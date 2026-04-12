@@ -1,0 +1,140 @@
+/* ── Theme Tokens ─────────────────────────────── */
+
+/* Dark Theme (Midnight Atelier) — DEFAULT */
+:root,
+:root[data-theme="dark"] {
+  /* Background */
+  --bg-app: #0B1020;
+  --bg-sidebar: #0E1428;
+  --bg-surface: #11182D;
+  --bg-surface-2: #151E36;
+  --bg-surface-3: #1A2440;
+  --bg-elevated: #1E2845;
+
+  /* Text */
+  --text-primary: #F2F5FB;
+  --text-secondary: #B7C0D4;
+  --text-tertiary: #8591AA;
+  --text-disabled: #5E6982;
+
+  /* Border */
+  --border-default: #25314F;
+  --border-strong: #334166;
+
+  /* Brand */
+  --brand-primary: #7C7CFF;
+  --brand-hover: #9292FF;
+  --brand-active: #6666F2;
+  --brand-soft: rgba(124, 124, 255, 0.14);
+
+  /* Accent */
+  --accent-gold: #E0AE57;
+  --accent-rose: #E07A92;
+  --accent-cyan: #56B7D1;
+
+  /* Semantic */
+  --success: #35B779;
+  --warning: #E3A53F;
+  --error: #F06A7A;
+  --info: #6FA8FF;
+
+  /* Shadow */
+  --shadow-sm: 0 2px 10px rgba(0, 0, 0, 0.18);
+  --shadow-md: 0 8px 28px rgba(0, 0, 0, 0.24);
+  --shadow-lg: 0 18px 48px rgba(0, 0, 0, 0.30);
+
+  /* Radius */
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-lg: 16px;
+
+  /* Legacy aliases (for gradual migration) */
+  --bg-primary: var(--bg-app);
+  --bg-secondary: var(--bg-sidebar);
+  --bg-tertiary: var(--bg-surface-2);
+  --border-color: var(--border-default);
+  --text-muted: var(--text-tertiary);
+  --accent-blue: var(--brand-primary);
+  --accent-purple: var(--accent-rose);
+  --accent-green: var(--success);
+  --accent-orange: var(--accent-gold);
+  --accent-red: var(--error);
+}
+
+/* Light Theme (Paper Studio) */
+:root[data-theme="light"] {
+  /* Background */
+  --bg-app: #F6F7FB;
+  --bg-sidebar: #F8F5EF;
+  --bg-surface: #FFFFFF;
+  --bg-surface-2: #F2F4F8;
+  --bg-surface-3: #ECEFF5;
+  --bg-elevated: #F0F2F7;
+
+  /* Text */
+  --text-primary: #151A23;
+  --text-secondary: #5B6472;
+  --text-tertiary: #8A93A3;
+  --text-disabled: #B2B8C3;
+
+  /* Border */
+  --border-default: #E2E7F0;
+  --border-strong: #CDD5E3;
+
+  /* Brand */
+  --brand-primary: #5B5BD6;
+  --brand-hover: #4D4DCA;
+  --brand-active: #3F40B8;
+  --brand-soft: #EEF0FF;
+
+  /* Accent */
+  --accent-gold: #C6923D;
+  --accent-rose: #D46A7E;
+  --accent-cyan: #3E9FB8;
+
+  /* Semantic */
+  --success: #2E9B62;
+  --warning: #D68A1F;
+  --error: #D14B57;
+  --info: #4C7CF0;
+
+  /* Shadow */
+  --shadow-sm: 0 2px 8px rgba(20, 28, 45, 0.05);
+  --shadow-md: 0 6px 24px rgba(20, 28, 45, 0.06);
+  --shadow-lg: 0 14px 40px rgba(20, 28, 45, 0.08);
+
+  /* Legacy aliases (for gradual migration) */
+  --bg-primary: var(--bg-app);
+  --bg-secondary: var(--bg-sidebar);
+  --bg-tertiary: var(--bg-surface-2);
+  --border-color: var(--border-default);
+  --text-muted: var(--text-tertiary);
+  --accent-blue: var(--brand-primary);
+  --accent-purple: var(--accent-rose);
+  --accent-green: var(--success);
+  --accent-orange: var(--accent-gold);
+  --accent-red: var(--error);
+}
+
+/* ── Base Reset ───────────────────────────────── */
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html, body {
+  height: 100%;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Noto Sans SC", sans-serif;
+  background: var(--bg-app);
+  color: var(--text-primary);
+  overflow: hidden;
+  transition: background-color 0.3s ease, color 0.3s ease, border-color 0.3s ease;
+}
+
+/* Scrollbar */
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: var(--bg-surface-2); }
+::-webkit-scrollbar-thumb { background: var(--border-default); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: var(--text-disabled); }

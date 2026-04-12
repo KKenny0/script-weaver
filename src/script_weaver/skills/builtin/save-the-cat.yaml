@@ -1,0 +1,54 @@
+id: save-the-cat
+name: "救猫咪节拍表 (Save the Cat)"
+stage: structuring
+description: "基于 Blake Snyder 的 Save the Cat 15 节拍结构来构建故事大纲。适用于商业类型片、短片、剧集。"
+version: "1.0"
+
+prompt_injection: |
+  你必须严格遵循「救猫咪 (Save the Cat)」15 节拍结构来构建故事大纲。
+
+  ## 15 个核心节拍（按顺序）：
+
+  1. **开场画面 (Opening Image)** — 展示主角在"之前"的状态，奠定基调
+  2. **主题呈现 (Theme Stated)** — 有人（通常不是主角）暗示/提出故事的核心问题
+  3. **铺垫 (Set-up)** — 展示主角的生活、缺陷、需求 vs 欲望
+  4. **催化剂 (Catalyst)** — 打破平衡的事件，小到大到无法忽视
+  5. **争论 (Debate)** — 主角犹豫是否接受召唤
+  6. ** breakpoint_1 (Break into Two)** — 主角决定进入新世界/新状态，主动选择
+  7. **B 故事 (B Story)** — 引入次要线索/关系，常承载主题
+  8. **游戏与乐趣 (Fun and Games)** — "承诺前提"的兑现，展示新状态的吸引力
+  9. **中点 (Midpoint)** — 假胜利或假失败，局势升级，赌注提高
+  10. **坏人逼近 (Bad Guys Close In)** — 内外压力聚集，团队分裂
+  11. **一无所有 (All Is Lost)** — 真正的低谷，看起来彻底失败
+  12. **灵魂黑夜 (Dark Night of the Soul)** — 绝望中的顿悟/觉醒时刻
+  13. ** breakpoint_2 (Break into Three)** — 基于 B 故事和灵魂黑夜的领悟，找到最终方案
+  14. **终局 (Finale)** — 主角用新能力/新认知对抗最终挑战
+  15. **最终画面 (Final Image)** — 与开场画面形成对比/呼应
+
+  ## 输出要求：
+  - 每个节拍必须包含：标题、概要（100-200字）、涉及角色、情绪走向、关键转折
+  - 节拍之间必须有清晰的因果链
+  - 中点必须是一个明确的"假胜利"或"假失败"
+  - breakpoint_1 和 breakpoint_2 是主动选择的时刻，不是被动发生
+  - 一无所有 + 灵魂黑夜是连续的两个最低点
+
+output_schema_override:
+  plot_beats:
+    beat_name:
+      type: string
+      enum: ["opening_image", "theme_stated", "set_up", "catalyst", "debate",
+             "break_into_two", "b_story", "fun_and_games", "midpoint",
+             "bad_guys_close_in", "all_is_lost", "dark_night_of_soul",
+             "break_into_three", "finale", "final_image"]
+
+constraints:
+  - "每个节拍必须有明确的情绪转折"
+  - "第10页左右必须出现'催化剂'事件"
+  - "breakpoint 必须是主角的主动选择"
+
+examples:
+  - input: "一个失意的程序员发现了一个能预知未来的AI应用"
+    output: |
+      开场画面：程序员小明在灰暗的办公室加班，屏幕上满是bug
+      主题呈现：同事说'你有没有想过，如果知道未来会怎样？'
+      铺垫：展示小明的孤独、对工作的厌倦、内心渴望改变...

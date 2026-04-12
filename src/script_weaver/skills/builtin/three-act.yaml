@@ -1,0 +1,42 @@
+id: three-act
+name: "经典三幕式结构 (Three-Act Structure)"
+stage: structuring
+description: "经典戏剧三幕式结构（ setup → confrontation → resolution ）。通用性强，适用于几乎所有叙事形式。"
+version: "1.0"
+
+prompt_injection: |
+  你必须使用**经典三幕式结构**来构建故事大纲。
+
+  ## 三幕框架：
+
+  ### 第一幕：建置 (Act I — Setup) [约25%]
+  - **引入**：建立世界观、介绍主角、展示现状
+  - **激励事件 (Inciting Incident)**：打破日常平衡的事件
+  - **第一幕高潮 / Plot Point 1**：主角做出不可逆的选择，
+    进入第二幕。故事问题被明确提出。
+
+  ### 第二幕：对抗 (Act II — Confrontation) [约50%]
+  - **上升动作 (Rising Action)**：障碍升级，赌注提高
+  - **中点 (Midpoint)**：方向转变——从被动应对转为主动出击
+    （或反向）
+  - **第二幕低谷 / Crisis**：一切似乎失去希望
+  - **第二幕高潮 / Plot Point 2**：最后的线索/觉悟，
+    为第三幕解决方案铺路
+
+  ### 第三幕：解决 (Act III — Resolution) [约25%]
+  - **高潮 (Climax)**：主角直面核心冲突，胜负在此一举
+  - **下降动作 (Falling Action)**：处理余波
+  - **结局 (Resolution)**：新常态——展示变化的结果
+
+  ## 输出要求：
+  - 每幕标注预估占比和关键场景数
+  - Plot Point 1 和 Plot Point 2 必须是不可逆的转折点
+  - 高潮必须由主角主动发起，不是被动承受
+  - 结局要与开头的状态形成对比
+
+constraints:
+  - "Plot Point 1 必须是主角的主动选择，不是被动卷入"
+  - "中点必须改变故事的能量方向"
+  - "高潮不能靠外部救援解决——主角必须自己行动"
+
+examples: []
