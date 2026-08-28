@@ -1,0 +1,14 @@
+.generate-button { position:fixed; right:18px; bottom:92px; z-index:11; display:flex; align-items:center; gap:6px; border:1px solid var(--wb-line-hot); background:var(--wb-gold); color:#21190b; padding:8px 10px; border-radius:6px; font-size:10px; font-weight:700; cursor:pointer }
+.adapter-select { position:fixed; right:18px; bottom:128px; z-index:11; width:116px; border:1px solid var(--wb-line); background:#171610; color:var(--wb-muted); padding:6px; border-radius:6px; font-size:10px }
+.generation-backdrop { position:fixed; inset:0; z-index:30; display:grid; place-items:center; background:#000a }
+.generation-dialog { width:min(560px,calc(100vw - 32px)); border:1px solid #584525; border-radius:10px; background:#171610; padding:20px; box-shadow:0 24px 80px #000 }
+.generation-dialog h2 { margin:7px 0 18px; font-size:18px }
+.generation-dialog dl { display:grid; gap:10px }
+.generation-dialog dl div { border-bottom:1px solid var(--wb-line); padding-bottom:9px }
+.generation-dialog dt { color:var(--wb-muted); font-size:10px; margin-bottom:4px }
+.generation-dialog dd { color:var(--wb-text); font-size:12px; line-height:1.5; word-break:break-word }
+.generation-dialog .fingerprint { color:var(--wb-gold); font:10px ui-monospace }
+.generation-dialog>p { margin:14px 0; color:var(--wb-muted); font-size:10px }
+.generation-dialog footer { display:flex; justify-content:flex-end; gap:8px }
+.generation-toast { position:fixed; right:18px; bottom:132px; z-index:29; display:flex; gap:8px; align-items:center; border:1px solid var(--wb-line); background:#171610; color:#cfc7b7; padding:9px 11px; border-radius:6px; font-size:10px }
+.generation-toast button { border:0; background:transparent; cursor:pointer }

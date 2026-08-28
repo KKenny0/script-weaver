@@ -1,0 +1,9 @@
+export type Prompt = { id: string; kind: "image" | "video"; version_number: number; content: string; is_current: number };
+export type Binding = { id: string; asset_id: string; asset_version_id: string; name: string; kind: string; usage: string; binding_mode: "frozen" | "follow_latest"; is_stale: number; stale_reason?: string };
+export type Shot = { id: string; order_index: number; status: string; revision: number; duration_seconds: number; shot_size: string; camera_angle: string; camera_movement: string; dialogue?: string; sound?: string; prompts: Prompt[]; bindings: Binding[]; media: { id: string; mime: string; storage_path: string; is_current: number }[]; versions: { id: string; revision: number; content: Record<string, unknown> }[] };
+export type Segment = { id: string; code: string; title: string; order_index: number; target_duration_seconds?: number; revision: number; shots?: Shot[]; shot_count?: number };
+export type Episode = { id: string; episode_number: number; title: string; segments: Segment[] };
+export type AssetVersion = { id: string; version_number: number; content: Record<string, unknown> };
+export type Asset = { id: string; kind: string; name: string; revision: number; current_version_id: string; versions: AssetVersion[] };
+export type Project = { id: string; title: string; aspect_ratio: string; revision: number; episodes: Episode[]; assets: Asset[] };
+export type ChangeSet = { id: string; status: string; summary: string; validated_fingerprint?: string; operations: { ordinal: number; op: string; target_type: string; target_id?: string; payload: Record<string, unknown> }[]; impacts: { impact_type: string; severity: string; entity_type: string; entity_id: string }[]; warnings: { code: string; severity: string; message: string }[] };

@@ -1,11 +1,10 @@
 import type { Metadata } from "next";
 import "./globals.css";
-import "./styles/artifact.css";
 import ThemeProvider from "./components/ThemeProvider";
 
 export const metadata: Metadata = {
-  title: "Script-Weaver — Agent-Native 剧本+分镜生成系统",
-  description: "从故事想法到完整剧本和专业分镜脚本",
+  title: "Script-Weaver — AI 视频工作台",
+  description: "Local-first 短剧分镜、资产与版本工作台",
 };
 
 export default function RootLayout({

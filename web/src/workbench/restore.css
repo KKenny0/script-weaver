@@ -1,0 +1,13 @@
+.restore-shot-button {
+  position: fixed;
+  right: 18px;
+  bottom: 58px;
+  z-index: 11;
+  border: 1px solid var(--wb-line-hot);
+  background: var(--wb-gold-soft);
+  color: var(--wb-gold);
+  padding: 7px 10px;
+  border-radius: 6px;
+  font-size: 10px;
+  cursor: pointer;
+}
