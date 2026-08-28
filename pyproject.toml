@@ -1,6 +1,6 @@
 [build-system]
 requires = ["setuptools>=68.0", "wheel"]
-build-backend = "setuptools.backends._legacy:_Backend"
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "script-weaver"
@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Agent-native screenplay and storyboard generation system that grows with you"
 readme = "README.md"
 license = {text = "MIT"}
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 authors = [
     {name = "Kenny Wu"},
 ]
@@ -29,6 +29,9 @@ dependencies = [
     "python-frontmatter>=1.0",
     "rich>=13.0",
     "click>=8.1",
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
+    "mcp>=2,<3",
 ]
 
 [project.optional-dependencies]
@@ -37,13 +40,19 @@ dev = [
     "pytest-asyncio>=0.21",
     "pytest-cov>=4.0",
     "ruff>=0.1",
+    "mcp[cli]>=2,<3",
 ]
 
 [project.scripts]
 script-weaver = "script_weaver.cli:main"
+script-weaverd = "script_weaver.daemon.server:main"
+script-weaver-mcp = "script_weaver.mcp.workbench_server:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+"script_weaver.infrastructure" = ["migrations/*.sql"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -53,3 +62,18 @@ pythonpath = ["src"]
 [tool.ruff]
 target-version = "py311"
 line-length = 100
+extend-exclude = [
+    "src/script_weaver/agents",
+    "src/script_weaver/core",
+    "src/script_weaver/exporters",
+    "src/script_weaver/llm",
+    "src/script_weaver/memory",
+    "src/script_weaver/prompts",
+    "src/script_weaver/skills",
+    "src/script_weaver/tools",
+    "src/script_weaver/cli.py",
+    "tests/unit",
+]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]
