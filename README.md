@@ -1,5 +1,29 @@
 # Script-Weaver
 
+Script-Weaver 是 local-first、workbench-first 的 AI 短剧视频制作工作台。SQLite 中的项目事实由 `script-weaverd` 单写，Workbench UI 与 Codex MCP 共享同一领域内核；Codex 只能提出 ChangeSet，不能直接 apply 或确认付费生成。
+
+## Workbench 启动
+
+```powershell
+python -m pip install -e ".[dev]"
+script-weaverd
+npm --prefix web install
+npm --prefix web run dev
+```
+
+打开 `http://127.0.0.1:3000`。Next dev/start 显式绑定 `127.0.0.1`，daemon 只监听 `127.0.0.1:8000`；不支持局域网访问。浏览器只请求相对 `/api`；Next 服务端读取 daemon 运行时令牌并代理到 `127.0.0.1:8000`。数据默认位于当前用户应用数据目录，包含 SQLite、Media Store 和每次启动轮换的 `runtime.token`。
+
+项目级 Codex MCP 配置位于 `.codex/config.toml`；五个短剧能力位于 `.agents/skills/`。验证命令：
+
+```powershell
+pytest -q
+ruff check src tests web/api
+npm --prefix web run build
+mcp dev src/script_weaver/mcp/workbench_server.py
+```
+
+架构决策见 `docs/adr/`，MCP 白名单见 `docs/contracts/mcp-v1.md`，垂直切片见 `docs/testing/vertical-slice.md`。
+
 **Agent-native 剧本 + 分镜生成系统** — 随用户成长的 AI 创作管线
 
 > 从一个故事想法出发，自动生成完整剧本和专业分镜脚本，可直接用于下游视频生成工具（Seiko/Runway/Kling 等）。

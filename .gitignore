@@ -3,5 +3,10 @@ node_modules/
 __pycache__/
 *.pyc
 *.pyo
+*.egg-info/
+.test-tmp/
 .env
 snapshot/
+
+# Python build artifacts
+build/
