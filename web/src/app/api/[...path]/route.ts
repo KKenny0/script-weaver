@@ -1,4 +1,5 @@
 import { readFile } from "node:fs/promises";
+import { homedir } from "node:os";
 import path from "node:path";
 import type { NextRequest } from "next/server";
 
@@ -24,6 +25,13 @@ function daemonBaseUrl(): URL {
     throw new Error("SCRIPT_WEAVER_DAEMON_URL 必须指向本机 loopback 地址");
   }
   return url;
+}
+
+function creatorTokenPath(): string {
+  if (process.env.SCRIPT_WEAVER_TOKEN_FILE) return process.env.SCRIPT_WEAVER_TOKEN_FILE;
+  const applicationRoot = process.env.LOCALAPPDATA || process.env.XDG_DATA_HOME;
+  if (applicationRoot) return path.join(applicationRoot, "script-weaver", "runtime.token");
+  return path.join(process.env.HOME || homedir(), ".local", "share", "script-weaver", "runtime.token");
 }
 
 async function readBoundedBody(request: NextRequest, limit: number): Promise<ArrayBuffer | null> {
@@ -71,11 +79,14 @@ async function proxy(request: NextRequest, { params }: { params: Promise<{ path:
     }
   }
   let token: string;
+  const tokenFile = creatorTokenPath();
   try {
-    const tokenFile = process.env.SCRIPT_WEAVER_TOKEN_FILE || path.join(process.env.LOCALAPPDATA || path.join(process.env.HOME || ".", ".local", "share"), "ScriptWeaver", "runtime.token");
     token = (await readFile(tokenFile, "utf8")).trim();
   } catch {
-    return Response.json({ detail: "script-weaverd 尚未启动" }, { status: 503 });
+    return Response.json({
+      code: "creator_token_missing",
+      detail: `未找到 creator token：${tokenFile}。请先运行 uv run script-weaverd。`,
+    }, { status: 503 });
   }
   let daemon: URL;
   try {
@@ -97,7 +108,21 @@ async function proxy(request: NextRequest, { params }: { params: Promise<{ path:
   headers.delete("content-length");
   headers.set("authorization", `Bearer ${token}`);
   if (body !== null) headers.set("content-length", String(body.byteLength));
-  const response = await fetch(target, { method, headers, body, cache: "no-store", redirect: "error" });
+  let response: Response;
+  try {
+    response = await fetch(target, { method, headers, body, cache: "no-store", redirect: "error" });
+  } catch {
+    return Response.json({
+      code: "daemon_unreachable",
+      detail: `无法连接 script-weaverd（${daemon.origin}）。请确认 uv run script-weaverd 正在运行。`,
+    }, { status: 503 });
+  }
+  if (response.status === 401 || response.status === 403) {
+    return Response.json({
+      code: "daemon_auth_failed",
+      detail: "Workbench 与 script-weaverd 的 creator token 不一致。请重启 daemon 和 Web 工作台后重试。",
+    }, { status: 502 });
+  }
   const outgoing = new Headers(response.headers);
   outgoing.delete("content-length");
   outgoing.delete("content-encoding");

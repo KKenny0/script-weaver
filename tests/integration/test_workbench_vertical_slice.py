@@ -55,7 +55,8 @@ def test_four_shot_changeset_restart_and_cursor(work_dir):
         TaskStart(project_id=project["id"], capability="short-drama-storyboard", intent="四镜")
     )
     changesets = ChangeSetService(db)
-    change = changesets.create(task["id"], summary="四镜分镜")
+    run = workbench.claim_task(task["id"], "pytest")
+    change = changesets.create(task["id"], run["id"], summary="四镜分镜")
     for index in range(4):
         change = changesets.append(
             change["id"],
@@ -96,7 +97,8 @@ def test_conflict_is_atomic_and_snapshot_is_immutable(work_dir):
     with pytest.raises(sqlite3.IntegrityError), db.write() as conn:
         conn.execute("UPDATE task_snapshots SET selection_json='{}' WHERE task_id=?", (task["id"],))
     changesets = ChangeSetService(db)
-    change = changesets.create(task["id"])
+    run = workbench.claim_task(task["id"], "pytest")
+    change = changesets.create(task["id"], run["id"])
     for shot in (first, second):
         change = changesets.append(
             change["id"],
@@ -143,20 +145,20 @@ def test_asset_propagation_sync_freeze_and_restore_versions(work_dir):
     assert workbench.get_shot(follow_shot["id"])["bindings"][0]["is_stale"] == 1
     assert workbench.get_shot(frozen_shot["id"])["bindings"][0]["is_stale"] == 0
     workbench.binding_action(
-        follow["id"], BindingAction(expected_shot_revision=1, action="sync")
+        follow["id"], BindingAction(expected_shot_revision=2, action="sync")
     )
     synced = workbench.get_shot(follow_shot["id"])
-    assert not synced["bindings"][0]["is_stale"] and synced["revision"] == 2
+    assert not synced["bindings"][0]["is_stale"] and synced["revision"] == 3
     workbench.binding_action(
-        follow["id"], BindingAction(expected_shot_revision=2, action="freeze")
+        follow["id"], BindingAction(expected_shot_revision=3, action="freeze")
     )
     assert workbench.get_shot(follow_shot["id"])["bindings"][0]["binding_mode"] == "frozen"
     restored_asset = workbench.restore_asset_version(asset["id"], old_version, 1)
     assert restored_asset["version_number"] == 3 and restored_asset["content"]["look"] == "v1"
-    edited = workbench.update_shot(follow_shot["id"], 3, {"duration_seconds": 9})
+    edited = workbench.update_shot(follow_shot["id"], 4, {"duration_seconds": 9})
     restored_shot = workbench.restore_shot(follow_shot["id"], edited["revision"], 0)
-    assert restored_shot["duration_seconds"] == 3 and restored_shot["revision"] == 5
-    assert [item["revision"] for item in restored_shot["versions"]] == [5, 4, 3, 2, 1, 0]
+    assert restored_shot["duration_seconds"] == 3 and restored_shot["revision"] == 6
+    assert [item["revision"] for item in restored_shot["versions"]] == [6, 5, 4, 3, 2, 1, 0]
     db.close()
 
 

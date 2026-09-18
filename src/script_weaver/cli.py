@@ -14,10 +14,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+import shutil
 import sys
+import tempfile
 from pathlib import Path
+from urllib.parse import quote, urlencode
 
 import click
+import httpx
 
 from script_weaver.core.config import get_settings
 from script_weaver.core.pipeline import PipelineEngine
@@ -27,6 +31,7 @@ from script_weaver.exporters.video_gen_exporter import export_video_gen_prompts
 from script_weaver.llm.client import LLMClient
 from script_weaver.memory.profile import get_profile_manager
 from script_weaver.skills.registry import SkillRegistry
+from script_weaver.infrastructure.daemon_client import call as daemon_call
 
 
 # ────────────────────────────────────────────────────────
@@ -61,6 +66,8 @@ def _cli_progress(stage: str, message: str) -> None:
 @click.pass_context
 def main(ctx: click.Context, version: bool) -> None:
     """Script-Weaver: Agent-native screenplay & storyboard generation system."""
+    from script_weaver.runtime import require_supported_python
+    require_supported_python()
     if version:
         from script_weaver import __version__
         click.echo(f"script-weaver v{__version__}")
@@ -326,6 +333,179 @@ def profile_edit() -> None:
     pm._profile = None  # Force reload
     p = pm.profile
     click.echo(f"Profile updated. Last modified: {p.updated_at}")
+
+
+# ────────────────────────────────────────────────────────
+# Persistent workbench collaboration commands
+# ────────────────────────────────────────────────────────
+
+
+def _seg(value: str) -> str:
+    return quote(value, safe="")
+
+
+def _json(value) -> None:
+    click.echo(json.dumps(value, ensure_ascii=False, separators=(",", ":")))
+
+
+def _call(method: str, path: str, body: dict | None = None):
+    try:
+        return daemon_call(method, path, body)
+    except (FileNotFoundError, httpx.ConnectError, httpx.TimeoutException) as error:
+        click.echo(json.dumps({"error": f"daemon unavailable: {error}"}), err=True)
+        raise click.exceptions.Exit(3) from error
+    except httpx.HTTPStatusError as error:
+        try:
+            payload = error.response.json()
+            detail = payload.get("detail", str(error)) if isinstance(payload, dict) else str(error)
+        except (ValueError, json.JSONDecodeError):
+            detail = error.response.text.strip() or str(error)
+        code = 4 if error.response.status_code == 409 else 2 if error.response.status_code in {400, 404, 422} else 5
+        click.echo(json.dumps({"error": detail}, ensure_ascii=False), err=True)
+        raise click.exceptions.Exit(code) from error
+
+
+def _depth(value, current=0):
+    if current > 32:
+        raise click.UsageError("proposal JSON exceeds maximum depth 32")
+    if isinstance(value, dict):
+        for item in value.values():
+            _depth(item, current + 1)
+    elif isinstance(value, list):
+        for item in value:
+            _depth(item, current + 1)
+
+
+@main.group()
+def workbench() -> None:
+    """Inspect the local persistent workbench."""
+
+
+@workbench.command("doctor")
+@click.option("--json", "as_json", is_flag=True, help="Emit one JSON document.")
+def workbench_doctor(as_json: bool) -> None:
+    """Check daemon, schema, and pinned product skills."""
+    result = _call("GET", "/workbench/doctor")
+    if as_json:
+        _json(result)
+    else:
+        missing = [skill["name"] for skill in result["skills"] if not skill["available"]]
+        click.echo(f"daemon: ok · schema: {max(result['schema_versions'])}")
+        click.echo("skills: " + ("ok" if not missing else "missing " + ", ".join(missing)))
+        h3 = result.get("h3", {})
+        if not h3.get("configured"):
+            click.echo("h3: optional · not configured")
+        else:
+            identity = h3.get("identity", "unavailable")
+            readiness = "ok" if h3.get("ready") else "failed"
+            click.echo(
+                f"h3: {readiness} · {identity} · requested {h3.get('requested_task')} · "
+                f"requested {h3.get('requested_short_edge')} short-edge"
+            )
+
+
+@main.group()
+def task() -> None:
+    """Claim and inspect durable workbench tasks."""
+
+
+@task.command("list")
+@click.option("--project-id")
+@click.option("--status")
+def task_list(project_id: str | None, status: str | None) -> None:
+    query = {key: value for key, value in {"project_id": project_id, "status": status}.items() if value}
+    _json(_call("GET", f"/tasks?{urlencode(query)}"))
+
+
+@task.command("claim")
+@click.option("--task-id", required=True)
+@click.option("--worker-label", required=True)
+def task_claim(task_id: str, worker_label: str) -> None:
+    _json(_call("POST", f"/tasks/{_seg(task_id)}/claim", {"worker_label": worker_label}))
+
+
+@task.command("context")
+@click.argument("task_id")
+@click.option("--section", type=click.Choice(["all", "source", "target"]), default="all")
+@click.option("--cursor", type=click.IntRange(min=0), default=0)
+def task_context(task_id: str, section: str, cursor: int) -> None:
+    query = urlencode({"section": section, "cursor": cursor})
+    _json(_call("GET", f"/tasks/{_seg(task_id)}/context?{query}"))
+
+
+@task.command("fail")
+@click.option("--task-id", required=True)
+@click.option("--run-id", required=True)
+@click.option("--message", required=True)
+def task_fail(task_id: str, run_id: str, message: str) -> None:
+    _json(_call("POST", f"/tasks/{_seg(task_id)}/fail", {"run_id": run_id, "message": message}))
+
+
+@main.group()
+def changeset() -> None:
+    """Submit typed proposals; applying remains creator-only in the UI."""
+
+
+@changeset.command("submit")
+@click.argument("task_id")
+@click.option("--run-id", required=True)
+@click.option("--file", "proposal_file", required=True, type=click.Path(exists=True, dir_okay=False, path_type=Path))
+def changeset_submit(task_id: str, run_id: str, proposal_file: Path) -> None:
+    if proposal_file.stat().st_size > 2 * 1024 * 1024:
+        raise click.UsageError("proposal file exceeds 2 MiB")
+    try:
+        proposal = json.loads(proposal_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise click.UsageError(f"invalid proposal file: {error}") from error
+    if not isinstance(proposal, dict):
+        raise click.UsageError("proposal must be a JSON object")
+    _depth(proposal)
+    proposal["run_id"] = run_id
+    _json(_call("POST", f"/tasks/{_seg(task_id)}/changesets/submit", proposal))
+
+
+@main.command("search")
+@click.argument("project_id")
+@click.option("--query", required=True)
+@click.option("--limit", type=click.IntRange(1, 100), default=50)
+def search_command(project_id: str, query: str, limit: int) -> None:
+    _json(_call("GET", f"/projects/{_seg(project_id)}/search?{urlencode({'q': query, 'limit': limit})}"))
+
+
+@main.command("export")
+@click.argument("project_id")
+@click.option("--output", required=True, type=click.Path(file_okay=False, path_type=Path))
+def export_command(project_id: str, output: Path) -> None:
+    project = _call("GET", f"/projects/{_seg(project_id)}")
+    _write_export(project, output)
+    _json({"project_id": project_id, "output": str(output), "documents": len(project.get("documents", []))})
+
+
+def _write_export(project: dict, output: Path) -> None:
+    """Build a complete sibling directory, then publish it with one rename."""
+    if output.exists():
+        raise click.UsageError("export output must not already exist")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temporary = Path(tempfile.mkdtemp(prefix=f".{output.name}-", dir=output.parent))
+    try:
+        (temporary / "project.json").write_text(
+            json.dumps(project, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        documents = temporary / "documents"
+        documents.mkdir()
+        for index, document in enumerate(project.get("documents", []), 1):
+            version = next(
+                (item for item in document["versions"] if item["status"] == "ACCEPTED"),
+                None,
+            )
+            content = version["content"] if version else (document.get("draft") or {}).get("content", "")
+            (documents / f"{index:02d}-{document['kind']}.md").write_text(
+                content, encoding="utf-8"
+            )
+        temporary.rename(output)
+    except BaseException:
+        shutil.rmtree(temporary, ignore_errors=True)
+        raise
 
 
 import os

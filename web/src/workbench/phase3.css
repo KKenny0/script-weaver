@@ -1,0 +1,74 @@
+.workbench {
+  grid-template-columns: 80px 274px minmax(620px, 1fr);
+}
+
+.workbench.inspector-open {
+  grid-template-columns: 80px 274px minmax(620px, 1fr) 338px;
+}
+
+.nav-icon:disabled {
+  opacity: .38;
+  cursor: not-allowed;
+}
+
+.nav-icon:disabled:hover {
+  color: #8e8879;
+  background: transparent;
+}
+
+.inspector { grid-column: 4; }
+
+.inspector-toggle {
+  position: fixed;
+  top: 61px;
+  right: 14px;
+  z-index: 12;
+  border: 1px solid var(--wb-line-hot);
+  border-radius: 6px;
+  background: #1a1811;
+  color: var(--wb-gold);
+  padding: 6px 9px;
+  font-size: 10px;
+  cursor: pointer;
+}
+
+.episode-navigator button:disabled,
+.storyboard-episodes button:disabled {
+  opacity: .55;
+  cursor: not-allowed;
+}
+
+.retry-task-button {
+  margin-top: 7px;
+  border: 1px solid var(--wb-line);
+  border-radius: 5px;
+  background: var(--wb-gold-soft);
+  color: var(--wb-gold);
+  padding: 6px 8px;
+  cursor: pointer;
+}
+
+@media(max-width: 1180px) {
+  .workbench, .workbench.inspector-open { grid-template-columns: 72px 240px minmax(560px, 1fr); }
+}
+
+@media(max-width: 780px) {
+  .workbench, .workbench.inspector-open { grid-template-columns: 64px 1fr; }
+}
+.document-asset-links{display:flex;gap:7px;overflow:auto;padding:8px 0}.document-asset-links button{display:flex;gap:8px;align-items:center;white-space:nowrap;border:1px solid var(--wb-line);border-radius:6px;background:#12120e;color:var(--wb-text);padding:7px 9px;cursor:pointer}.document-asset-links small{color:var(--wb-gold)}
+
+.development-contract {
+  display: grid;
+  gap: 9px;
+  margin: 12px 14px 0;
+  padding: 12px;
+  border: 1px solid var(--wb-line-hot);
+  border-radius: 7px;
+  background: var(--wb-gold-soft);
+}
+
+.development-contract strong { color: var(--wb-gold); }
+.development-contract p { margin: 5px 0 0; color: var(--wb-muted); font-size: 12px; line-height: 1.55; }
+.development-contract code { color: var(--wb-text); }
+.development-contract > small { color: var(--wb-muted); }
+.development-contract-actions { display: flex; flex-wrap: wrap; gap: 7px; }

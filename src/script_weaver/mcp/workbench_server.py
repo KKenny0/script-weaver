@@ -2,29 +2,25 @@
 
 from __future__ import annotations
 
-import os
-from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlencode
 
 import httpx
 from mcp.server.mcpserver import MCPServer
 
-from script_weaver.infrastructure.sqlite import default_data_dir
+from script_weaver.infrastructure.daemon_client import base_url, call as daemon_call
 
 TOOL_NAMES = (
-    "workbench.get_active_context", "workbench.start_task", "workbench.get_task_snapshot",
+    "workbench.get_active_context", "workbench.list_tasks", "workbench.claim_task",
+    "workbench.get_task_context", "workbench.fail_task", "workbench.submit_proposal",
+    "workbench.get_task_snapshot",
     "workbench.get_project", "workbench.get_episode", "workbench.get_segment",
     "workbench.get_shot", "workbench.list_assets", "workbench.get_asset_version",
-    "workbench.search_project", "workbench.create_changeset",
-    "workbench.append_changeset_operation", "workbench.validate_changeset",
-    "workbench.submit_changeset", "workbench.render_shot_preview",
+    "workbench.search_project", "workbench.render_shot_preview",
     "workbench.render_segment_contact_sheet", "workbench.compare_shot_versions",
     "workbench.render_asset_board", "workbench.get_deep_link",
     "workbench.prepare_generation_job", "workbench.get_generation_job",
 )
-
-LOOPBACK_HOSTNAMES = {"localhost", "127.0.0.1", "::1"}
 
 server = MCPServer("script-weaver-workbench", instructions="Read project facts and submit ChangeSets. Applying changes and confirming/running generation are intentionally unavailable.")
 
@@ -35,11 +31,7 @@ def seg(value: Any) -> str:
 
 
 def daemon_base_url() -> httpx.URL:
-    raw = os.getenv("SCRIPT_WEAVER_DAEMON_URL", "http://127.0.0.1:8000")
-    parsed = httpx.URL(raw)
-    if (parsed.host or "").strip("[]") not in LOOPBACK_HOSTNAMES:
-        raise RuntimeError("SCRIPT_WEAVER_DAEMON_URL must point at a loopback address")
-    return parsed
+    return base_url()
 
 
 def _send(request: httpx.Request) -> httpx.Response:
@@ -48,17 +40,7 @@ def _send(request: httpx.Request) -> httpx.Response:
 
 
 def call(method: str, path: str, body: dict[str, Any] | None = None) -> Any:
-    token_path = Path(os.getenv("SCRIPT_WEAVER_TOKEN_FILE", str(default_data_dir() / "runtime.token")))
-    token = token_path.read_text(encoding="utf-8").strip()
-    request = httpx.Request(
-        method,
-        daemon_base_url().join(httpx.URL(f"/api{path}")),
-        headers={"Authorization": f"Bearer {token}"},
-        json=body,
-    )
-    response = _send(request)
-    response.raise_for_status()
-    return response.json()
+    return daemon_call(method, path, body, _send)
 
 
 @server.tool(name="workbench.get_active_context")
@@ -67,9 +49,31 @@ def get_active_context(session_id: str | None = None) -> dict[str, Any]:
     return call("GET", f"/active-context{query}")
 
 
-@server.tool(name="workbench.start_task")
-def start_task(project_id: str, capability: str, intent: str, surface_session_id: str | None = None, skill_manifest: list[dict[str, str]] | None = None) -> dict[str, Any]:
-    return call("POST", "/tasks", {"project_id": project_id, "capability": capability, "intent": intent, "surface_session_id": surface_session_id, "skill_manifest": skill_manifest or []})
+@server.tool(name="workbench.list_tasks")
+def list_tasks(project_id: str | None = None, status: str | None = None) -> list[dict[str, Any]]:
+    query = {key: value for key, value in {"project_id": project_id, "status": status}.items() if value}
+    suffix = f"?{urlencode(query)}" if query else ""
+    return call("GET", f"/tasks{suffix}")
+
+
+@server.tool(name="workbench.claim_task")
+def claim_task(task_id: str, worker_label: str = "codex-mcp") -> dict[str, Any]:
+    return call("POST", f"/tasks/{seg(task_id)}/claim", {"worker_label": worker_label})
+
+
+@server.tool(name="workbench.get_task_context")
+def get_task_context(task_id: str, section: str = "all", cursor: int = 0) -> dict[str, Any]:
+    return call("GET", f"/tasks/{seg(task_id)}/context?{urlencode({'section': section, 'cursor': cursor})}")
+
+
+@server.tool(name="workbench.fail_task")
+def fail_task(task_id: str, run_id: str, message: str) -> dict[str, Any]:
+    return call("POST", f"/tasks/{seg(task_id)}/fail", {"run_id": run_id, "message": message})
+
+
+@server.tool(name="workbench.submit_proposal")
+def submit_proposal(task_id: str, run_id: str, summary: str, operations: list[dict[str, Any]]) -> dict[str, Any]:
+    return call("POST", f"/tasks/{seg(task_id)}/changesets/submit", {"run_id": run_id, "summary": summary, "operations": operations})
 
 
 @server.tool(name="workbench.get_task_snapshot")
@@ -102,22 +106,6 @@ def get_asset_version(version_id: str) -> dict[str, Any]: return call("GET", f"/
 
 @server.tool(name="workbench.search_project")
 def search_project(project_id: str, query: str, limit: int = 50) -> list[dict[str, Any]]: return call("GET", f"/projects/{seg(project_id)}/search?{urlencode({'q': query, 'limit': min(limit, 100)})}")
-
-
-@server.tool(name="workbench.create_changeset")
-def create_changeset(task_id: str, summary: str = "", run_id: str | None = None) -> dict[str, Any]: return call("POST", "/changesets", {"task_id": task_id, "run_id": run_id, "summary": summary})
-
-
-@server.tool(name="workbench.append_changeset_operation")
-def append_changeset_operation(changeset_id: str, operation: dict[str, Any]) -> dict[str, Any]: return call("POST", f"/changesets/{seg(changeset_id)}/operations", {"operation": operation})
-
-
-@server.tool(name="workbench.validate_changeset")
-def validate_changeset(changeset_id: str) -> dict[str, Any]: return call("POST", f"/changesets/{seg(changeset_id)}/validate")
-
-
-@server.tool(name="workbench.submit_changeset")
-def submit_changeset(changeset_id: str) -> dict[str, Any]: return call("POST", f"/changesets/{seg(changeset_id)}/submit")
 
 
 @server.tool(name="workbench.render_shot_preview")

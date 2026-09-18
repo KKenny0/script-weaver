@@ -116,7 +116,7 @@ def test_freeze_keeps_old_version_until_sync(work_dir):
     stale = workbench.get_shot(shot["id"])["bindings"][0]
     assert stale["is_stale"] == 1 and stale["asset_version_id"] == old_version
 
-    workbench.binding_action(binding["id"], BindingAction(expected_shot_revision=revision_after_bind, action="freeze"))
+    workbench.binding_action(binding["id"], BindingAction(expected_shot_revision=revision_after_bind + 1, action="freeze"))
     frozen = workbench.get_shot(shot["id"])
     assert frozen["bindings"][0]["asset_version_id"] == old_version, "freeze must not implicitly sync"
     assert frozen["bindings"][0]["binding_mode"] == "frozen"

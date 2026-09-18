@@ -150,7 +150,7 @@ def test_running_jobs_fail_on_daemon_restart_without_retry(work_dir):
     db.close()
 
 
-def test_multi_output_job_ingests_all_but_marks_only_last_current_and_cleans_staging(work_dir):
+def test_multi_output_job_ingests_all_as_unaccepted_candidates_and_cleans_staging(work_dir):
     db, workbench, project, _episode, segment = seed(work_dir)
     shot = workbench.create_shot(segment["id"], ShotCreate(order_index=0))
     service = generation_service(db, work_dir)
@@ -160,10 +160,10 @@ def test_multi_output_job_ingests_all_but_marks_only_last_current_and_cleans_sta
 
     assert finished["state"] == "SUCCEEDED"
     rows = db.connection.execute(
-        "SELECT is_current FROM media_versions WHERE owner_type='shot' AND owner_id=? AND kind='image' ORDER BY created_at",
+        "SELECT is_current,candidate_status FROM media_versions WHERE owner_type='shot' AND owner_id=? AND kind='image' ORDER BY created_at",
         (shot["id"],),
     ).fetchall()
-    assert [row[0] for row in rows] == [0, 1], "all outputs kept as versions; only the last is current"
+    assert [(row[0], row[1]) for row in rows] == [(0, "candidate"), (0, "candidate")]
     assert not (Path(work_dir) / "media" / "staging" / job["id"]).exists()
     db.close()
 
@@ -341,7 +341,7 @@ def test_base_exception_rolls_back_and_releases_the_writer(work_dir):
     project = workbench.create_project(ProjectCreate(title="雾渡"))
 
     with pytest.raises(KeyboardInterrupt), db.write() as conn:
-        conn.execute("INSERT INTO projects VALUES('ghost','','','','','{}',0,'t','t')")
+        conn.execute("INSERT INTO projects(id,title,format,aspect_ratio,prompt_language,metadata_json,revision,created_at,updated_at) VALUES('ghost','','','','','{}',0,'t','t')")
         raise KeyboardInterrupt
 
     assert db.connection.execute("SELECT COUNT(*) FROM projects WHERE id='ghost'").fetchone()[0] == 0
@@ -380,7 +380,7 @@ def test_task_start_recomputes_skill_hashes_and_rejects_unknown_skills(work_dir)
 
     with pytest.raises(NotFoundError):
         workbench.start_task(TaskStart(
-            project_id=project["id"], capability="short-drama-storyboard", intent="未知能力",
+            project_id=project["id"], capability="not-a-real-skill", intent="未知能力",
             skill_manifest=[{"name": "not-a-real-skill", "version": "1"}],
         ))
     db.close()

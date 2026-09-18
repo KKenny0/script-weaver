@@ -1,0 +1,46 @@
+import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { canStartNewH3Round, continuationActions, h3JobMode, h3Readiness, packageIsReady, resolveKeyframeChoice } from "../src/workbench/h3-state.mjs";
+
+const frozen = { binding_mode: "frozen" };
+const acceptedPng = { candidate_status: "accepted", mime: "image/png" };
+assert.deepEqual(h3Readiness(null, null, "move", 6), { ready: false, reason: "先绑定视觉资产" });
+assert.equal(h3Readiness({ binding_mode: "follow_latest" }, acceptedPng, "move", 6).ready, false);
+assert.equal(h3Readiness(frozen, acceptedPng, "move", 3).ready, false);
+assert.deepEqual(h3Readiness(frozen, acceptedPng, "move", 6), { ready: true, reason: "可提交本地 H3" });
+assert.deepEqual(continuationActions(true, true), ["下一集", "下一季", "新作品", "项目库"]);
+assert.deepEqual(continuationActions(true, false), ["下一季", "新作品", "项目库"]);
+assert.deepEqual(continuationActions(false, true), []);
+assert.equal(h3JobMode("H3_RUNNING"), "poll-only");
+assert.equal(h3JobMode("FAILED"), "reprepare");
+assert.equal(h3JobMode("SUCCEEDED"), "review-candidate");
+assert.equal(canStartNewH3Round("SUCCEEDED"), true);
+assert.equal(canStartNewH3Round("H3_RUNNING"), false);
+const choices = [{ binding: { id: "b1" } }, { binding: { id: "b2" } }];
+assert.equal(resolveKeyframeChoice(choices, null, null), null);
+assert.equal(resolveKeyframeChoice(choices, "b2", null), choices[1]);
+assert.equal(resolveKeyframeChoice(choices, null, "b1"), choices[0]);
+assert.equal(resolveKeyframeChoice([choices[0]], null, null), choices[0]);
+assert.equal(packageIsReady({ ready: true, missing: [], failed: [], stale: { shots: [] } }), true);
+assert.equal(packageIsReady({ ready: true, missing: [{}], failed: [], stale: {} }), false);
+
+const studio = readFileSync(new URL("../src/workbench/H3VideoStudio.tsx", import.meta.url), "utf8");
+assert.match(studio, /\/h3\/video-jobs/);
+assert.match(studio, /\/poll/);
+assert.match(studio, /media-candidates\/\$\{current\.id\}\/accept/);
+assert.match(studio, /expected_shot_revision/);
+assert.match(studio, /h3-video-job/);
+assert.match(studio, /disabled=\{locked\}/);
+assert.match(studio, /production-packages/);
+assert.match(studio, /package-issues/);
+assert.match(studio, /回到文档处理/);
+assert.match(studio, /开始新一轮 H3/);
+assert.match(studio, /onOpenShotH3/);
+
+const shell = readFileSync(new URL("../src/workbench/WorkbenchShell.tsx", import.meta.url), "utf8");
+assert.match(shell, /continuation_kind: "season"/);
+assert.match(shell, /source_project_id: continuationSource\.id/);
+assert.match(shell, /setH3Shot\(null\); const loaded = await api<Segment>/);
+assert.match(shell, /openPackageDocumentIssue/);
+assert.match(shell, /openPackageShotIssue/);
+console.log("phase 5 H3 and production package contract: ok");

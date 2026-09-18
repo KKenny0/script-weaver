@@ -2,14 +2,16 @@ export class ApiError extends Error {
   status: number;
   detail: string;
   currentRevisions: Record<string, number> | null;
+  code: string | null;
   raw: unknown;
 
   constructor(status: number, payload: unknown, fallback: string) {
-    const body = (payload && typeof payload === "object" ? payload : {}) as { detail?: unknown; current_revisions?: unknown };
+    const body = (payload && typeof payload === "object" ? payload : {}) as { code?: unknown; detail?: unknown; current_revisions?: unknown };
     const detail = typeof body.detail === "string" ? body.detail : fallback;
     super(detail);
     this.name = "ApiError";
     this.status = status;
+    this.code = typeof body.code === "string" ? body.code : null;
     this.detail = detail;
     this.currentRevisions = body.current_revisions && typeof body.current_revisions === "object" ? body.current_revisions as Record<string, number> : null;
     this.raw = payload;

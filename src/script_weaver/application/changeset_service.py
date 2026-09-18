@@ -11,9 +11,12 @@ from script_weaver.domain.models import (
     AssetCreate,
     AssetVersionPayload,
     ConflictError,
+    DocumentCreatePayload,
+    DocumentVersionCreatePayload,
     NotFoundError,
     ProjectMismatchError,
     PromptVersionPayload,
+    ProposalSubmit,
     ReferenceBindPayload,
     ReferenceRebindPayload,
     ReferenceSetModePayload,
@@ -27,7 +30,15 @@ from script_weaver.domain.operations import ALLOWED_OPERATIONS
 from script_weaver.infrastructure.sqlite import Database
 
 from .dependency_service import DependencyService
-from .workbench_service import WorkbenchService, dump, now, require_same_project, row_dict, uid
+from .workbench_service import (
+    WorkbenchService,
+    dump,
+    now,
+    require_same_project,
+    row_dict,
+    skill_tree_hash,
+    uid,
+)
 
 
 def fingerprint(value: Any) -> str:
@@ -35,9 +46,11 @@ def fingerprint(value: Any) -> str:
 
 
 # Tables that can appear in a task snapshot's expected_revisions, keyed by id.
-_ENTITY_TABLES = ("projects", "episodes", "segments", "shots", "assets")
+_ENTITY_TABLES = ("projects", "episodes", "segments", "shots", "assets", "creative_documents")
 
 _PAYLOAD_MODELS: dict[str, type[BaseModel]] = {
+    "document.create": DocumentCreatePayload,
+    "document.version.create": DocumentVersionCreatePayload,
     "segment.create": SegmentCreate,
     "shot.create": ShotCreate,
     "shot.update": ShotUpdateFields,
@@ -68,19 +81,45 @@ class ChangeSetService:
         self.db = database
 
     def create(self, task_id: str, run_id: str | None = None, summary: str = "") -> dict[str, Any]:
+        if run_id is None:
+            raise ValueError("a running agent run is required")
         entity_id = uid()
         with self.db.write() as conn:
-            task = conn.execute("SELECT project_id FROM tasks WHERE id=?", (task_id,)).fetchone()
+            task = conn.execute("SELECT project_id,status FROM tasks WHERE id=?", (task_id,)).fetchone()
             if not task:
                 raise NotFoundError("task not found")
-            if run_id is not None and not conn.execute("SELECT 1 FROM agent_runs WHERE id=?", (run_id,)).fetchone():
+            run = conn.execute("SELECT task_id,status FROM agent_runs WHERE id=?", (run_id,)).fetchone()
+            if not run:
                 raise NotFoundError("agent run not found")
+            if run[0] != task_id:
+                raise ProjectMismatchError("agent run belongs to another task")
+            if task[1] != "RUNNING" or run[1] != "RUNNING":
+                raise ConflictError({task_id: 0}, "task and agent run must both be RUNNING")
+            if conn.execute("SELECT 1 FROM changesets WHERE run_id=?", (run_id,)).fetchone():
+                raise ConflictError({task_id: 0}, "agent run already has a proposal")
             snapshot = conn.execute("SELECT expected_revisions_json FROM task_snapshots WHERE task_id=?", (task_id,)).fetchone()
             if not snapshot:
                 raise NotFoundError("task snapshot not found")
             timestamp = now()
             conn.execute("INSERT INTO changesets VALUES(?,?,?,?,'DRAFT',?,?,NULL,?,?)", (entity_id, task_id, run_id, task[0], snapshot[0], summary, timestamp, timestamp))
         return self.get(entity_id)
+
+    @staticmethod
+    def _require_running_owner(conn, changeset: dict[str, Any]) -> None:
+        if not changeset.get("run_id"):
+            raise ConflictError({changeset["task_id"]: 0}, "changeset has no owning agent run")
+        task = conn.execute("SELECT status FROM tasks WHERE id=?", (changeset["task_id"],)).fetchone()
+        run = conn.execute(
+            "SELECT task_id,status FROM agent_runs WHERE id=?", (changeset["run_id"],)
+        ).fetchone()
+        if not task or not run:
+            raise NotFoundError("changeset task or agent run not found")
+        if run[0] != changeset["task_id"]:
+            raise ProjectMismatchError("agent run belongs to another task")
+        if task[0] != "RUNNING" or run[1] != "RUNNING":
+            raise ConflictError(
+                {changeset["task_id"]: 0}, "task and agent run must both be RUNNING"
+            )
 
     def append(self, changeset_id: str, operation) -> dict[str, Any]:
         if operation.op not in ALLOWED_OPERATIONS:
@@ -91,11 +130,91 @@ class ChangeSetService:
             raw["target_id"] = uid()
         with self.db.write() as conn:
             changeset = self._get_locked(conn, changeset_id)
+            self._require_running_owner(conn, changeset)
             if changeset["status"] != "DRAFT":
                 raise ConflictError({changeset_id: 0}, f"changeset is {changeset['status']}; only DRAFT accepts operations")
             ordinal = conn.execute("SELECT COALESCE(MAX(ordinal),-1)+1 FROM changeset_operations WHERE changeset_id=?", (changeset_id,)).fetchone()[0]
             conn.execute("INSERT INTO changeset_operations VALUES(?,?,?,?,?,?,?)", (changeset_id, ordinal, raw["op"], raw["target_type"], raw.get("target_id"), raw.get("expected_revision"), dump(raw["payload"])))
             conn.execute("UPDATE changesets SET validated_fingerprint=NULL,updated_at=? WHERE id=?", (now(), changeset_id))
+        return self.get(changeset_id)
+
+    def submit_proposal(self, task_id: str, proposal: ProposalSubmit) -> dict[str, Any]:
+        """Atomically persist a typed agent proposal and finish its claimed run."""
+        changeset_id, timestamp = uid(), now()
+        snapshot = self.db.connection.execute(
+            "SELECT skill_manifest_json FROM task_snapshots WHERE task_id=?", (task_id,)
+        ).fetchone()
+        if not snapshot:
+            raise NotFoundError("task snapshot not found")
+        manifest = row_dict({"skill_manifest_json": snapshot[0]})["skill_manifest"]
+        if len(manifest) != 1:
+            raise ValueError("task snapshot must pin exactly one skill")
+        current_skill_hash = skill_tree_hash(manifest[0]["name"])
+        with self.db.write() as conn:
+            task = conn.execute(
+                "SELECT project_id,status FROM tasks WHERE id=?", (task_id,)
+            ).fetchone()
+            if not task:
+                raise NotFoundError("task not found")
+            run = conn.execute(
+                "SELECT task_id,status FROM agent_runs WHERE id=?", (proposal.run_id,)
+            ).fetchone()
+            if not run:
+                raise NotFoundError("agent run not found")
+            if run[0] != task_id:
+                raise ProjectMismatchError("agent run belongs to another task")
+            if task[1] != "RUNNING" or run[1] != "RUNNING":
+                raise ConflictError({task_id: 0}, "task and agent run must both be RUNNING")
+            if conn.execute(
+                "SELECT 1 FROM changesets WHERE run_id=?", (proposal.run_id,)
+            ).fetchone():
+                raise ConflictError({task_id: 0}, "agent run already has a proposal")
+            pinned = conn.execute(
+                "SELECT skill_manifest_json FROM task_snapshots WHERE task_id=?", (task_id,)
+            ).fetchone()
+            current_manifest = row_dict({"skill_manifest_json": pinned[0]})["skill_manifest"]
+            if current_manifest != manifest or current_skill_hash != manifest[0]["hash"]:
+                raise ConflictError({task_id: 0}, "pinned skill tree changed before proposal submission")
+            snapshot = conn.execute(
+                "SELECT expected_revisions_json FROM task_snapshots WHERE task_id=?", (task_id,)
+            ).fetchone()
+            if not snapshot:
+                raise NotFoundError("task snapshot not found")
+            conn.execute(
+                "INSERT INTO changesets VALUES(?,?,?,?,'DRAFT',?,?,NULL,?,?)",
+                (
+                    changeset_id, task_id, proposal.run_id, task[0], snapshot[0],
+                    proposal.summary, timestamp, timestamp,
+                ),
+            )
+            for ordinal, operation in enumerate(proposal.operations):
+                raw = operation.model_dump(mode="json")
+                raw["payload"] = operation.payload.model_dump(mode="json", exclude_unset=True)
+                if operation.op.endswith(".create") and not raw.get("target_id"):
+                    raw["target_id"] = uid()
+                conn.execute(
+                    "INSERT INTO changeset_operations VALUES(?,?,?,?,?,?,?)",
+                    (
+                        changeset_id, ordinal, raw["op"], raw["target_type"],
+                        raw.get("target_id"), raw.get("expected_revision"), dump(raw["payload"]),
+                    ),
+                )
+            changeset = self._get_locked(conn, changeset_id)
+            impacts, warnings, validated = self._validate_locked(conn, changeset)
+            self._store_evaluation(conn, changeset_id, impacts, warnings, validated, "SUBMITTED")
+            conn.execute(
+                "UPDATE agent_runs SET status='SUCCEEDED',finished_at=? WHERE id=?",
+                (timestamp, proposal.run_id),
+            )
+            conn.execute(
+                "INSERT INTO agent_run_events VALUES(?,1,'run.succeeded',?,?)",
+                (proposal.run_id, dump({"changeset_id": changeset_id}), timestamp),
+            )
+            conn.execute("UPDATE tasks SET status='SUBMITTED' WHERE id=?", (task_id,))
+            WorkbenchService._event(
+                conn, task[0], "changeset", changeset_id, 0, "changeset.submitted",
+                {"summary": proposal.summary}, changeset_id, task_id,
+            )
         return self.get(changeset_id)
 
     def get(self, changeset_id: str) -> dict[str, Any]:
@@ -124,7 +243,7 @@ class ChangeSetService:
 
     @staticmethod
     def _current_revision(conn, target_type: str, target_id: str | None) -> int | None:
-        tables = {"project": "projects", "episode": "episodes", "segment": "segments", "shot": "shots", "asset": "assets"}
+        tables = {"project": "projects", "episode": "episodes", "segment": "segments", "shot": "shots", "asset": "assets", "document": "creative_documents"}
         table = tables.get(target_type)
         if not table or not target_id:
             return None
@@ -166,7 +285,71 @@ class ChangeSetService:
         name = op["op"]
         project_id = changeset["project_id"]
         parsed = _parse_payload(op)
-        if name == "segment.create":
+        snapshot = conn.execute("SELECT selection_json FROM task_snapshots WHERE task_id=?", (changeset["task_id"],)).fetchone()
+        selection = row_dict({"selection_json": snapshot[0]})["selection"] if snapshot else {}
+        scope = selection.get("edit_scope")
+        if scope:
+            WorkbenchService.require_scoped_draft_current(conn, selection)
+            if len(changeset["operations"]) != 1 or name != "document.version.create" or op["target_id"] != selection["document_id"]:
+                raise ValueError("局部修订只能为当前剧本提交一个候选，不能修改其他对象")
+            original = selection["target"]["draft_content"]
+            prefix, suffix = original[:scope["start"]], original[scope["end"]:]
+            if len(parsed.content) < len(prefix) + len(suffix) or not parsed.content.startswith(prefix) or not parsed.content.endswith(suffix):
+                raise ValueError("候选修改了选区以外的文字，请仅修改指定范围后重新提交")
+        if name == "document.create":
+            if not conn.execute("SELECT 1 FROM projects WHERE id=?", (project_id,)).fetchone():
+                raise NotFoundError(f"project not found: {project_id}")
+            if parsed.episode_id:
+                require_same_project(conn, project_id, "episode", parsed.episode_id)
+            snapshot = conn.execute(
+                "SELECT selection_json FROM task_snapshots WHERE task_id=?",
+                (changeset["task_id"],),
+            ).fetchone()
+            selection = row_dict({"selection_json": snapshot[0]})["selection"] if snapshot else {}
+            if selection.get("episode_id") and parsed.episode_id != selection["episode_id"]:
+                raise ProjectMismatchError("document episode is outside the task snapshot")
+            if parsed.episode_id:
+                episode = conn.execute(
+                    "SELECT source_document_version_id,status FROM episodes WHERE id=?",
+                    (parsed.episode_id,),
+                ).fetchone()
+                if episode[1] != "active":
+                    raise ConflictError({parsed.episode_id: 0}, "episode is removed")
+                if selection.get("document_version_id") != episode[0]:
+                    raise ProjectMismatchError("document source is outside the current episode lineage")
+        elif name == "document.version.create":
+            require_same_project(conn, project_id, "document", op["target_id"])
+            snapshot = conn.execute(
+                "SELECT selection_json FROM task_snapshots WHERE task_id=?",
+                (changeset["task_id"],),
+            ).fetchone()
+            selection = row_dict({"selection_json": snapshot[0]})["selection"] if snapshot else {}
+            if selection.get("document_id") != op["target_id"]:
+                raise ProjectMismatchError("document version target is outside the task snapshot")
+            document = conn.execute(
+                "SELECT kind,episode_id FROM creative_documents WHERE id=?", (op["target_id"],)
+            ).fetchone()
+            kind = document[0]
+            if kind == "source":
+                raise ValueError("agents may not create versions of source documents")
+            if kind in {"screenplay", "review"} and document[1]:
+                episode = conn.execute(
+                    "SELECT source_document_version_id,status FROM episodes WHERE id=?",
+                    (document[1],),
+                ).fetchone()
+                if episode[1] != "active":
+                    raise ConflictError({document[1]: 0}, "episode is removed")
+                if selection.get("document_version_id") != episode[0]:
+                    raise ProjectMismatchError("candidate source is outside the current episode lineage")
+            if conn.execute(
+                "SELECT 1 FROM creative_document_versions WHERE document_id=? AND status='SUBMITTED'",
+                (op["target_id"],),
+            ).fetchone():
+                raise ConflictError(
+                    {op["target_id"]: self._current_revision(conn, "document", op["target_id"]) or 0},
+                    "document already has a submitted candidate",
+                )
+        elif name == "segment.create":
             if not parsed.episode_id:
                 raise ValueError("segment.create requires payload.episode_id")
             require_same_project(conn, project_id, "episode", parsed.episode_id)
@@ -221,29 +404,53 @@ class ChangeSetService:
     def validate(self, changeset_id: str) -> dict[str, Any]:
         with self.db.write() as conn:
             changeset = self._get_locked(conn, changeset_id)
-            if changeset["status"] not in {"DRAFT", "SUBMITTED"}:
+            self._require_running_owner(conn, changeset)
+            if changeset["status"] != "DRAFT":
                 raise ConflictError({changeset_id: 0}, f"changeset is {changeset['status']}")
             impacts, warnings, validated = self._validate_locked(conn, changeset)
-            conn.execute("DELETE FROM changeset_impacts WHERE changeset_id=?", (changeset_id,))
-            conn.execute("DELETE FROM changeset_warnings WHERE changeset_id=?", (changeset_id,))
-            conn.executemany("INSERT INTO changeset_impacts VALUES(?,?,?,?,?,?)", [(changeset_id, i["entity_type"], i["entity_id"], i["impact_type"], i["severity"], dump(i["detail"])) for i in impacts])
-            conn.executemany("INSERT INTO changeset_warnings VALUES(?,?,?,?,?)", [(changeset_id, w["code"], w["severity"], w["message"], dump(w["detail"])) for w in warnings])
-            conn.execute("UPDATE changesets SET validated_fingerprint=?,updated_at=? WHERE id=?", (validated, now(), changeset_id))
+            self._store_evaluation(conn, changeset_id, impacts, warnings, validated)
         return self.get(changeset_id)
 
     def submit(self, changeset_id: str) -> dict[str, Any]:
         with self.db.write() as conn:
             changeset = self._get_locked(conn, changeset_id)
-            if changeset["status"] not in {"DRAFT", "SUBMITTED"}:
+            self._require_running_owner(conn, changeset)
+            if changeset["status"] != "DRAFT":
                 raise ConflictError({changeset_id: 0}, f"changeset is {changeset['status']}")
-            if changeset["status"] == "DRAFT":
-                impacts, warnings, validated = self._validate_locked(conn, changeset)
-                conn.execute("DELETE FROM changeset_impacts WHERE changeset_id=?", (changeset_id,))
-                conn.execute("DELETE FROM changeset_warnings WHERE changeset_id=?", (changeset_id,))
-                conn.executemany("INSERT INTO changeset_impacts VALUES(?,?,?,?,?,?)", [(changeset_id, i["entity_type"], i["entity_id"], i["impact_type"], i["severity"], dump(i["detail"])) for i in impacts])
-                conn.executemany("INSERT INTO changeset_warnings VALUES(?,?,?,?,?)", [(changeset_id, w["code"], w["severity"], w["message"], dump(w["detail"])) for w in warnings])
-                conn.execute("UPDATE changesets SET status='SUBMITTED',validated_fingerprint=?,updated_at=? WHERE id=?", (validated, now(), changeset_id))
+            impacts, warnings, validated = self._validate_locked(conn, changeset)
+            self._store_evaluation(
+                conn, changeset_id, impacts, warnings, validated, "SUBMITTED"
+            )
+            timestamp = now()
+            conn.execute(
+                "UPDATE agent_runs SET status='SUCCEEDED',finished_at=? WHERE id=?",
+                (timestamp, changeset["run_id"]),
+            )
+            conn.execute(
+                "INSERT INTO agent_run_events VALUES(?,1,'run.succeeded',?,?)",
+                (changeset["run_id"], dump({"changeset_id": changeset_id}), timestamp),
+            )
+            conn.execute("UPDATE tasks SET status='SUBMITTED' WHERE id=?", (changeset["task_id"],))
         return self.get(changeset_id)
+
+    @staticmethod
+    def _store_evaluation(conn, changeset_id, impacts, warnings, validated, status=None) -> None:
+        conn.execute("DELETE FROM changeset_impacts WHERE changeset_id=?", (changeset_id,))
+        conn.execute("DELETE FROM changeset_warnings WHERE changeset_id=?", (changeset_id,))
+        conn.executemany(
+            "INSERT INTO changeset_impacts VALUES(?,?,?,?,?,?)",
+            [(changeset_id, i["entity_type"], i["entity_id"], i["impact_type"], i["severity"], dump(i["detail"])) for i in impacts],
+        )
+        conn.executemany(
+            "INSERT INTO changeset_warnings VALUES(?,?,?,?,?)",
+            [(changeset_id, w["code"], w["severity"], w["message"], dump(w["detail"])) for w in warnings],
+        )
+        clause = ",status=?" if status else ""
+        values = (validated, now(), status, changeset_id) if status else (validated, now(), changeset_id)
+        conn.execute(
+            f"UPDATE changesets SET validated_fingerprint=?,updated_at=?{clause} WHERE id=?",
+            values,
+        )
 
     def apply(self, changeset_id: str, expected_fingerprint: str) -> dict[str, Any]:
         conflicts: dict[str, int] | None = None
@@ -272,6 +479,11 @@ class ChangeSetService:
                         if table == "shots":
                             WorkbenchService._snapshot_shot(conn, entity_id, changeset_id)
                     conn.execute("UPDATE changesets SET status='APPLIED',updated_at=? WHERE id=?", (now(), changeset_id))
+                    conn.execute("UPDATE tasks SET status='APPLIED' WHERE id=?", (changeset["task_id"],))
+                    WorkbenchService._event(
+                        conn, changeset["project_id"], "changeset", changeset_id, 0,
+                        "changeset.applied", {}, changeset_id, changeset["task_id"],
+                    )
         if conflicts:
             raise ConflictError(conflicts)
         return self.get(changeset_id)
@@ -299,6 +511,14 @@ class ChangeSetService:
                 raise ConflictError({changeset_id: 0}, f"changeset already {status}; cannot reject")
             if status != "REJECTED":
                 conn.execute("UPDATE changesets SET status='REJECTED',updated_at=? WHERE id=? AND status=?", (now(), changeset_id, status))
+                task = conn.execute(
+                    "SELECT task_id,project_id FROM changesets WHERE id=?", (changeset_id,)
+                ).fetchone()
+                conn.execute("UPDATE tasks SET status='REJECTED' WHERE id=?", (task[0],))
+                WorkbenchService._event(
+                    conn, task[1], "changeset", changeset_id, 0, "changeset.rejected", {},
+                    changeset_id, task[0],
+                )
         return self.get(changeset_id)
 
     def _bump(self, conn, table: str, entity_id: str, touched: set[tuple[str, str]]) -> int:
@@ -315,8 +535,67 @@ class ChangeSetService:
         project_id = changeset["project_id"]
         self._check_operation(conn, changeset, op)
         parsed = _parse_payload(op)
-        if name == "segment.create":
-            conn.execute("INSERT INTO segments VALUES(?,?,?,?,?,?,?,0)", (target_id, parsed.episode_id, parsed.code, parsed.order_index, parsed.title, dump(parsed.source_scene_ids), parsed.target_duration_seconds))
+        if name == "document.create":
+            version_id, timestamp = uid(), now()
+            projection = "not_projected" if parsed.kind == "screenplay" else "not_applicable"
+            selection = row_dict(conn.execute(
+                "SELECT selection_json FROM task_snapshots WHERE task_id=?",
+                (changeset["task_id"],),
+            ).fetchone())["selection"]
+            source_version_id = selection.get("document_version_id")
+            conn.execute(
+                """INSERT INTO creative_documents(
+                id,project_id,episode_id,kind,title,current_version_id,revision,created_at,updated_at,
+                source_document_version_id,derived_from_ids_json
+                ) VALUES(?,?,?,?,?,NULL,0,?,?,?,?)""",
+                (target_id, project_id, parsed.episode_id, parsed.kind, parsed.title, timestamp, timestamp,
+                 source_version_id, dump([source_version_id] if source_version_id else [])),
+            )
+            conn.execute(
+                """INSERT INTO creative_document_versions(
+                id,document_id,version_number,content,status,source_snapshot_id,
+                decision_feedback,projection_status,created_at,decided_at,source_changeset_id,created_by,
+                source_document_version_id,derived_from_ids_json
+                ) VALUES(?,?,1,?,'SUBMITTED',NULL,NULL,?,?,NULL,?,'agent',?,?)""",
+                (version_id, target_id, parsed.content, projection, timestamp, changeset["id"],
+                 source_version_id, dump([source_version_id] if source_version_id else [])),
+            )
+            conn.execute(
+                "INSERT INTO document_drafts VALUES(?,?,0,NULL,?)",
+                (target_id, parsed.content, timestamp),
+            )
+            aggregate_type, aggregate_id, revision = "document", target_id, 0
+        elif name == "document.version.create":
+            document = conn.execute(
+                "SELECT kind,revision FROM creative_documents WHERE id=?", (target_id,)
+            ).fetchone()
+            number = conn.execute(
+                "SELECT COALESCE(MAX(version_number),0)+1 FROM creative_document_versions WHERE document_id=?",
+                (target_id,),
+            ).fetchone()[0]
+            version_id, timestamp = uid(), now()
+            projection = "not_projected" if document[0] == "screenplay" else "not_applicable"
+            selection = row_dict(conn.execute(
+                "SELECT selection_json FROM task_snapshots WHERE task_id=?",
+                (changeset["task_id"],),
+            ).fetchone())["selection"]
+            source_version_id = selection.get("document_version_id")
+            conn.execute(
+                """INSERT INTO creative_document_versions(
+                id,document_id,version_number,content,status,source_snapshot_id,
+                decision_feedback,projection_status,created_at,decided_at,source_changeset_id,created_by,
+                source_document_version_id,derived_from_ids_json
+                ) VALUES(?,?,?,?,'SUBMITTED',NULL,NULL,?,?,NULL,?,'agent',?,?)""",
+                (version_id, target_id, number, parsed.content, projection, timestamp, changeset["id"],
+                 source_version_id, dump([source_version_id] if source_version_id else [])),
+            )
+            conn.execute(
+                "UPDATE creative_documents SET revision=revision+1,updated_at=? WHERE id=?",
+                (timestamp, target_id),
+            )
+            aggregate_type, aggregate_id, revision = "document", target_id, document[1] + 1
+        elif name == "segment.create":
+            conn.execute("INSERT INTO segments(id,episode_id,code,order_index,title,source_scene_ids_json,target_duration_seconds,revision) VALUES(?,?,?,?,?,?,?,0)", (target_id, parsed.episode_id, parsed.code, parsed.order_index, parsed.title, dump(parsed.source_scene_ids), parsed.target_duration_seconds))
             aggregate_type, aggregate_id, revision = "segment", target_id, 0
         elif name == "shot.create":
             WorkbenchService._insert_shot(conn, target_id, parsed.segment_id, parsed, changeset["id"])
@@ -352,7 +631,13 @@ class ChangeSetService:
             revision = self._bump(conn, "assets", target_id, touched)
         elif name == "reference.bind":
             asset_id = conn.execute("SELECT asset_id FROM asset_versions WHERE id=?", (parsed.asset_version_id,)).fetchone()[0]
-            conn.execute("INSERT INTO reference_bindings VALUES(?,?,?,?,?,?,0,NULL)", (uid(), target_id, asset_id, parsed.asset_version_id, parsed.usage, parsed.binding_mode))
+            conn.execute("""INSERT INTO reference_bindings(
+                id,shot_id,asset_id,asset_version_id,usage,binding_mode,is_stale,stale_reason,
+                source_document_version_id,source_projection_revision,derived_from_ids_json
+                ) SELECT ?,?,?,?,?,?,0,NULL,source_document_version_id,
+                source_projection_revision,derived_from_ids_json FROM shots WHERE id=?""",
+                (uid(), target_id, asset_id, parsed.asset_version_id, parsed.usage, parsed.binding_mode, target_id),
+            )
             aggregate_type, aggregate_id = "shot", target_id
             revision = self._bump(conn, "shots", target_id, touched)
         elif name in {"reference.rebind", "reference.set_mode"}:
@@ -373,13 +658,34 @@ class ChangeSetService:
         elif name == "prompt.version.create":
             conn.execute("UPDATE prompt_versions SET is_current=0 WHERE owner_type=? AND owner_id=? AND kind=?", (op["target_type"], target_id, parsed.kind))
             number = conn.execute("SELECT COALESCE(MAX(version_number),0)+1 FROM prompt_versions WHERE owner_type=? AND owner_id=? AND kind=?", (op["target_type"], target_id, parsed.kind)).fetchone()[0]
-            conn.execute("INSERT INTO prompt_versions VALUES(?,?,?,?,?,?,?,1,?,?)", (uid(), op["target_type"], target_id, parsed.kind, number, parsed.content, parsed.negative_content, changeset["id"], now()))
+            if op["target_type"] == "shot":
+                lineage = conn.execute(
+                    "SELECT source_document_version_id,source_projection_revision,derived_from_ids_json FROM shots WHERE id=?",
+                    (target_id,),
+                ).fetchone()
+            else:
+                lineage = (None, None, "[]")
+            conn.execute("""INSERT INTO prompt_versions(
+                id,owner_type,owner_id,kind,version_number,content,negative_content,is_current,
+                source_changeset_id,created_at,source_document_version_id,
+                source_projection_revision,derived_from_ids_json
+                ) VALUES(?,?,?,?,?,?,?,1,?,?,?,?,?)""", (
+                uid(), op["target_type"], target_id, parsed.kind, number, parsed.content,
+                parsed.negative_content, changeset["id"], now(), lineage[0], lineage[1], lineage[2],
+            ))
             aggregate_type, aggregate_id = op["target_type"], target_id
             table = {"shot": "shots", "segment": "segments", "asset": "assets"}[op["target_type"]]
             revision = self._bump(conn, table, target_id, touched)
         else:
             raise ValueError(f"unsupported operation: {name}")
-        WorkbenchService._event(conn, project_id, aggregate_type, aggregate_id, revision, name, op["payload"], changeset["id"], changeset["task_id"])
+        event_payload = {"operation": name}
+        if name.startswith("document."):
+            event_payload.update({
+                "document_id": aggregate_id,
+                "version_id": version_id,
+                "content_sha256": hashlib.sha256(parsed.content.encode("utf-8")).hexdigest(),
+            })
+        WorkbenchService._event(conn, project_id, aggregate_type, aggregate_id, revision, name, event_payload, changeset["id"], changeset["task_id"])
 
 
 __all__ = ["ChangeSetService", "fingerprint"]

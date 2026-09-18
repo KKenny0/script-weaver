@@ -71,7 +71,8 @@ def seed_two_projects(tmp_path):
 
 def build_changeset(workbench, changesets, project_id, operations):
     task = workbench.start_task(TaskStart(project_id=project_id, capability=CAPABILITY, intent="测试"))
-    change = changesets.create(task["id"])
+    run = workbench.claim_task(task["id"], "pytest")
+    change = changesets.create(task["id"], run["id"])
     for operation in operations:
         change = changesets.append(change["id"], operation)
     return change
@@ -132,7 +133,8 @@ def test_concurrent_apply_is_exactly_once(work_dir):
     assert len(statuses) == 2 and statuses == ["APPLIED", "APPLIED"]
     assert len(workbench.get_segment(segment["id"])["shots"]) == 4
     events = [event for event in workbench.list_events(project["id"]) if event["causation_id"] == change["id"]]
-    assert len(events) == 4
+    assert len(events) == 5
+    assert events[-1]["event_type"] == "changeset.applied"
     for shot in workbench.get_segment(segment["id"])["shots"]:
         assert shot["revision"] == 0
     db.close()
@@ -234,7 +236,11 @@ def test_uncommitted_facts_and_events_are_invisible_to_readers(work_dir):
         try:
             with db.write() as conn:
                 conn.execute(
-                    "INSERT INTO shots VALUES('ghost-shot',?,999,'active',0,3,'medium','eye_level','static',NULL,NULL,'{}','{}','[]')",
+                    """INSERT INTO shots(
+                    id,segment_id,order_index,status,revision,duration_seconds,shot_size,
+                    camera_angle,camera_movement,dialogue,sound,start_boundary_json,
+                    end_boundary_json,source_block_ids_json
+                    ) VALUES('ghost-shot',?,999,'active',0,3,'medium','eye_level','static',NULL,NULL,'{}','{}','[]')""",
                     (segment["id"],),
                 )
                 conn.execute(
@@ -284,7 +290,8 @@ def test_stale_snapshot_base_revision_marks_conflicted_with_zero_writes(work_dir
     task = workbench.start_task(TaskStart(project_id=project["id"], capability=CAPABILITY, intent="过期基础", surface_session_id="s-stale"))
     base_revisions = task["expected_revisions"]
     assert base_revisions[other["id"]] == 0
-    change = changesets.create(task["id"])
+    run = workbench.claim_task(task["id"], "pytest")
+    change = changesets.create(task["id"], run["id"])
     change = changesets.append(change["id"], ShotUpdateOperation(op="shot.update", target_id=shot["id"], expected_revision=0, payload={"duration_seconds": 8}))
     submitted = changesets.submit(change["id"])
     # Move a snapshot-selected entity the operation never touches; the frozen base is now stale.
@@ -348,7 +355,8 @@ def test_reorder_with_foreign_shot_leaves_it_untouched(work_dir):
 
     # Removing the foreign item lets the same reorder apply cleanly.
     task = workbench.start_task(TaskStart(project_id=a["project"]["id"], capability=CAPABILITY, intent="重排"))
-    clean = changesets.create(task["id"])
+    run = workbench.claim_task(task["id"], "pytest")
+    clean = changesets.create(task["id"], run["id"])
     clean = changesets.append(clean["id"], ShotReorderOperation(op="shot.reorder", target_id=a["segment"]["id"], expected_revision=0, payload={"shots": [{"id": a["shot"]["id"], "order_index": 4}]}))
     applied = changesets.apply(clean["id"], changesets.submit(clean["id"])["validated_fingerprint"])
     assert applied["status"] == "APPLIED"
@@ -377,7 +385,8 @@ def test_malformed_payloads_are_rejected_before_submit(work_dir):
 
     # A payload that bypassed append validation must fail submit, never a false-green SUBMITTED.
     task = workbench.start_task(TaskStart(project_id=project["id"], capability=CAPABILITY, intent="坏数据"))
-    change = changesets.create(task["id"])
+    run = workbench.claim_task(task["id"], "pytest")
+    change = changesets.create(task["id"], run["id"])
     conn = db.connection
     conn.execute(
         "INSERT INTO changeset_operations VALUES(?,0,'shot.update','shot',?,0,?)",

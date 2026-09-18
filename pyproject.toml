@@ -44,9 +44,9 @@ dev = [
 ]
 
 [project.scripts]
-script-weaver = "script_weaver.cli:main"
-script-weaverd = "script_weaver.daemon.server:main"
-script-weaver-mcp = "script_weaver.mcp.workbench_server:main"
+script-weaver = "script_weaver.runtime:cli_main"
+script-weaverd = "script_weaver.runtime:daemon_main"
+script-weaver-mcp = "script_weaver.runtime:mcp_main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

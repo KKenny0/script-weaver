@@ -1,0 +1,45 @@
+name: CI
+
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --python 3.11 --extra dev
+      - run: uv run --extra dev --python 3.11 python -m pytest -q
+        env:
+          XDG_DATA_HOME: ${{ runner.temp }}/script-weaver-tests
+      - run: uv run --extra dev --python 3.11 ruff check src tests web/api
+      - run: uv run --python 3.11 script-weaver --help
+      - run: uv run --python 3.11 python .agents/skills/short-drama-novel-analyze/scripts/selftest.py
+      - run: uv run --python 3.11 python .agents/skills/short-drama-develop/scripts/selftest.py
+      - run: uv run --python 3.11 python .agents/skills/short-drama-write/scripts/selftest.py
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci
+        working-directory: web
+      - run: npm run check:autosave
+        working-directory: web
+      - run: npm run check:candidate-review
+        working-directory: web
+      - run: npm run check:phase3
+        working-directory: web
+      - run: npm run check:phase4
+        working-directory: web
+      - run: npm run check:phase5
+        working-directory: web
+      - run: npm run build
+        working-directory: web
+      - run: npm run check:proxy
+        working-directory: web
+      - run: npm run check:start
+        working-directory: web

@@ -4,21 +4,46 @@ Script-Weaver 是 local-first、workbench-first 的 AI 短剧视频制作工作�
 
 ## Workbench 启动
 
+首次只需执行一次准备：
+
 ```powershell
-python -m pip install -e ".[dev]"
-script-weaverd
-npm --prefix web install
-npm --prefix web run dev
+uv sync --python 3.11 --extra dev
+npm --prefix web ci
+npm --prefix web run build
 ```
 
-打开 `http://127.0.0.1:3000`。Next dev/start 显式绑定 `127.0.0.1`，daemon 只监听 `127.0.0.1:8000`；不支持局域网访问。浏览器只请求相对 `/api`；Next 服务端读取 daemon 运行时令牌并代理到 `127.0.0.1:8000`。数据默认位于当前用户应用数据目录，包含 SQLite、Media Store 和每次启动轮换的 `runtime.token`。
+准备完成后需要同时保持两个终端运行。
+
+终端 A — 启动本地 daemon：
+
+```powershell
+uv run script-weaverd
+```
+
+终端 B — 启动生产 Workbench：
+
+```powershell
+npm --prefix web start
+```
+
+打开 `http://127.0.0.1:3000`。Next dev/start 显式绑定 `127.0.0.1`，daemon 只监听 `127.0.0.1:8000`；不支持局域网访问。浏览器只请求相对 `/api`；Next 服务端读取 creator `runtime.token`，CLI/MCP 读取 proposal-only `agent.token`。数据默认位于当前用户应用数据目录，包含 SQLite、Media Store 和每次启动轮换的两个 token。
+
+`uv` 是唯一的主安装与 Python 启动流程。若需要直接调用项目虚拟环境，`.venv/bin/script-weaverd` 与 `uv run script-weaverd` 等价，仅作为排障补充。Python 低于 3.11 时，CLI 与 daemon 会报告当前版本，并提示重新运行上面的 `uv sync --python 3.11 --extra dev`。
+
+日常使用走上面的 production server。只有开发前端时，才在终端 B 改用热更新模式：
+
+```powershell
+npm --prefix web run dev
+```
 
 项目级 Codex MCP 配置位于 `.codex/config.toml`；五个短剧能力位于 `.agents/skills/`。验证命令：
 
 ```powershell
-pytest -q
-ruff check src tests web/api
+XDG_DATA_HOME="$(mktemp -d)" uv run --extra dev --python 3.11 python -m pytest -q
+uv run --extra dev --python 3.11 ruff check src tests web/api
 npm --prefix web run build
+npm --prefix web run check:proxy
+npm --prefix web run check:start
 mcp dev src/script_weaver/mcp/workbench_server.py
 ```
 
@@ -43,7 +68,7 @@ mcp dev src/script_weaver/mcp/workbench_server.py
 
 ```bash
 cd script-weaver
-pip install -e ".[dev]"
+uv sync --python 3.11 --extra dev
 ```
 
 ### 配置
@@ -69,19 +94,19 @@ cp .env.example .env
 
 ```bash
 # 从一个想法生成完整剧本+分镜
-python -m script_weaver generate "一个穿越时空的古装爱情故事，女主角能看见别人的命运线"
+uv run script-weaver generate "一个穿越时空的古装爱情故事，女主角能看见别人的命运线"
 
 # 指定标题和输出目录
-python -m script_weaver generate "你的想法" --title "我的剧本" --output-dir ./output
+uv run script-weaver generate "你的想法" --title "我的剧本" --output-dir ./output
 
 # 管理 Skills
-python -m script_weaver skills list                    # 列出所有可用 Skills
-python -m script_weaver skills list --stage structuring   # 按阶段筛选
-python -m script_weaver skills install ./my-skill.yaml    # 安装新 Skill
-python -m script_weaver skills activate save-the-cat --stage structuring  # 激活 Skill
+uv run script-weaver skills list                    # 列出所有可用 Skills
+uv run script-weaver skills list --stage structuring   # 按阶段筛选
+uv run script-weaver skills install ./my-skill.yaml    # 安装新 Skill
+uv run script-weaver skills activate save-the-cat --stage structuring  # 激活 Skill
 
 # 查看用户画像（学习到的偏好）
-python -m script_weaver profile show
+uv run script-weaver profile show
 ```
 
 ## 系统架构
@@ -196,8 +221,8 @@ TRIGGER when: 用户提到写剧本、写短片...
 ### 安装和使用
 
 ```bash
-python -m script_weaver skills install ./my-skill.yaml
-python -m script_weaver skills activate my-skill --stage scriptwriting
+uv run script-weaver skills install ./my-skill.yaml
+uv run script-weaver skills activate my-skill --stage scriptwriting
 ```
 
 ## Grows With User — 成长系统
@@ -220,7 +245,7 @@ Script-Weaver 不是一次性工具——它会随着使用越来越懂你：
 
 ```bash
 # 查看系统学到了什么
-python -m script_weaver profile show
+uv run script-weaver profile show
 ```
 
 ## 导出格式
@@ -246,20 +271,39 @@ output/video_gen/
 - **transition_in/out**: 转场方式
 - **dialogue_text / voiceover_text**: 音频轨道信息
 
+### 可选：本地 MiniMax-H3 FL2VA
+
+生产工作台只接 H3-Base 768p FL2VA，不下载或分发模型权重。先按模型当前 License 自行部署：
+
+```bash
+sglang serve --model-path MiniMaxAI/MiniMax-H3 --model-variant fl2va
+```
+
+再给 daemon 配置字面量 loopback endpoint 和 H3 进程可见的同路径共享目录：
+
+```bash
+export SCRIPT_WEAVER_H3_URL=http://127.0.0.1:30000
+export SCRIPT_WEAVER_H3_SHARED_MEDIA_ROOT=/absolute/shared/script-weaver-h3
+uv run script-weaver workbench doctor
+```
+
+工作台只把已接受并冻结的关键帧复制到该共享目录。H3 视频从 `/content` 接口摄取后仍是
+候选，创作者接受后才成为正式 REF；生产包 manifest 不包含权重或未接受媒体。
+
 ## 开发
 
 ```bash
 # 安装开发依赖
-pip install -e ".[dev]"
+uv sync --python 3.11 --extra dev
 
 # 运行测试
-pytest
+XDG_DATA_HOME="$(mktemp -d)" uv run --extra dev --python 3.11 python -m pytest
 
 # 代码检查
-ruff check src/ tests/
+uv run --extra dev --python 3.11 ruff check src tests web/api
 
 # 手动测试完整流程
-python -m script_weaver generate "测试故事" --auto-approve --output-dir ./test-output
+uv run script-weaver generate "测试故事" --auto-approve --output-dir ./test-output
 ```
 
 ## 项目结构

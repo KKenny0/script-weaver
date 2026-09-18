@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -31,6 +31,87 @@ class ProjectCreate(BaseModel):
     aspect_ratio: Literal["16:9", "9:16", "1:1", "21:9"] = "9:16"
     prompt_language: str = Field(default="en", max_length=20)
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ProjectIntake(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    title: str = Field(min_length=1, max_length=200)
+    intake_kind: Literal["idea", "novel", "single_script", "multi_script"]
+    content: str = Field(min_length=1, max_length=1_500_000)
+    format: str = Field(default="short_drama", max_length=50)
+    aspect_ratio: Literal["16:9", "9:16", "1:1", "21:9"] = "9:16"
+    prompt_language: str = Field(default="zh", max_length=20)
+    source_project_id: str | None = None
+    continuation_kind: Literal["season"] | None = None
+
+    @model_validator(mode="after")
+    def continuation_is_paired(self) -> ProjectIntake:
+        if (self.source_project_id is None) != (self.continuation_kind is None):
+            raise ValueError("source_project_id and continuation_kind must be provided together")
+        return self
+
+
+class ProjectInputCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    intake_kind: Literal["supplement", "revision"]
+    title: str = Field(default="新的输入", min_length=1, max_length=200)
+    content: str = Field(min_length=1, max_length=1_500_000)
+
+
+class ProjectArchive(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_revision: int = Field(ge=0)
+
+
+class DraftSave(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_revision: int = Field(ge=0)
+    content: str = Field(max_length=1_500_000)
+
+
+class DocumentSubmit(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_document_revision: int = Field(ge=0)
+    expected_draft_revision: int = Field(ge=0)
+
+
+class DocumentDecision(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_document_revision: int = Field(ge=0)
+    action: Literal["accept", "reject"]
+    feedback: str | None = Field(default=None, max_length=10000)
+
+    @model_validator(mode="after")
+    def reject_requires_feedback(self) -> DocumentDecision:
+        if self.action == "reject" and not (self.feedback or "").strip():
+            raise ValueError("reject requires feedback")
+        return self
+
+
+class DocumentRestore(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_draft_revision: int = Field(ge=0)
+    source_version_id: str
+
+
+class ProjectionRetry(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_document_revision: int = Field(ge=0)
+
+
+class SingleScriptAdopt(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_document_revision: int = Field(ge=0)
+    expected_draft_revision: int = Field(ge=0)
 
 
 class LegacyImportRequest(BaseModel):
@@ -153,17 +234,59 @@ class SurfaceContextUpsert(BaseModel):
     selected_shot_ids: list[str] = Field(default_factory=list, max_length=100)
 
 
+class DocumentEditScope(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    draft_revision: int = Field(ge=0, strict=True)
+    start: int = Field(ge=0, strict=True)
+    end: int = Field(gt=0, strict=True)
+
+
 class TaskStart(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     project_id: str
     capability: str = Field(min_length=1, max_length=100)
     intent: str = Field(min_length=1, max_length=10000)
     surface_session_id: str | None = None
-    skill_manifest: list[dict[str, str]] = Field(default_factory=list, max_length=20)
+    document_id: str | None = None
+    document_version_id: str | None = None
+    edit_scope: DocumentEditScope | None = None
+    batch_key: str | None = Field(default=None, min_length=1, max_length=100)
+    asset_id: str | None = None
+    media_candidate_limit: int = Field(default=3, ge=1, le=8)
+    parent_candidate_id: str | None = None
+    skill_manifest: list[dict[str, str]] = Field(default_factory=list, max_length=1)
+
+    @model_validator(mode="after")
+    def exactly_one_matching_skill(self) -> TaskStart:
+        if self.edit_scope and (not self.document_id or self.capability != "short-drama-write"):
+            raise ValueError("局部修订必须指定剧本文档并使用写作能力")
+        if not self.skill_manifest:
+            self.skill_manifest = [{"name": self.capability, "version": "local"}]
+        if len(self.skill_manifest) != 1:
+            raise ValueError("a task must pin exactly one skill")
+        if self.skill_manifest[0].get("name") != self.capability:
+            raise ValueError("pinned skill name must equal task capability")
+        return self
+
+
+class TaskClaim(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    worker_label: str = Field(min_length=1, max_length=100)
+
+
+class TaskFail(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    run_id: str
+    message: str = Field(min_length=1, max_length=10000)
 
 
 class ChangeSetCreate(BaseModel):
     task_id: str
-    run_id: str | None = None
+    run_id: str
     summary: str = Field(default="", max_length=10000)
 
 
@@ -179,7 +302,24 @@ class AgentRunCreate(BaseModel):
     skill_version: str = Field(min_length=1, max_length=100)
 
 
+class DocumentCreatePayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["development", "screenplay", "review"]
+    title: str = Field(min_length=1, max_length=200)
+    content: str = Field(min_length=1, max_length=1_500_000)
+    episode_id: str | None = None
+
+
+class DocumentVersionCreatePayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    content: str = Field(min_length=1, max_length=1_500_000)
+
+
 class OperationBase(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     target_id: str | None = None
     expected_revision: int | None = Field(default=None, ge=0)
 
@@ -188,6 +328,20 @@ class SegmentCreateOperation(OperationBase):
     op: Literal["segment.create"]
     target_type: Literal["episode"] = "episode"
     payload: SegmentCreate
+
+
+class DocumentCreateOperation(OperationBase):
+    op: Literal["document.create"]
+    target_type: Literal["project"] = "project"
+    payload: DocumentCreatePayload
+
+
+class DocumentVersionCreateOperation(OperationBase):
+    op: Literal["document.version.create"]
+    target_type: Literal["document"] = "document"
+    target_id: str
+    expected_revision: int = Field(ge=0)
+    payload: DocumentVersionCreatePayload
 
 
 class ShotCreateOperation(OperationBase):
@@ -321,11 +475,22 @@ class PromptVersionCreateOperation(OperationBase):
 
 
 DomainOperation = (
-    SegmentCreateOperation | ShotCreateOperation | ShotUpdateOperation | ShotRetireOperation
+    DocumentCreateOperation | DocumentVersionCreateOperation | SegmentCreateOperation
+    | ShotCreateOperation | ShotUpdateOperation | ShotRetireOperation
     | ShotReorderOperation | AssetCreateOperation | AssetVersionCreateOperation
     | ReferenceBindOperation | ReferenceRebindOperation | ReferenceSetModeOperation
     | PromptVersionCreateOperation
 )
+
+
+class ProposalSubmit(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    run_id: str
+    summary: str = Field(default="", max_length=10000)
+    operations: list[Annotated[DomainOperation, Field(discriminator="op")]] = Field(
+        min_length=1, max_length=500
+    )
 
 
 class OperationEnvelope(BaseModel):
@@ -343,6 +508,31 @@ class GenerationPrepare(BaseModel):
     reference_asset_version_ids: list[str] = Field(default_factory=list, max_length=20)
     adapter: Literal["fake", "gpt-image-2"] = "fake"
     output_spec: dict[str, Any] = Field(default_factory=lambda: {"mime": "image/png"})
+    parent_candidate_id: str | None = None
+    target_asset_id: str | None = None
+
+
+class MediaCandidateAccept(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    asset_id: str | None = None
+    expected_asset_revision: int | None = Field(default=None, ge=0)
+    expected_shot_revision: int | None = Field(default=None, ge=0)
+
+
+class MediaCandidateImport(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    project_id: str
+    task_id: str
+    run_id: str
+    owner_type: Literal["shot", "asset"]
+    owner_id: str
+    prompt: str = Field(min_length=1, max_length=50000)
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    mime: Literal["image/png"] = "image/png"
+    parent_candidate_id: str | None = None
+    target_asset_id: str | None = None
 
 
 class GenerationConfirm(BaseModel):
@@ -351,3 +541,39 @@ class GenerationConfirm(BaseModel):
 
 class GenerationRun(BaseModel):
     confirmation_token: str = Field(min_length=1, max_length=200)
+
+
+class H3Keyframe(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    media_id: str
+    binding_id: str
+    frame_index: Literal[0, -1]
+
+
+class H3VideoPrepare(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    project_id: str
+    shot_id: str
+    target_asset_id: str
+    prompt: str = Field(min_length=1, max_length=50000)
+    keyframes: list[H3Keyframe] = Field(min_length=1, max_length=2)
+    duration_seconds: int = Field(ge=4, le=15)
+
+    @model_validator(mode="after")
+    def validate_keyframes(self):
+        expected = [0] if len(self.keyframes) == 1 else [0, -1]
+        if [item.frame_index for item in self.keyframes] != expected:
+            raise ValueError("keyframes must be ordered start frame 0, then optional end frame -1")
+        if len({item.media_id for item in self.keyframes}) != len(self.keyframes):
+            raise ValueError("keyframe media must be distinct")
+        if len({item.binding_id for item in self.keyframes}) != len(self.keyframes):
+            raise ValueError("keyframe bindings must be distinct")
+        return self
+
+
+class ProductionPackageCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_project_revision: int = Field(ge=0)
