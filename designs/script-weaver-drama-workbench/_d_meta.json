@@ -1,0 +1,104 @@
+{
+  "type": "design",
+  "designSystems": [],
+  "primaryDesignSystem": null,
+  "assets": {
+    "Drama Workbench": {
+      "versions": [
+        {
+          "path": "index.html",
+          "createdAt": "2026-08-29T10:01:51.812Z",
+          "status": "needs-review",
+          "subtitle": "V8 creator journey workbench with four intake paths, eight episodes, CLI double gate, correct nail-file media lineage, and production package",
+          "viewport": {
+            "width": 1440,
+            "height": 900
+          },
+          "section": "Workbench"
+        },
+        {
+          "path": "complete-flow.html",
+          "createdAt": "2026-08-29T14:28:44.720Z",
+          "status": "needs-review",
+          "subtitle": "Six-episode flow from development through production handoff",
+          "viewport": {
+            "width": 1440,
+            "height": 900
+          },
+          "section": "Workbench"
+        },
+        {
+          "path": "creator-flow.html",
+          "createdAt": "2026-08-29T15:46:27.068Z",
+          "status": "needs-review",
+          "subtitle": "Creator-first project materials, five episode documents, and unified production center",
+          "viewport": {
+            "width": 1440,
+            "height": 900
+          },
+          "section": "Workbench"
+        },
+        {
+          "path": "document-workspace.html",
+          "createdAt": "2026-08-30T00:25:00.000Z",
+          "status": "needs-review",
+          "subtitle": "Single-page document workspace with contextual approval and production confirmation",
+          "viewport": {
+            "width": 1440,
+            "height": 900
+          },
+          "section": "Workbench"
+        },
+        {
+          "path": "focus-workbench.html",
+          "createdAt": "2026-08-30T06:17:37.250Z",
+          "status": "needs-review",
+          "subtitle": "Focus-first multimodal text and image creation loop with formal REF and external video handoff",
+          "viewport": {
+            "width": 1440,
+            "height": 900
+          },
+          "section": "Workbench"
+        },
+        {
+          "path": "v6-dashboard.html",
+          "createdAt": "2026-08-30T07:11:49.681Z",
+          "status": "needs-review",
+          "subtitle": "Dashboard-first creator workspace with contextual Codex decisions and local MiniMax H3 production handoff",
+          "viewport": {
+            "width": 1440,
+            "height": 900
+          },
+          "section": "Workbench"
+        },
+        {
+          "path": "v7-complete-journey.html",
+          "createdAt": "2026-08-30T07:40:53.029Z",
+          "status": "needs-review",
+          "subtitle": "Idea-to-local-H3 complete creator journey with editable screenplay and visual decisions",
+          "viewport": {
+            "width": 1440,
+            "height": 900
+          },
+          "section": "Workbench"
+        }
+      ]
+    },
+    "Scene Creator Workbench": {
+      "versions": [
+        {
+          "path": "scene-workbench.html",
+          "createdAt": "2026-09-05T02:24:37.332Z",
+          "status": "needs-review",
+          "subtitle": "多作品与场次创作：剧本、拍法、镜头方案及静帧预演",
+          "viewport": {
+            "width": 1440,
+            "height": 900
+          }
+        }
+      ]
+    }
+  },
+  "createdAt": "2026-08-29T10:01:51.812Z",
+  "updatedAt": "2026-09-05T07:14:06.979Z"
+}
