@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -280,18 +281,18 @@ def profile_show() -> None:
     click.echo(f"\nStyle Preferences:")
     click.echo(f"  Genres: {', '.join(p.style_preferences.preferred_genres) or '(none)'}")
     click.echo(f"  Tones: {', '.join(p.style_preferences.preferred_tones) or '(none)'}")
-    click.echo(f"  Pace: {p.style_preferences.narrative_pace.value}")
-    click.echo(f"  Dialogue density: {p.style_preferences.dialogue_density.value}")
+    click.echo(f"  Pace: {p.style_preferences.narrative_pace}")
+    click.echo(f"  Dialogue density: {p.style_preferences.dialogue_density}")
 
     click.echo(f"\nDialogue Style:")
     ds = p.dialogue_style
-    click.echo(f"  Formality: {ds.formality_level.value}")
-    click.echo(f"  Subtext: {ds.subtext_preference.value}")
-    click.echo(f"  Monologue: {ds.monologue_frequency.value}")
+    click.echo(f"  Formality: {ds.formality_level}")
+    click.echo(f"  Subtext: {ds.subtext_preference}")
+    click.echo(f"  Monologue: {ds.monologue_frequency}")
 
     click.echo(f"\nVisual Preferences:")
     vp = p.visual_preferences
-    click.echo(f"  Movement: {vp.movement_preference.value}")
+    click.echo(f"  Movement: {vp.movement_preference}")
     click.echo(f"  Aspect ratios: {', '.join(vp.preferred_aspect_ratios)}")
 
     click.echo(f"\nPreferred Structures:")
@@ -326,9 +327,6 @@ def profile_edit() -> None:
     pm._profile = None  # Force reload
     p = pm.profile
     click.echo(f"Profile updated. Last modified: {p.updated_at}")
-
-
-import os
 
 
 if __name__ == "__main__":

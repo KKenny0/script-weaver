@@ -19,7 +19,7 @@ const ARTIFACT_TABS = [
   { id: "storyboard", label: "影像亮点", icon: Eye },
 ] as const;
 
-const API = "http://localhost:8000/api";
+const API = "/api";
 
 async function apiGet(path: string) {
   const res = await fetch(`${API}${path}`);

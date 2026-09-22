@@ -14,6 +14,33 @@ from uuid import uuid4
 from pydantic import BaseModel, Field
 
 
+class _LenientStrEnum:
+    """Mixin for LLM-facing enums (use as ``class X(_LenientStrEnum, str, Enum)``).
+
+    LLMs frequently emit near-miss enum values — synonyms ("extreme_wide_shot"
+    instead of "extreme_long_shot") or Chinese labels ("特写" instead of
+    "close_up"). Instead of failing validation and discarding the whole
+    artifact, coerce known synonyms and fall back to a sensible default member.
+    """
+
+    __synonyms__: dict[str, str] = {}
+    __default_value__: str | None = None
+
+    @classmethod
+    def _missing_(cls, value):
+        if isinstance(value, str):
+            norm = value.strip().lower().replace("-", "_").replace(" ", "_")
+            for key, target in cls.__synonyms__.items():
+                if key.lower().replace("-", "_").replace(" ", "_") == norm:
+                    try:
+                        return cls(target)
+                    except ValueError:
+                        continue
+        if cls.__default_value__ is not None:
+            return cls(cls.__default_value__)
+        return None
+
+
 # ────────────────────────────────────────────────────────
 # Constants & Enums
 # ────────────────────────────────────────────────────────
@@ -56,7 +83,7 @@ class FormatType(str, Enum):
 # ────────────────────────────────────────────────────────
 
 
-class ShotSize(str, Enum):
+class ShotSize(_LenientStrEnum, str, Enum):
     """Shot size / framing (景别)."""
     EXTREME_LONG_SHOT = "extreme_long_shot"       # 大远景 ELS
     LONG_SHOT = "long_shot"                         # 远景 LS
@@ -67,8 +94,22 @@ class ShotSize(str, Enum):
     CLOSE_UP = "close_up"                           # 特写 CU
     EXTREME_CLOSE_UP = "extreme_close_up"           # 大特写 ECU
 
+    __synonyms__ = {
+        "extreme_wide_shot": "extreme_long_shot", "extreme_wide": "extreme_long_shot",
+        "very_wide": "extreme_long_shot", "establishing_shot": "extreme_long_shot",
+        "establishing": "extreme_long_shot", "wide_shot": "long_shot", "wide": "long_shot",
+        "medium_wide": "medium_long_shot", "medium_shot_full": "medium_long_shot",
+        "mcu": "medium_close_up", "closeup": "close_up", "cu": "close_up",
+        "extreme_closeup": "extreme_close_up", "ecu": "extreme_close_up",
+        "大远景": "extreme_long_shot", "远景": "long_shot", "全景": "full_shot",
+        "中远景": "medium_long_shot", "中景": "medium_shot",
+        "中近景": "medium_close_up", "近景": "medium_close_up",
+        "特写": "close_up", "大特写": "extreme_close_up",
+    }
+    __default_value__ = "medium_shot"
 
-class CameraMovement(str, Enum):
+
+class CameraMovement(_LenientStrEnum, str, Enum):
     """Camera movement types (机位运动)."""
     STATIC = "static"                               # 固定机位
     PUSH_IN = "push_in"                             # 推镜头
@@ -88,8 +129,21 @@ class CameraMovement(str, Enum):
     ZOOM_IN = "zoom_in"                             # 变焦推进
     ZOOM_OUT = "zoom_out"                           # 变焦拉远
 
+    __synonyms__ = {
+        "固定": "static", "静止": "static", "fixed": "static",
+        "推": "push_in", "推近": "push_in", "pushin": "push_in",
+        "拉": "pull_out", "拉远": "pull_out", "pullout": "pull_out",
+        "左摇": "pan_left", "右摇": "pan_right", "摇": "pan_left",
+        "pan": "pan_left", "上仰": "tilt_up", "下俯": "tilt_down",
+        "跟拍": "tracking", "跟踪": "tracking", "移动": "dolly",
+        "弧形": "arc", "升降": "crane_up", "升": "crane_up", "降": "crane_down",
+        "手持": "handheld", "斯坦尼康": "steadicam", "航拍": "aerial",
+        "变焦推": "zoom_in", "变焦拉": "zoom_out", "zoom": "zoom_in",
+    }
+    __default_value__ = "static"
 
-class CameraAngle(str, Enum):
+
+class CameraAngle(_LenientStrEnum, str, Enum):
     """Camera angle types (拍摄角度)."""
     EYE_LEVEL = "eye_level"                         # 平视
     LOW_ANGLE = "low_angle"                         # 仰拍
@@ -100,14 +154,32 @@ class CameraAngle(str, Enum):
     POINT_OF_VIEW = "point_of_view"                 # 主观视角 POV
     TWO_SHOT = "two_shot"                           # 双人镜头
 
+    __synonyms__ = {
+        "平视": "eye_level", "水平": "eye_level",
+        "仰拍": "low_angle", "仰视": "low_angle", "low": "low_angle",
+        "俯拍": "high_angle", "俯视": "high_angle", "high": "high_angle",
+        "倾斜": "dutch_angle", "荷兰角": "dutch_angle",
+        "鸟瞰": "bird_eye", "过肩": "over_shoulder", "过肩镜头": "over_shoulder",
+        "pov": "point_of_view", "主观": "point_of_view",
+        "双人": "two_shot",
+    }
+    __default_value__ = "eye_level"
 
-class SceneLocationType(str, Enum):
+
+class SceneLocationType(_LenientStrEnum, str, Enum):
     INT = "INT."
     EXT = "EXT."
     INT_EXT = "INT./EXT."
 
+    __synonyms__ = {
+        "内景": "INT.", "int": "INT.", "室内": "INT.",
+        "外景": "EXT.", "ext": "EXT.", "室外": "EXT.",
+        "内外景": "INT./EXT.", "int/ext": "INT./EXT.",
+    }
+    __default_value__ = "INT."
 
-class TransitionType(str, Enum):
+
+class TransitionType(_LenientStrEnum, str, Enum):
     CUT = "cut"
     FADE_IN = "fade_in"
     FADE_OUT = "fade_out"
@@ -119,12 +191,73 @@ class TransitionType(str, Enum):
     HARD_CUT = "hard_cut"
     WIPE = "wipe"
 
+    __synonyms__ = {
+        "切": "cut", "硬切": "hard_cut",
+        "淡入": "fade_in", "淡出": "fade_out",
+        "叠化": "dissolve", "溶解": "dissolve", "交叉溶解": "cross_dissolve",
+        "跳切": "jump_cut", "匹配剪辑": "match_cut", "划像": "wipe",
+    }
+    __default_value__ = "cut"
 
-class CharacterRole(str, Enum):
+
+class CharacterRole(_LenientStrEnum, str, Enum):
     PROTAGONIST = "protagonist"
     ANTAGONIST = "antagonist"
     SUPPORTING = "supporting"
     EXTRA = "extra"
+
+    __synonyms__ = {
+        "主角": "protagonist", "反派": "antagonist",
+        "配角": "supporting", "龙套": "extra", "群众": "extra",
+    }
+    __default_value__ = "supporting"
+
+
+class EnvironmentType(_LenientStrEnum, str, Enum):
+    """Interior/exterior scene environment type."""
+    INTERIOR = "interior"
+    EXTERIOR = "exterior"
+    MIXED = "mixed"
+
+    __synonyms__ = {
+        "内景": "interior", "室内": "interior", "int": "interior",
+        "外景": "exterior", "室外": "exterior", "ext": "exterior",
+        "内外景": "mixed", "混合": "mixed", "int/ext": "mixed",
+        "interior/exterior": "mixed",
+    }
+    __default_value__ = "interior"
+
+
+class ScriptBlockType(_LenientStrEnum, str, Enum):
+    """Type of a script block."""
+    SCENE_HEADING = "scene_heading"
+    ACTION = "action"
+    DIALOGUE = "dialogue"
+    TRANSITION = "transition"
+
+    __synonyms__ = {
+        "场景标题": "scene_heading", "标题": "scene_heading", "heading": "scene_heading",
+        "动作": "action", "描述": "action", "action_block": "action",
+        "对白": "dialogue", "对话": "dialogue", "dialogue_block": "dialogue",
+        "转场": "transition", "transition_block": "transition",
+    }
+    __default_value__ = "action"
+
+
+class AspectRatio(_LenientStrEnum, str, Enum):
+    """Video aspect ratio."""
+    WIDE = "16:9"
+    VERTICAL = "9:16"
+    SQUARE = "1:1"
+    CINEMA = "21:9"
+
+    __synonyms__ = {
+        "横屏": "16:9", "16比9": "16:9",
+        "竖屏": "9:16", "9比16": "9:16",
+        "方形": "1:1", "1比1": "1:1",
+        "宽银幕": "21:9", "21比9": "21:9",
+    }
+    __default_value__ = "16:9"
 
 
 class UserAction(str, Enum):
@@ -183,7 +316,7 @@ class BasicInfo(BaseModel):
     theme: str = ""                                # Core theme
     tone: str = ""                                 # e.g., "虐心", "热血"
     target_audience: str | None = None
-    episode_count: int = 1
+    episode_count: int | str = 1
     estimated_total_duration: str = ""             # e.g., "约30分钟"
 
 
@@ -253,7 +386,7 @@ class SceneDesign(BaseModel):
     id: str = Field(default_factory=lambda: f"scene_{uuid4().hex[:8]}")
     name: str = ""
 
-    location_type: Literal["interior", "exterior", "mixed"] = "interior"
+    location_type: EnvironmentType = EnvironmentType.INTERIOR
     environment: str = ""                          # Detailed environmental description
     time_of_day: str = ""                          # e.g., "深夜", "黄昏"
     weather: str | None = None
@@ -312,13 +445,13 @@ class TransitionBlock(BaseModel):
 
 class ScriptBlock(BaseModel):
     """Discriminated union of all script block types."""
-    block_type: Literal["scene_heading", "action", "dialogue", "transition"]
+    block_type: ScriptBlockType = ScriptBlockType.ACTION
     # Content varies by block_type; stored as raw dict for flexibility
     content: dict[str, Any] = Field(default_factory=dict)
 
 
 class ScriptSceneHeading(BaseModel):
-    scene_number: str = ""
+    scene_number: str | int = ""
     int_ext: SceneLocationType = SceneLocationType.INT
     location: str = ""
     time_of_day: str = ""
@@ -387,7 +520,7 @@ class Storyboard(BaseModel):
     shots: list[Shot] = Field(default_factory=list)
     total_shot_count: int = 0
     total_estimated_duration: float = 0.0
-    aspect_ratio: Literal["16:9", "9:16", "1:1", "21:9"] = "16:9"
+    aspect_ratio: AspectRatio = AspectRatio.WIDE
     fps: int = 24
     notes: str | None = None
 
@@ -710,7 +843,7 @@ class ProjectState(BaseModel):
         if self.script:
             return ProjectStatus.STORYBOARDING
         if self.characters or self.scenes or self.art_style:
-            return ProjectStatus.SCRIPTWRITING
+            return ProjectStatus.SCRIPTING
         if self.outline:
             return ProjectStatus.DESIGNING
         if self.refined_idea:

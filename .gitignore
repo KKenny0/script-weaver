@@ -5,3 +5,6 @@ __pycache__/
 *.pyo
 .env
 snapshot/
+.venv/
+*.egg-info/
+next-env.d.ts

@@ -20,6 +20,10 @@ export function useTheme() {
 
 const STORAGE_KEY = "scriptweaver-theme";
 
+// Runs before React hydrates to set `data-theme` on <html>, preventing a
+// flash of the wrong theme — while the actual app content still SSR-renders.
+const BOOTSTRAP_SCRIPT = `(function(){try{var t=localStorage.getItem('${STORAGE_KEY}');if(t!=='light'&&t!=='dark'){t=window.matchMedia('(prefers-color-scheme: light)').matches?'light':'dark';}document.documentElement.setAttribute('data-theme',t);}catch(e){}})();`;
+
 function getInitialTheme(): Theme {
   if (typeof window === "undefined") return "dark";
   const stored = localStorage.getItem(STORAGE_KEY);
@@ -29,13 +33,9 @@ function getInitialTheme(): Theme {
 
 export default function ThemeProvider({ children }: { children: React.ReactNode }) {
   const [theme, setTheme] = useState<Theme>("dark");
-  const [mounted, setMounted] = useState(false);
 
   useEffect(() => {
-    const initial = getInitialTheme();
-    setTheme(initial);
-    document.documentElement.setAttribute("data-theme", initial);
-    setMounted(true);
+    setTheme(getInitialTheme());
   }, []);
 
   const toggleTheme = useCallback(() => {
@@ -47,28 +47,12 @@ export default function ThemeProvider({ children }: { children: React.ReactNode 
     });
   }, []);
 
-  // Prevent flash on load: render nothing until mounted
-  if (!mounted) {
-    return (
-      <script
-        dangerouslySetInnerHTML={{
-          __html: `
-            (function() {
-              var t = localStorage.getItem('${STORAGE_KEY}');
-              if (t !== 'light' && t !== 'dark') {
-                t = window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
-              }
-              document.documentElement.setAttribute('data-theme', t);
-            })();
-          `,
-        }}
-      />
-    );
-  }
-
   return (
-    <ThemeContext.Provider value={{ theme, toggleTheme }}>
-      {children}
-    </ThemeContext.Provider>
+    <>
+      <script dangerouslySetInnerHTML={{ __html: BOOTSTRAP_SCRIPT }} />
+      <ThemeContext.Provider value={{ theme, toggleTheme }}>
+        {children}
+      </ThemeContext.Provider>
+    </>
   );
 }

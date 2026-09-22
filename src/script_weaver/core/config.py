@@ -15,7 +15,7 @@ class Settings(BaseSettings):
     ] = "anthropic"
     llm_model: str = "claude-sonnet-4-20250514"
     llm_temperature: float = 0.7
-    llm_max_tokens: int = 4096
+    llm_max_tokens: int = 8192
 
     # API Keys (provider-specific)
     anthropic_api_key: str | None = None

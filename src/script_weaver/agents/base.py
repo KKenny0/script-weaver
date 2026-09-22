@@ -107,6 +107,7 @@ class BaseAgent:
         """Core agent loop: LLM call → tool execution → repeat until done."""
         iteration = 0
         last_content = ""
+        last_artifact: dict[str, Any] | list[Any] | None = None
 
         while iteration < self._max_iterations:
             iteration += 1
@@ -124,27 +125,76 @@ class BaseAgent:
             # Build assistant message from response
             assistant_msg: dict[str, Any] = {}
             if response.content:
-                assistant_msg["content"] = response.content
                 last_content = response.content
             if response.tool_calls:
+                # OpenAI tool-call format: content must be null, and each call
+                # needs the type/function wrapper with arguments as a JSON string.
+                assistant_msg["content"] = None
                 assistant_msg["tool_calls"] = [
-                    {"id": tc.id, "name": tc.name, "arguments": tc.arguments}
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.name,
+                            "arguments": (
+                                json.dumps(tc.arguments, ensure_ascii=False)
+                                if isinstance(tc.arguments, dict)
+                                else str(tc.arguments)
+                            ),
+                        },
+                    }
                     for tc in response.tool_calls
                 ]
-            if not assistant_msg:
-                assistant_msg["content"] = "(no response)"
+            else:
+                assistant_msg["content"] = response.content or "(no response)"
             messages.append({"role": "assistant", **assistant_msg})
 
             # Branch: tool calls vs. final response
             if response.tool_calls:
-                # Execute each tool call and append results
+                # Execute each tool call and append results as tool-role messages
                 for tool_call in response.tool_calls:
                     logger.debug(
                         f"[{self.name}] Tool call: {tool_call.name}({tool_call.arguments})"
                     )
+                    # Capture write_artifact payload so it can be integrated into state
+                    if tool_call.name == "write_artifact":
+                        args = tool_call.arguments
+                        if isinstance(args, str):
+                            try:
+                                args = json.loads(args)
+                            except json.JSONDecodeError:
+                                args = {}
+                        if isinstance(args, dict):
+                            content = args.get("content")
+                            parsed: dict[str, Any] | list[Any] | None = None
+                            if isinstance(content, str):
+                                try:
+                                    parsed = json.loads(content)
+                                except json.JSONDecodeError:
+                                    parsed = None
+                            elif isinstance(content, (dict, list)):
+                                parsed = content
+                            if parsed is not None:
+                                # Artifact written — return immediately. The LLM
+                                # often keeps calling read_state/request_review
+                                # after writing and never emits a final text, which
+                                # previously made the loop spin to max iterations.
+                                logger.info(
+                                    f"[{self.name}] Artifact captured via write_artifact "
+                                    f"on iteration {iteration}."
+                                )
+                                return {
+                                    "status": "success",
+                                    "data": parsed,
+                                    "raw": (
+                                        content if isinstance(content, str)
+                                        else json.dumps(content, ensure_ascii=False)
+                                    ),
+                                }
                     result = await self._execute_tool(tool_name=tool_call.name, arguments=tool_call.arguments)
                     messages.append({
-                        "role": "user",
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
                         "content": result,
                     })
                 # Loop continues — LLM will see tool results and decide next action
@@ -152,10 +202,18 @@ class BaseAgent:
                 # No tool calls — agent has finished its reasoning
                 # Try to extract structured output from the content
                 parsed = self._parse_final_output(response.content, state_json)
+                if last_artifact is not None and parsed.get("status") != "success":
+                    parsed = {
+                        "status": "success",
+                        "data": last_artifact,
+                        "raw": response.content,
+                    }
                 return parsed
 
         # Exceeded max iterations — force return whatever we have
         logger.warning(f"[{self.name}] Max iterations ({self._max_iterations}) reached.")
+        if last_artifact is not None:
+            return {"status": "success", "data": last_artifact, "raw": last_content}
         return {"error": "max_iterations_exceeded", "raw_response": last_content}
 
     async def _execute_tool(self, tool_name: str, arguments: dict[str, Any] | str) -> str:

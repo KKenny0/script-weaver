@@ -76,7 +76,7 @@ def _add_user_profile_hints(base_prompt: str, stage: str) -> str:
 # ────────────────────────────────────────────────────────
 
 
-class IdeaRefiner(SimpleAgent):
+class IdeaRefiner(BaseAgent):
     """Takes raw user idea → produces refined story concept."""
 
     name = "idea_refiner"

@@ -215,9 +215,9 @@ class ProfileManager:
 
         if stage == PipelineStage.SCRIPTWRITING.value:
             ds = self.profile.dialogue_style
-            hints.append(f"Dialogue style: {ds.formality_level.value}")
-            hints.append(f"Subtext preference: {ds.subtext_preference.value}")
-            hints.append(f"Monologue frequency: {ds.monologue_frequency.value}")
+            hints.append(f"Dialogue style: {ds.formality_level}")
+            hints.append(f"Subtext preference: {ds.subtext_preference}")
+            hints.append(f"Monologue frequency: {ds.monologue_frequency}")
 
         elif stage == PipelineStage.STORYBOARDING.value:
             vp = self.profile.visual_preferences

@@ -29,6 +29,7 @@ from script_weaver.core.types import (
     DecisionRecord,
     ProjectMeta,
     ProjectState,
+    ProjectStatus,
     UserAction,
     VisualHighlight,
 )
@@ -41,6 +42,30 @@ logger = logging.getLogger(__name__)
 
 # Type alias for async functions
 AsyncFunc = Callable[..., Coroutine[Any, Any, Any]]
+
+
+def _coerce_llm_types(data: Any) -> Any:
+    """Recursively coerce LLM output: pure-numeric strings → int/float.
+
+    LLMs frequently emit numbers as strings (e.g. "1" instead of 1), which
+    fails strict Pydantic validation and discards an entire artifact. This
+    normalizes the common cases so one type mismatch doesn't lose everything.
+    """
+    if isinstance(data, dict):
+        return {k: _coerce_llm_types(v) for k, v in data.items()}
+    if isinstance(data, list):
+        return [_coerce_llm_types(v) for v in data]
+    if isinstance(data, str):
+        s = data.strip()
+        if s:
+            try:
+                return int(s)
+            except ValueError:
+                try:
+                    return float(s)
+                except ValueError:
+                    return data
+    return data
 
 
 class HumanGateResult:
@@ -121,7 +146,7 @@ class PipelineEngine:
                 status = result.get("status", "")
                 data = result.get("data", result)
 
-                if status == "success" and isinstance(data, dict):
+                if status == "success" and isinstance(data, (dict, list)):
                     await self._integrate_artifact(state, agent_name, data)
                 elif status == "text_response":
                     # Agent returned text directly — try to parse as artifact
@@ -160,6 +185,8 @@ class PipelineEngine:
             ArtStyle, Character, Outline, Script, SceneDesign, Storyboard,
         )
 
+        data = _coerce_llm_types(data)
+
         try:
             if agent_name == "idea_refiner":
                 state.refined_idea = data.get("logline", "")
@@ -167,12 +194,12 @@ class PipelineEngine:
                     state.refined_idea = data.get("title", "") + ": " + data.get(
                         "core_theme", ""
                     )
-                state.meta.status = "refining"
+                state.meta.status = ProjectStatus.REFINING
 
             elif agent_name == "structurer":
                 outline = Outline.model_validate(data) if data else Outline()
                 state.outline = outline
-                state.meta.status = "structured"
+                state.meta.status = ProjectStatus.STRUCTURED
 
             elif agent_name == "character_designer":
                 if isinstance(data, list):
@@ -180,7 +207,7 @@ class PipelineEngine:
                 else:
                     characters = [Character.model_validate(data)]
                 state.characters = characters
-                state.meta.status = "designing"
+                state.meta.status = ProjectStatus.DESIGNING
 
             elif agent_name == "scene_designer":
                 if isinstance(data, list):
@@ -194,13 +221,13 @@ class PipelineEngine:
 
             elif agent_name == "scriptwriter":
                 state.script = Script.model_validate(data)
-                state.meta.status = "scripting"
+                state.meta.status = ProjectStatus.SCRIPTING
 
             elif agent_name == "storyboard_artist":
                 sb = Storyboard.model_validate(data)
                 sb.compute_totals()
                 state.storyboard = sb
-                state.meta.status = "storyboarding"
+                state.meta.status = ProjectStatus.STORYBOARDING
 
             state.touch()
         except Exception as e:
@@ -238,14 +265,14 @@ class PipelineEngine:
         self._notify("pipeline", "--- Stage 1: Idea Refinement ---")
         await self._run_agent("idea_refiner", state, user_input)
 
-        if not self._await_gate("ideation", state):
+        if not await self._await_gate("ideation", state):
             return state
 
         # ── Stage 2: Structuring ───────────────────────
         self._notify("pipeline", "--- Stage 2: Story Structuring ---")
         await self._run_agent("structurer", state)
 
-        if not self._await_gate("structuring", state):
+        if not await self._await_gate("structuring", state):
             return state
 
         # ── Stage 3: Design (Parallel) ────────────────
@@ -254,14 +281,14 @@ class PipelineEngine:
         await self._run_agent("scene_designer", state)
         await self._run_agent("art_director", state)
 
-        if not self._await_gate("designing", state):
+        if not await self._await_gate("designing", state):
             return state
 
         # ── Stage 4: Script Writing ────────────────────
         self._notify("pipeline", "--- Stage 4: Script Writing ---")
         await self._run_agent("scriptwriter", state)
 
-        if not self._await_gate("scriptwriting", state):
+        if not await self._await_gate("scriptwriting", state):
             return state
 
         # ── Stage 5: Storyboarding ────────────────────
@@ -273,7 +300,7 @@ class PipelineEngine:
         await self._generate_visual_highlights(state)
 
         # ── Final State ───────────────────────────────
-        state.meta.status = "complete"
+        state.meta.status = ProjectStatus.COMPLETE
         state.touch()
 
         # ── Growth Loop ──────────────────────────────

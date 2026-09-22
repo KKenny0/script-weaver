@@ -73,8 +73,8 @@ STRUCTURER_PROMPT = """你是一位**资深编剧/故事架构师**，精通多�
     "genre": "类型",
     "theme": "主题",
     "tone": "基调",
-    "episode_count": 集数/幕数,
-    "estimated_total_duration": "总时长"
+    "episode_count": 1,
+    "estimated_total_duration": "约30分钟"
   },
   "main_characters": [
     {
