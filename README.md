@@ -253,6 +253,19 @@ ruff check src/ tests/
 python -m script_weaver generate "测试故事" --auto-approve --output-dir ./test-output
 ```
 
+### Web 前端回归（Playwright）
+
+针对 Web 端异步隔离行为（迟到响应、面板折叠、历史查看）的端到端回归，使用页面内请求门闩复现竞争，不依赖固定等待：
+
+```bash
+cd web
+npm install
+npx playwright install chromium   # 首次运行前执行一次
+npm run test:e2e                  # 自动启动隔离后端(8310)与前端(3100)
+```
+
+测试使用独立的临时数据目录（`/tmp/script-weaver-e2e-data`），不会触碰默认数据目录；无模型密钥即可运行。
+
 ## 真实模型验收
 
 DeepSeek 适配器显式使用非思考模式，匹配当前工具消息协议。分镜按剧本场次分别生成，

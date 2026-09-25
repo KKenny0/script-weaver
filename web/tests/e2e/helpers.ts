@@ -1,0 +1,179 @@
+import type { APIRequestContext, Page } from "@playwright/test";
+
+/**
+ * In-page request gate: deterministic race control without fixed waits.
+ *
+ * `gate(page, "GET /versions")` holds matching fetches; `release(page, key)`
+ * resolves the OLDEST held request (FIFO), `releaseAll` resolves everything.
+ * `gateRespond` additionally replaces the response body when released (e.g.
+ * to fake a 500). Requests started after `ungate` pass through untouched.
+ *
+ * Keys are "<METHOD> <url-fragment>", matched via url.includes(fragment).
+ */
+export async function installGate(page: Page) {
+  await page.addInitScript(() => {
+    const w = window as any;
+    w.__gateRules = new Map<string, null | { status: number; body: unknown }>();
+    w.__gatePending = new Map<string, Array<() => void>>();
+
+    const orig = window.fetch.bind(window);
+    window.fetch = (input: any, init: any) => {
+      const url = typeof input === "string" ? input : input.url;
+      const method = ((init && init.method) || "GET").toUpperCase();
+      for (const key of w.__gateRules.keys()) {
+        const [m, frag] = key.split(" ");
+        if (method === m && url.includes(frag)) {
+          if (!w.__gatePending.has(key)) w.__gatePending.set(key, []);
+          const queue = w.__gatePending.get(key);
+          return new Promise<void>((resolve) => queue.push(resolve)).then(() => {
+            const mock = w.__gateRules.get(key);
+            if (mock) {
+              return new Response(JSON.stringify(mock.body), {
+                status: mock.status,
+                headers: { "Content-Type": "application/json" },
+              });
+            }
+            return orig(input, init);
+          });
+        }
+      }
+      return orig(input, init);
+    };
+  });
+}
+
+export async function gate(page: Page, key: string) {
+  await page.evaluate((key) => {
+    (window as any).__gateRules.set(key, null);
+  }, key);
+}
+
+export async function gateRespond(
+  page: Page,
+  key: string,
+  status: number,
+  body: unknown,
+) {
+  await page.evaluate(
+    ({ key, status, body }) => {
+      (window as any).__gateRules.set(key, { status, body });
+    },
+    { key, status, body },
+  );
+}
+
+export async function ungate(page: Page, key: string) {
+  await page.evaluate((key) => {
+    (window as any).__gateRules.delete(key);
+  }, key);
+}
+
+/** Resolve the oldest held request for this key (FIFO). */
+export async function release(page: Page, key: string) {
+  await page.evaluate((key) => {
+    const queue = (window as any).__gatePending.get(key) || [];
+    const resolve = queue.shift();
+    if (resolve) resolve();
+  }, key);
+}
+
+export async function releaseAll(page: Page, key: string) {
+  await page.evaluate((key) => {
+    const queue = (window as any).__gatePending.get(key) || [];
+    queue.splice(0).forEach((resolve: () => void) => resolve());
+  }, key);
+}
+
+/** Seed a project directly against the isolated backend.
+ *
+ * The title gets a unique suffix: the e2e data dir persists across runs,
+ * so identical titles would produce ambiguous list entries.
+ */
+export async function seedProject(
+  request: APIRequestContext,
+  title: string,
+): Promise<{ project_id: string; revision: number; title: string }> {
+  const unique = `${title}-${Math.random().toString(36).slice(2, 8)}`;
+  const res = await request.post("http://127.0.0.1:8310/api/projects", {
+    data: { user_input: `想法：${unique}`, title: unique },
+  });
+  const body = await res.json();
+  return { ...body, title: unique };
+}
+
+/** Advance a seeded project to revision 2 (rename) so history has entries. */
+export async function seedSecondRevision(
+  request: APIRequestContext,
+  projectId: string,
+  newTitle: string,
+): Promise<void> {
+  const res = await request.patch(`http://127.0.0.1:8310/api/projects/${projectId}`, {
+    data: { title: newTitle, expected_revision: 1 },
+  });
+  if (!res.ok()) throw new Error(`seedSecondRevision failed: ${res.status()}`);
+}
+
+/**
+ * Navigate and wait until the app has hydrated: the mount-time skills
+ * request only fires from the client bundle, so it is a reliable signal
+ * (SSR-only pages never issue it and would silently drop interactions).
+ */
+export async function openApp(page: import("@playwright/test").Page, url: string) {
+  const skills = page.waitForResponse((r) => r.url().includes("/api/skills"), { timeout: 30_000 });
+  await page.goto(url);
+  await skills;
+}
+
+/**
+ * Release a gated request and wait until its outcome has been processed:
+ * the real network response (when it goes to the backend) plus two frame
+ * ticks so React has committed whatever the handlers decided. Event-driven
+ * — no fixed sleeps.
+ */
+export async function releaseAndSettle(
+  page: import("@playwright/test").Page,
+  key: string,
+  urlFragment: string,
+) {
+  const responded = page
+    .waitForResponse((r) => r.url().includes(urlFragment), { timeout: 5_000 })
+    .catch(() => null);
+  await release(page, key);
+  await responded;
+  await page.evaluate(
+    () =>
+      new Promise<void>((resolve) =>
+        requestAnimationFrame(() => setTimeout(() => requestAnimationFrame(() => resolve()), 0)),
+      ),
+  );
+}
+
+/** Write an outline into a seeded project via the store (no model needed). */
+export async function seedOutline(
+  projectId: string,
+  logline: string,
+): Promise<void> {
+  const { execFile } = await import("node:child_process");
+  const script = `
+import sys
+from pathlib import Path
+from script_weaver.core.project_store import ProjectStore
+from script_weaver.core.types import Outline, BasicInfo, ProjectStatus
+pid, logline = sys.argv[1], sys.argv[2]
+store = ProjectStore(Path("/tmp/script-weaver-e2e-data/main-web/projects.sqlite3"))
+rec = store.get_required(pid)
+rec.state.outline = Outline(basic_info=BasicInfo(logline=logline, genre="e2e"))
+rec.state.refined_idea = logline
+rec.state.meta.status = ProjectStatus.STRUCTURED
+store.save_state(pid, rec.state, rec.revision, source="manual", summary="e2e seed")
+store.close()
+`;
+  await new Promise<void>((resolve, reject) => {
+    execFile(
+      "../.venv/bin/python",
+      ["-c", script, projectId, logline],
+      { cwd: process.cwd() },
+      (err) => (err ? reject(err) : resolve()),
+    );
+  });
+}

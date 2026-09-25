@@ -8,3 +8,7 @@ snapshot/
 .venv/
 *.egg-info/
 next-env.d.ts
+
+# e2e test artifacts
+web/test-results/
+web/tsconfig.tsbuildinfo

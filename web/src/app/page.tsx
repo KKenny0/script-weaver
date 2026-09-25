@@ -78,6 +78,11 @@ export default function HomePage() {
   // overwrite the current one.
   const projectRef = useRef("");
   const sessionEpochRef = useRef(0);
+  // Monotonic token for history requests: every new view intent (open,
+  // retry, snapshot load, close, project switch) supersedes the previous
+  // one, so a late history response can only ever update the view session
+  // it belongs to.
+  const historyReqRef = useRef(0);
   // Set by ChatPanel; closing the stream ends the subscription only (the
   // backend owns the task).
   const closeStreamRef = useRef<() => void>(() => {});
@@ -90,6 +95,20 @@ export default function HomePage() {
     sessionEpochRef.current += 1;
     setSessionNotice({ epoch: sessionEpochRef.current, text });
   }, []);
+
+  // Parent-owned liveness checks. ChatPanel is conditionally unmounted (chat
+  // collapse), so its own refs stop receiving updates the moment it unmounts;
+  // these stable predicates read the always-alive page refs instead. A stale
+  // async continuation from any ChatPanel instance — mounted or not — can
+  // therefore only proceed while its session/project is still current.
+  const isSessionActive = useCallback(
+    (epoch: number) => sessionEpochRef.current === epoch,
+    [],
+  );
+  const isProjectActive = useCallback(
+    (id: string) => projectRef.current === id,
+    [],
+  );
 
   const refreshProjects = useCallback(async () => {
     try {
@@ -108,6 +127,7 @@ export default function HomePage() {
     setActiveTab("outline");
     setProjectStatus("idle");
     setHistoryPanel(HISTORY_CLOSED);
+    historyReqRef.current++; // in-flight history responses belong to the old project
     window.history.replaceState(null, "", `/?project=${encodeURIComponent(id)}`);
     nextNotice("📂 正在打开项目…");
     try {
@@ -133,6 +153,7 @@ export default function HomePage() {
     setActiveTab("outline");
     setProjectStatus("idle");
     setHistoryPanel(HISTORY_CLOSED);
+    historyReqRef.current++;
     window.history.replaceState(null, "", "/");
     nextNotice("🆕 已开始一个新项目，输入故事想法开始生成。");
   }, [nextNotice]);
@@ -166,9 +187,11 @@ export default function HomePage() {
   // ── Version history (read-only; separate from the live project state) ──
 
   const refreshHistory = useCallback(async (projectId: string) => {
+    const token = ++historyReqRef.current;
     setHistoryPanel((prev) => ({ ...prev, loading: true, error: null }));
     try {
       const result = await apiGet(`/projects/${projectId}/versions`);
+      if (historyReqRef.current !== token) return; // superseded view intent
       setHistoryPanel((prev) => ({
         ...prev,
         open: true,
@@ -178,6 +201,7 @@ export default function HomePage() {
         currentRevision: result.current_revision ?? 0,
       }));
     } catch (err: any) {
+      if (historyReqRef.current !== token) return;
       // Keep the panel open so the failure is visible and retryable.
       setHistoryPanel((prev) => ({ ...prev, open: true, loading: false, error: err.message }));
     }
@@ -187,6 +211,8 @@ export default function HomePage() {
     if (!projectId) return;
     if (historyPanel.open) {
       // Toggle: from a snapshot back to the list, from the list to closed.
+      // Either way the replaced intent invalidates in-flight responses.
+      historyReqRef.current++;
       setHistoryPanel((prev) => (prev.viewing ? { ...prev, viewing: null, error: null } : HISTORY_CLOSED));
       return;
     }
@@ -196,9 +222,11 @@ export default function HomePage() {
 
   const handleSelectHistoryVersion = useCallback(async (revision: number) => {
     if (!projectId) return;
+    const token = ++historyReqRef.current;
     setHistoryPanel((prev) => ({ ...prev, viewingLoading: true, error: null }));
     try {
       const snap = await apiGet(`/projects/${projectId}/versions/${revision}`);
+      if (historyReqRef.current !== token) return; // superseded (closed/switched/another view)
       const viewing: VersionSnapshot = {
         revision: snap.revision,
         title: snap.meta?.title ?? "",
@@ -209,15 +237,18 @@ export default function HomePage() {
       };
       setHistoryPanel((prev) => ({ ...prev, viewing, viewingLoading: false }));
     } catch (err: any) {
+      if (historyReqRef.current !== token) return;
       setHistoryPanel((prev) => ({ ...prev, viewingLoading: false, error: err.message }));
     }
   }, [projectId]);
 
   const handleBackToHistoryList = useCallback(() => {
+    historyReqRef.current++;
     setHistoryPanel((prev) => ({ ...prev, viewing: null, error: null }));
   }, []);
 
   const handleCloseHistory = useCallback(() => {
+    historyReqRef.current++;
     setHistoryPanel(HISTORY_CLOSED);
   }, []);
 
@@ -258,6 +289,9 @@ export default function HomePage() {
           onTabSwitch={setActiveTab}
           onCollapse={() => setLeftPanelCollapsed(true)}
           sessionNotice={sessionNotice}
+          sessionEpoch={sessionNotice?.epoch ?? 0}
+          isSessionActive={isSessionActive}
+          isProjectActive={isProjectActive}
           closeStreamRef={closeStreamRef}
           onProjectCreated={handleProjectCreated}
           onProjectMutated={handleProjectMutated}
