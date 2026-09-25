@@ -255,7 +255,7 @@ python -m script_weaver generate "测试故事" --auto-approve --output-dir ./te
 
 ### Web 前端回归（Playwright）
 
-针对 Web 端异步隔离行为（迟到响应、面板折叠、历史查看）的端到端回归，使用页面内请求门闩复现竞争，不依赖固定等待：
+针对 Web 端异步隔离行为（迟到响应、面板折叠、历史查看、生成连接生命周期）的端到端回归，使用页面内请求门闩与生成 SSE 替身（EventSource stand-in）复现竞争，不依赖固定等待：
 
 ```bash
 cd web
@@ -264,7 +264,7 @@ npx playwright install chromium   # 首次运行前执行一次
 npm run test:e2e                  # 自动启动隔离后端(8310)与前端(3100)
 ```
 
-测试使用独立的临时数据目录（`/tmp/script-weaver-e2e-data`），不会触碰默认数据目录；无模型密钥即可运行。
+测试使用独立的临时数据目录（`/tmp/script-weaver-e2e-data`），不会触碰默认数据目录。生成一律通过页内 EventSource 替身驱动（支持等待、进度、完成、错误与关闭），且配置会用空密钥覆盖所有 `SCRIPTWEAVER_*_API_KEY`（真实环境变量优先于 `.env`），因此即使开发机配置了真实密钥，E2E 也不会、也不能发起任何真实模型调用；每个用例结束时都会断言没有任何请求真正到达 `/generate` 或 `/refine`。
 
 ## 真实模型验收
 

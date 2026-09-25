@@ -114,6 +114,125 @@ export async function seedSecondRevision(
 }
 
 /**
+ * In-page EventSource stand-in for the generation SSE endpoint.
+ *
+ * The e2e backend runs model-less on purpose (see playwright.config.ts);
+ * replacing window.EventSource before hydration means the suite can drive
+ * a generation connection's full lifecycle — waiting, progress, done,
+ * error, close — deterministically, and no test can ever open a real
+ * /generate connection (which would start a real pipeline run).
+ */
+export async function installSSEStub(page: Page) {
+  await page.addInitScript(() => {
+    class MockEventSource {
+      url: string;
+      readyState = 1; // OPEN
+      onopen: ((e?: unknown) => void) | null = null;
+      onmessage: ((e?: unknown) => void) | null = null;
+      onerror: ((e?: unknown) => void) | null = null;
+      closed = false; // test-visible marker: close() was called
+      private listeners = new Map<string, Set<(e: unknown) => void>>();
+
+      constructor(url: string) {
+        this.url = url;
+        (window as any).__mockSSE.push(this);
+      }
+
+      addEventListener(type: string, cb: (e: unknown) => void) {
+        if (!this.listeners.has(type)) this.listeners.set(type, new Set());
+        this.listeners.get(type)!.add(cb);
+      }
+
+      removeEventListener(type: string, cb: (e: unknown) => void) {
+        this.listeners.get(type)?.delete(cb);
+      }
+
+      close() {
+        this.closed = true;
+        this.readyState = 2; // CLOSED
+      }
+
+      // Test driver: deliver an event the way the browser would. Like a
+      // real EventSource, nothing is delivered after close().
+      __dispatch(type: string, payload: unknown): boolean {
+        if (this.closed) return false;
+        const e = { data: typeof payload === "string" ? payload : JSON.stringify(payload) };
+        if (type === "error" && this.onerror) this.onerror(e);
+        const set = this.listeners.get(type);
+        if (set) for (const cb of set) cb(e);
+        return true;
+      }
+    }
+    const w = window as any;
+    w.__mockSSE = [];
+    w.EventSource = MockEventSource;
+  });
+}
+
+/** Number of EventSource connections opened so far in this page. */
+export async function sseCount(page: Page): Promise<number> {
+  return page.evaluate(() => (window as any).__mockSSE.length);
+}
+
+/** Index of the LATEST connection whose URL contains the fragment, or -1. */
+export async function sseFind(page: Page, urlFragment: string): Promise<number> {
+  return page.evaluate((frag) => {
+    const list = (window as any).__mockSSE as { url: string }[];
+    for (let i = list.length - 1; i >= 0; i--) {
+      if (list[i].url.includes(frag)) return i;
+    }
+    return -1;
+  }, urlFragment);
+}
+
+/** Whether the latest matching connection has been closed. */
+export async function sseClosed(page: Page, urlFragment: string): Promise<boolean | null> {
+  return page.evaluate((frag) => {
+    const list = (window as any).__mockSSE as { url: string; closed: boolean }[];
+    for (let i = list.length - 1; i >= 0; i--) {
+      if (list[i].url.includes(frag)) return list[i].closed;
+    }
+    return null;
+  }, urlFragment);
+}
+
+/** Dispatch an SSE event on the latest matching connection.
+ *
+ * Returns false when no connection exists or it is already closed (the
+ * delivery was refused, exactly like a real EventSource).
+ */
+export async function sseDispatch(
+  page: Page,
+  urlFragment: string,
+  type: string,
+  payload: unknown,
+): Promise<boolean> {
+  return page.evaluate(
+    ({ frag, type, payload }) => {
+      const list = (window as any).__mockSSE as any[];
+      for (let i = list.length - 1; i >= 0; i--) {
+        if (list[i].url.includes(frag)) return list[i].__dispatch(type, payload) as boolean;
+      }
+      return false;
+    },
+    { frag: urlFragment, type, payload },
+  );
+}
+
+/**
+ * Collect real page requests to model-bound endpoints. With the SSE stub
+ * installed and refine calls gated, this must stay empty for every e2e
+ * test — that is the proof the suite never triggers a real model call.
+ */
+export function modelEgressWatcher(page: Page): string[] {
+  const hits: string[] = [];
+  page.on("request", (req) => {
+    if (/\/(generate|refine)(\?|$)/.test(req.url())) hits.push(req.url());
+  });
+  return hits;
+}
+
+/**
  * Navigate and wait until the app has hydrated: the mount-time skills
  * request only fires from the client bundle, so it is a reliable signal
  * (SSR-only pages never issue it and would silently drop interactions).

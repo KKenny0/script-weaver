@@ -171,6 +171,14 @@ export default function HomePage() {
     refreshProjects();
   }, [refreshProjects]);
 
+  // Collapsing the chat unmounts ChatPanel, which closes its generation
+  // stream (and the backend cancels the run). A "running" status must not
+  // outlive the subscription it described.
+  const collapseChat = useCallback(() => {
+    setLeftPanelCollapsed(true);
+    setProjectStatus((s) => (s === "running" ? "idle" : s));
+  }, []);
+
   const handleRename = useCallback(async (id: string, title: string, expectedRevision: number) => {
     const res = await fetch(`${API}/projects/${id}`, {
       method: "PATCH",
@@ -188,7 +196,10 @@ export default function HomePage() {
 
   const refreshHistory = useCallback(async (projectId: string) => {
     const token = ++historyReqRef.current;
-    setHistoryPanel((prev) => ({ ...prev, loading: true, error: null }));
+    // Supersedes any pending snapshot load — end the loading state that
+    // request owned, or the panel would stay stuck on "载入快照" once the
+    // (now stale) response is discarded.
+    setHistoryPanel((prev) => ({ ...prev, loading: true, error: null, viewingLoading: false }));
     try {
       const result = await apiGet(`/projects/${projectId}/versions`);
       if (historyReqRef.current !== token) return; // superseded view intent
@@ -211,9 +222,14 @@ export default function HomePage() {
     if (!projectId) return;
     if (historyPanel.open) {
       // Toggle: from a snapshot back to the list, from the list to closed.
-      // Either way the replaced intent invalidates in-flight responses.
+      // Either way the replaced intent invalidates in-flight responses —
+      // and must also end whatever loading state they owned.
       historyReqRef.current++;
-      setHistoryPanel((prev) => (prev.viewing ? { ...prev, viewing: null, error: null } : HISTORY_CLOSED));
+      setHistoryPanel((prev) => (
+        prev.viewing
+          ? { ...prev, viewing: null, error: null, loading: false, viewingLoading: false }
+          : HISTORY_CLOSED
+      ));
       return;
     }
     setHistoryPanel({ ...HISTORY_CLOSED, open: true, loading: true });
@@ -223,7 +239,8 @@ export default function HomePage() {
   const handleSelectHistoryVersion = useCallback(async (revision: number) => {
     if (!projectId) return;
     const token = ++historyReqRef.current;
-    setHistoryPanel((prev) => ({ ...prev, viewingLoading: true, error: null }));
+    // Supersedes any pending list load — its loading state ends here too.
+    setHistoryPanel((prev) => ({ ...prev, viewingLoading: true, error: null, loading: false }));
     try {
       const snap = await apiGet(`/projects/${projectId}/versions/${revision}`);
       if (historyReqRef.current !== token) return; // superseded (closed/switched/another view)
@@ -244,7 +261,7 @@ export default function HomePage() {
 
   const handleBackToHistoryList = useCallback(() => {
     historyReqRef.current++;
-    setHistoryPanel((prev) => ({ ...prev, viewing: null, error: null }));
+    setHistoryPanel((prev) => ({ ...prev, viewing: null, error: null, loading: false, viewingLoading: false }));
   }, []);
 
   const handleCloseHistory = useCallback(() => {
@@ -287,7 +304,7 @@ export default function HomePage() {
           setProjectStatus={setProjectStatus}
           onArtifactUpdate={setArtifactData}
           onTabSwitch={setActiveTab}
-          onCollapse={() => setLeftPanelCollapsed(true)}
+          onCollapse={collapseChat}
           sessionNotice={sessionNotice}
           sessionEpoch={sessionNotice?.epoch ?? 0}
           isSessionActive={isSessionActive}
@@ -333,7 +350,7 @@ export default function HomePage() {
         projectStatus={projectStatus}
         activeTab={activeTab}
         onTabChange={setActiveTab}
-        onCollapse={() => setLeftPanelCollapsed(true)}
+        onCollapse={collapseChat}
         historyPanel={historyPanel}
         onOpenHistory={handleOpenHistory}
         onRefreshHistory={() => projectId && refreshHistory(projectId)}

@@ -3,36 +3,42 @@ import {
   gate,
   gateRespond,
   installGate,
+  installSSEStub,
+  modelEgressWatcher,
   openApp,
   releaseAndSettle,
   seedOutline,
-  release,
   seedProject,
   seedSecondRevision,
+  sseCount,
 } from "./helpers";
 
 /**
  * Regression: collapsing the chat panel unmounts ChatPanel, whose own
- * session refs stopped receiving updates — a creation/refine response that
- * landed after the user moved on would hijack the project, URL and status.
+ * refs stopped receiving updates — a creation/refine response that landed
+ * after the user moved on would hijack the project, URL and status.
  *
- * Guards now check the parent-owned liveness predicates, which survive
- * unmounts. The first three tests FAIL on the pre-fix behaviour (53cb887);
- * the last two guard the legitimate flows that must keep working.
+ * Round-5 additions: an unmounted instance must be fully invalidated — it
+ * may not adopt a creation, open a generation subscription, or write any
+ * state from late events ("collapse + re-expand" test FAILS on 07a69bb).
+ * The other tests guard the legitimate flows that must keep working.
  */
 
+let egress: string[];
+
 test.beforeEach(async ({ page }) => {
+  egress = modelEgressWatcher(page);
   await installGate(page);
+  await installSSEStub(page);
+});
+
+test.afterEach(async () => {
+  expect(egress, "no real request may reach a model-bound endpoint").toEqual([]);
 });
 
 test("collapse + switch: late creation response must not steal the session", async ({ page, request }) => {
   const b = await seedProject(request, "折叠后打开的项目B");
   await seedSecondRevision(request, b.project_id, `${b.title}-r2`);
-
-  const generateRequests: string[] = [];
-  page.on("request", (req) => {
-    if (req.url().includes("/generate")) generateRequests.push(req.url());
-  });
 
   await openApp(page, "/");
   await expect(page.getByPlaceholder("输入你的故事想法，按 Enter 开始生成...")).toBeVisible();
@@ -53,7 +59,7 @@ test("collapse + switch: late creation response must not steal the session", asy
 
   // C's late response must not reclaim the project/URL nor start its SSE.
   await expect(page).toHaveURL(new RegExp(`project=${b.project_id}`));
-  await expect(generateRequests).toEqual([]);
+  expect(await sseCount(page)).toBe(0);
 
   // Re-expanding shows B's session, intact.
   await page.getByRole("button", { name: "展开对话面板" }).click();
@@ -119,22 +125,44 @@ test("collapse + switch: late refine response must not overwrite B's content", a
   await expect(page).toHaveURL(new RegExp(`project=${b.project_id}`));
 });
 
-test("collapse and re-expand in the SAME session continues normally", async ({ page, request }) => {
+test("collapse + re-expand in the SAME session: the stale instance must not adopt the creation", async ({ page, request }) => {
+  const b = await seedProject(request, "同会话竞争目标项目B");
+  await seedOutline(b.project_id, "B的固定大纲");
+
+  const cIdea = `同会话竞争项目C-${Math.random().toString(36).slice(2, 8)}`;
+
   await openApp(page, "/");
   await expect(page.getByPlaceholder("输入你的故事想法，按 Enter 开始生成...")).toBeVisible();
 
   await gate(page, "POST /api/projects");
-  await page.getByPlaceholder("输入你的故事想法，按 Enter 开始生成...").fill("同会话折叠再展开D");
+  await page.getByPlaceholder("输入你的故事想法，按 Enter 开始生成...").fill(cIdea);
   await page.locator("textarea ~ button").click();
 
+  // Collapse and re-expand while the creation request is held: the pending
+  // operation now belongs to an instance that no longer owns the chat UI
+  // (the epoch never changed, so the session check alone passes).
   await page.locator("button:has(.lucide-panel-left-close)").first().click();
   await page.getByRole("button", { name: "展开对话面板" }).click();
 
   await releaseAndSettle(page, "POST /api/projects", "/api/projects");
 
-  // No session change happened: the creation must be adopted as usual.
+  // The stale instance must not adopt the project, move the URL, or open a
+  // generation connection; the created project surfaces in the list only.
+  await expect(page).not.toHaveURL(/project=/);
+  expect(await sseCount(page)).toBe(0);
+  const cEntry = page.getByRole("button", { name: new RegExp(`^${cIdea}`) });
+  await expect(cEntry).toBeVisible();
+
+  // Opening B afterwards keeps it immune to the abandoned creation.
+  await page.getByRole("button", { name: new RegExp(`^${b.title}`) }).click();
+  await expect(page).toHaveURL(new RegExp(`project=${b.project_id}`));
+  await expect(page.getByText("B的固定大纲")).toBeVisible();
+  await expect(page.getByText("出错了", { exact: true })).toHaveCount(0);
+  await expect(page.getByText("已完成", { exact: true })).toBeVisible();
+
+  // The user can still open C explicitly from the list when they want it.
+  await cEntry.click();
   await expect(page).toHaveURL(/project=/);
-  await expect(page.getByPlaceholder("输入修改指令，按 Enter 发送...")).toBeVisible();
 });
 
 test("draft typed during a pending creation is preserved (kept regression)", async ({ page }) => {

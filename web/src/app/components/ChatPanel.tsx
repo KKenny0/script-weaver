@@ -90,6 +90,11 @@ export default function ChatPanel({
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const eventSourceRef = useRef<EventSource | null>(null);
+  // False once this instance unmounts (chat collapse). Every async
+  // continuation re-checks it: an unmounted instance no longer owns any UI,
+  // so its late responses and events must never write state, open a
+  // subscription, or move the project/URL.
+  const mountedRef = useRef(false);
   const noticeEpochRef = useRef<number>(-1);
   const noticeShownKeyRef = useRef<string>("");
 
@@ -99,14 +104,30 @@ export default function ChatPanel({
     apiGet("/skills?stage=structuring").then(setAvailableSkills).catch(console.error);
   }, []);
 
-  useEffect(() => () => { eventSourceRef.current?.close(); }, []);
-
-  // Let the page close the subscription when the user switches projects.
+  // The subscription's lifetime is bound to this instance: unmounting closes
+  // the stream (the backend then cancels the run per the disconnect-cancel
+  // contract) and ends the generating flag that stream owned.
   useEffect(() => {
-    closeStreamRef.current = () => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
       eventSourceRef.current?.close();
       eventSourceRef.current = null;
       setIsGenerating(false);
+    };
+  }, [setIsGenerating]);
+
+  // Let the page close the subscription when the user switches projects.
+  // Deregister on unmount so the page never holds a dead instance's closer.
+  useEffect(() => {
+    const close = () => {
+      eventSourceRef.current?.close();
+      eventSourceRef.current = null;
+      setIsGenerating(false);
+    };
+    closeStreamRef.current = close;
+    return () => {
+      if (closeStreamRef.current === close) closeStreamRef.current = () => {};
     };
   }, [setIsGenerating]);
 
@@ -156,10 +177,12 @@ export default function ChatPanel({
 
     try {
       const proj = await apiPost("/projects", { user_input: ideaText, auto_approve_gates: true, active_skills: {} });
-      if (!isSessionActive(epochAtStart)) {
-        // The user moved to another project/session while this creation was
-        // in flight: the project exists server-side, so refresh the list,
-        // but do not touch the current session, URL, draft or subscription.
+      if (!mountedRef.current || !isSessionActive(epochAtStart)) {
+        // Stale continuation: this instance unmounted (chat collapsed) or the
+        // session moved on while the creation was in flight. The project
+        // exists server-side, so refresh the list, but do not touch the
+        // current session, URL or draft — and never open a subscription from
+        // an instance that no longer owns the chat UI.
         onProjectMutated();
         return;
       }
@@ -171,7 +194,18 @@ export default function ChatPanel({
       const evtSource = new EventSource(`${API}/projects/${proj.project_id}/generate`);
       eventSourceRef.current = evtSource;
 
+      // The subscription belongs to (this instance, this session, this
+      // project). A listener that no longer matches — the chat collapsed,
+      // the session changed, another project opened — must write nothing at
+      // all; the connection itself is closed by its owner (unmount cleanup
+      // or the page's closeStreamRef), never by a stale listener.
+      const isStaleEvent = () =>
+        !mountedRef.current ||
+        !isSessionActive(epochAtStart) ||
+        !isProjectActive(proj.project_id);
+
       evtSource.addEventListener("progress", (e: MessageEvent) => {
+        if (isStaleEvent()) return;
         const data = JSON.parse(e.data);
         setMessages((prev) => {
           const last = prev[prev.length - 1];
@@ -183,13 +217,12 @@ export default function ChatPanel({
       });
 
       evtSource.addEventListener("done", async (e: MessageEvent) => {
+        if (isStaleEvent()) return;
         evtSource.close();
         eventSourceRef.current = null;
         setIsGenerating(false);
 
         const doneData = JSON.parse(e.data);
-        if (!isProjectActive(proj.project_id)) return; // late response after switching/unmount
-
         if (doneData.error) {
           setProjectStatus("error");
           setMessages((prev) => [...prev, { role: "assistant", content: `❌ 生成出错: ${doneData.error}`, timestamp: Date.now() }]);
@@ -200,7 +233,7 @@ export default function ChatPanel({
 
         try {
           const fullState = await apiGet(`/projects/${proj.project_id}`);
-          if (!isProjectActive(proj.project_id)) return;
+          if (isStaleEvent()) return;
           applyFullState(fullState);
           onProjectMutated();
 
@@ -215,6 +248,7 @@ export default function ChatPanel({
       });
 
       evtSource.onerror = () => {
+        if (isStaleEvent()) return;
         evtSource.close();
         eventSourceRef.current = null;
         setIsGenerating(false);
@@ -222,7 +256,7 @@ export default function ChatPanel({
         setMessages((prev) => [...prev, { role: "assistant", content: "⚠️ 连接中断或生成启动失败，请检查后端服务与模型配置。输入的内容已保存在项目中。", timestamp: Date.now() }]);
       };
     } catch (err: any) {
-      if (!isSessionActive(epochAtStart)) return; // late failure: not this session's concern
+      if (!mountedRef.current || !isSessionActive(epochAtStart)) return; // late failure: not this session's concern
       setIsGenerating(false);
       setProjectStatus("error");
       // Keep inputValue so the user's text is not lost on failure.
@@ -243,24 +277,24 @@ export default function ChatPanel({
 
     try {
       await apiPost(`/projects/${projectId}/refine`, { message: refineText });
-      if (!isProjectActive(projectId)) return;
+      if (!mountedRef.current || !isProjectActive(projectId)) return;
       // Consume the submitted instruction only if the composer still holds
       // it; a draft typed while the model was processing must survive.
       setInputValue((prev) => (prev === originalInput ? "" : prev));
       const fullState = await apiGet(`/projects/${projectId}`);
-      if (!isProjectActive(projectId)) return;
+      if (!mountedRef.current || !isProjectActive(projectId)) return;
       applyFullState(fullState);
       onProjectMutated();
 
       setMessages((prev) => [...prev.slice(0, -1), { role: "assistant", content: "✅ 修改已应用。", timestamp: Date.now() }]);
     } catch (err: any) {
-      if (!isProjectActive(projectId)) return; // late failure
+      if (!mountedRef.current || !isProjectActive(projectId)) return; // late failure
       // Keep inputValue so the user's text is not lost on failure.
       if (err?.code === "revision_conflict") {
         setMessages((prev) => [...prev.slice(0, -1), { role: "assistant", content: "⚠️ 项目已在其他窗口被修改，已为你重新加载最新内容。请基于最新内容重试修改。", timestamp: Date.now() }]);
         try {
           const fullState = await apiGet(`/projects/${projectId}`);
-          if (isProjectActive(projectId)) applyFullState(fullState);
+          if (mountedRef.current && isProjectActive(projectId)) applyFullState(fullState);
         } catch (fetchErr) {
           console.error("Failed to reload project:", fetchErr);
         }
