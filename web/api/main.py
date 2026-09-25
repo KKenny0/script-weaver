@@ -14,16 +14,20 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import io
 import json
 import logging
+import tempfile
+import zipfile
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from anyio import CancelScope
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
 
@@ -37,7 +41,7 @@ from script_weaver.core.project_store import (
     ProjectStoreError,
     RevisionConflictError,
 )
-from script_weaver.core.types import ProjectState
+from script_weaver.core.types import ProjectState, Shot
 from script_weaver.exporters.fountain_exporter import export_fountain
 from script_weaver.exporters.json_exporter import export_json
 from script_weaver.exporters.video_gen_exporter import export_video_gen_prompts
@@ -484,9 +488,71 @@ async def activate_skill(skill_id: str, req: SkillActivateRequest) -> dict:
 # ── Export ──────────────────────────────────────────────
 
 
+def _validate_video_gen_shot_ids(shots: list[Shot]) -> None:
+    """Shot ids become filenames inside the export ZIP; unsafe ones are refused.
+
+    A shot_id must be a non-empty, unique, single path segment — no path
+    separators, no parent-directory references — otherwise it could escape
+    the archive's shots/ layout or silently overwrite another shot's file.
+    """
+    seen: set[str] = set()
+    for shot in shots:
+        sid = shot.shot_id
+        if not sid or "/" in sid or "\\" in sid or sid in {".", ".."} or "\x00" in sid:
+            raise HTTPException(422, detail=f"不安全的 shot_id，无法导出: {sid!r}")
+        if sid in seen:
+            raise HTTPException(422, detail=f"重复的 shot_id，无法导出: {sid!r}")
+        seen.add(sid)
+
+
+def _build_video_gen_zip(state: ProjectState) -> bytes:
+    """Build the complete VideoGen ZIP in memory via the existing exporter.
+
+    The exporter is disk-based, so it runs inside a TemporaryDirectory; the
+    archive is closed and reduced to bytes before that directory disappears,
+    so the returned Response never points at deleted files and both success
+    and failure paths clean up. Members come only from this run's output dir
+    (relative arcnames); anything unexpected fails the export instead of
+    shipping a partial archive as a successful download.
+    """
+    shots = state.storyboard.shots
+    _validate_video_gen_shot_ids(shots)
+    expected = {"video_gen_shots.json", "video_gen_shots.csv"} | {
+        f"shots/{shot.shot_id}.txt" for shot in shots
+    }
+
+    with tempfile.TemporaryDirectory(prefix="scriptweaver-export-") as tmp:
+        out_dir = Path(tmp)
+        results = export_video_gen_prompts(state, output_dir=out_dir)
+        if "error" in results:
+            raise HTTPException(400, detail=str(results["error"]))
+
+        actual = {
+            p.relative_to(out_dir).as_posix()
+            for p in out_dir.rglob("*")
+            if p.is_file()
+        }
+        if actual != expected:
+            raise RuntimeError(
+                f"VideoGen export produced unexpected files: {sorted(actual ^ expected)}"
+            )
+
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            for rel in sorted(actual):
+                zf.write(out_dir / rel, arcname=rel)
+        return buf.getvalue()
+
+
 @app.get("/api/projects/{project_id}/export/{format_type}")
-async def export_project(project_id: str, format_type: str) -> JSONResponse:
-    """Export the persisted current project in various formats."""
+async def export_project(project_id: str, format_type: str) -> Response:
+    """Export the persisted current project as a real, tool-readable file.
+
+    One read of the persistent snapshot serves the whole export; the response
+    is a file download (Content-Disposition: attachment), not a JSON envelope:
+    json → the raw ProjectState object, fountain → Fountain text,
+    video_gen → a ZIP_DEFLATED archive (video_gen_shots.json/.csv + shots/*).
+    """
     try:
         record = await asyncio.to_thread(_store().get_required, project_id)
     except ProjectStoreError as exc:
@@ -495,20 +561,30 @@ async def export_project(project_id: str, format_type: str) -> JSONResponse:
     state: ProjectState = record.state
 
     if format_type == "json":
-        content = export_json(state)
-        return JSONResponse({"content": content, "meta": {"id": state.meta.id, "title": state.meta.title}})
+        return Response(
+            content=export_json(state),
+            media_type="application/json",
+            headers={"Content-Disposition": f'attachment; filename="{project_id}.json"'},
+        )
     elif format_type == "fountain":
         if not state.script:
             raise HTTPException(400, "No script to export as Fountain")
-        content = export_fountain(state.script)
-        return JSONResponse({"content": content})
+        return Response(
+            content=export_fountain(state.script),
+            media_type="text/plain; charset=utf-8",
+            headers={"Content-Disposition": f'attachment; filename="{project_id}.fountain"'},
+        )
     elif format_type == "video_gen":
-        if not state.storyboard:
+        if not state.storyboard or not state.storyboard.shots:
             raise HTTPException(400, "No storyboard to export")
-        results = export_video_gen_prompts(state)
-        if "error" in results:
-            raise HTTPException(400, results["error"])
-        return JSONResponse(results)
+        zip_bytes = await asyncio.to_thread(_build_video_gen_zip, state)
+        return Response(
+            content=zip_bytes,
+            media_type="application/zip",
+            headers={
+                "Content-Disposition": f'attachment; filename="{project_id}_video_gen.zip"'
+            },
+        )
     else:
         raise HTTPException(400, f"Unknown format: {format_type}")
 
