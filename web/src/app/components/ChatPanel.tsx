@@ -12,7 +12,19 @@ interface Message {
   timestamp: number;
 }
 
+interface SessionNotice {
+  epoch: number;
+  text: string;
+}
+
 const API = "/api";
+
+function extractError(err: any, fallback = "请求失败"): string {
+  const d = err?.detail;
+  if (typeof d === "string") return d;
+  if (d?.message) return d.message;
+  return err?.message || fallback;
+}
 
 async function apiPost(path: string, body?: object) {
   const res = await fetch(`${API}${path}`, {
@@ -22,20 +34,24 @@ async function apiPost(path: string, body?: object) {
   });
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
-    throw new Error(err.detail || err.message || `HTTP ${res.status}`);
+    const e: any = new Error(extractError(err, `HTTP ${res.status}`));
+    e.code = err?.detail?.code;
+    throw e;
   }
   return res.json();
 }
 
 async function apiGet(path: string) {
   const res = await fetch(`${API}${path}`);
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(extractError(err, `HTTP ${res.status}`));
+  }
   return res.json();
 }
 
 interface ChatPanelProps {
   projectId: string;
-  setProjectId: (id: string) => void;
   isGenerating: boolean;
   setIsGenerating: (v: boolean) => void;
   projectStatus: "idle" | "running" | "complete" | "error";
@@ -43,14 +59,28 @@ interface ChatPanelProps {
   onArtifactUpdate: (data: Record<string, any>) => void;
   onTabSwitch: (tab: string) => void;
   onCollapse: () => void;
+  sessionNotice: SessionNotice | null;
+  sessionEpoch: number;
+  isSessionActive: (epoch: number) => boolean;
+  isProjectActive: (id: string) => boolean;
+  closeStreamRef: React.MutableRefObject<() => void>;
+  onProjectCreated: (id: string) => void;
+  onProjectMutated: () => void;
 }
 
 export default function ChatPanel({
-  projectId, setProjectId,
+  projectId,
   isGenerating, setIsGenerating,
   projectStatus, setProjectStatus,
   onArtifactUpdate, onTabSwitch,
   onCollapse,
+  sessionNotice,
+  sessionEpoch,
+  isSessionActive,
+  isProjectActive,
+  closeStreamRef,
+  onProjectCreated,
+  onProjectMutated,
 }: ChatPanelProps) {
   const [inputValue, setInputValue] = useState("");
   const [messages, setMessages] = useState<Message[]>([]);
@@ -60,6 +90,13 @@ export default function ChatPanel({
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const eventSourceRef = useRef<EventSource | null>(null);
+  // False once this instance unmounts (chat collapse). Every async
+  // continuation re-checks it: an unmounted instance no longer owns any UI,
+  // so its late responses and events must never write state, open a
+  // subscription, or move the project/URL.
+  const mountedRef = useRef(false);
+  const noticeEpochRef = useRef<number>(-1);
+  const noticeShownKeyRef = useRef<string>("");
 
   useEffect(() => { messagesEndRef.current?.scrollIntoView({ behavior: "smooth" }); }, [messages]);
 
@@ -67,16 +104,71 @@ export default function ChatPanel({
     apiGet("/skills?stage=structuring").then(setAvailableSkills).catch(console.error);
   }, []);
 
-  useEffect(() => () => { eventSourceRef.current?.close(); }, []);
+  // The subscription's lifetime is bound to this instance: unmounting closes
+  // the stream (the backend then cancels the run per the disconnect-cancel
+  // contract) and ends the generating flag that stream owned.
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      eventSourceRef.current?.close();
+      eventSourceRef.current = null;
+      setIsGenerating(false);
+    };
+  }, [setIsGenerating]);
+
+  // Let the page close the subscription when the user switches projects.
+  // Deregister on unmount so the page never holds a dead instance's closer.
+  useEffect(() => {
+    const close = () => {
+      eventSourceRef.current?.close();
+      eventSourceRef.current = null;
+      setIsGenerating(false);
+    };
+    closeStreamRef.current = close;
+    return () => {
+      if (closeStreamRef.current === close) closeStreamRef.current = () => {};
+    };
+  }, [setIsGenerating]);
+
+  // Session notices from the page (project opened / new project). A new epoch
+  // resets the conversation; follow-up texts with the same epoch append.
+  // The shown-key guard makes this idempotent under React StrictMode's
+  // double-invoked effects in dev builds.
+  useEffect(() => {
+    if (!sessionNotice) return;
+    const key = `${sessionNotice.epoch}:${sessionNotice.text}`;
+    if (noticeShownKeyRef.current === key) return;
+    noticeShownKeyRef.current = key;
+    const isNewEpoch = sessionNotice.epoch !== noticeEpochRef.current;
+    noticeEpochRef.current = sessionNotice.epoch;
+    const notice: Message = { role: "assistant", content: sessionNotice.text, timestamp: Date.now() };
+    setMessages((prev) => (isNewEpoch ? [notice] : [...prev, notice]));
+  }, [sessionNotice]);
 
   // ── Handlers ──────────────────────────────────
+
+  const applyFullState = useCallback((fullState: any) => {
+    onArtifactUpdate({
+      refined_idea: fullState.refined_idea,
+      outline: fullState.outline,
+      characters: fullState.characters,
+      scenes: fullState.scenes,
+      art_style: fullState.art_style,
+      script: fullState.script,
+      storyboard: fullState.storyboard,
+      visual_highlights: fullState.visual_highlights,
+    });
+  }, [onArtifactUpdate]);
 
   const handleGenerate = useCallback(async () => {
     if (!inputValue.trim() || isGenerating) return;
 
-    const userMsg: Message = { role: "user", content: inputValue.trim(), timestamp: Date.now() };
+    const ideaText = inputValue.trim();
+    const originalInput = inputValue;
+    const epochAtStart = sessionEpoch;
+    const userMsg: Message = { role: "user", content: ideaText, timestamp: Date.now() };
     setMessages((prev) => [...prev, userMsg]);
-    setInputValue("");
     setIsGenerating(true);
     setProjectStatus("running");
     onArtifactUpdate({});
@@ -84,13 +176,36 @@ export default function ChatPanel({
     setMessages((prev) => [...prev, { role: "assistant", content: "正在分析创意，启动 Pipeline...", timestamp: Date.now() }]);
 
     try {
-      const proj = await apiPost("/projects", { user_input: inputValue.trim(), auto_approve_gates: true, active_skills: {} });
-      setProjectId(proj.project_id);
+      const proj = await apiPost("/projects", { user_input: ideaText, auto_approve_gates: true, active_skills: {} });
+      if (!mountedRef.current || !isSessionActive(epochAtStart)) {
+        // Stale continuation: this instance unmounted (chat collapsed) or the
+        // session moved on while the creation was in flight. The project
+        // exists server-side, so refresh the list, but do not touch the
+        // current session, URL or draft — and never open a subscription from
+        // an instance that no longer owns the chat UI.
+        onProjectMutated();
+        return;
+      }
+      // The project exists in persistent storage now — consume the input,
+      // but only if the user has not started typing a new draft meanwhile.
+      setInputValue((prev) => (prev === originalInput ? "" : prev));
+      onProjectCreated(proj.project_id);
 
       const evtSource = new EventSource(`${API}/projects/${proj.project_id}/generate`);
       eventSourceRef.current = evtSource;
 
+      // The subscription belongs to (this instance, this session, this
+      // project). A listener that no longer matches — the chat collapsed,
+      // the session changed, another project opened — must write nothing at
+      // all; the connection itself is closed by its owner (unmount cleanup
+      // or the page's closeStreamRef), never by a stale listener.
+      const isStaleEvent = () =>
+        !mountedRef.current ||
+        !isSessionActive(epochAtStart) ||
+        !isProjectActive(proj.project_id);
+
       evtSource.addEventListener("progress", (e: MessageEvent) => {
+        if (isStaleEvent()) return;
         const data = JSON.parse(e.data);
         setMessages((prev) => {
           const last = prev[prev.length - 1];
@@ -102,6 +217,7 @@ export default function ChatPanel({
       });
 
       evtSource.addEventListener("done", async (e: MessageEvent) => {
+        if (isStaleEvent()) return;
         evtSource.close();
         eventSourceRef.current = null;
         setIsGenerating(false);
@@ -117,16 +233,9 @@ export default function ChatPanel({
 
         try {
           const fullState = await apiGet(`/projects/${proj.project_id}`);
-          onArtifactUpdate({
-            refined_idea: fullState.refined_idea,
-            outline: fullState.outline,
-            characters: fullState.characters,
-            scenes: fullState.scenes,
-            art_style: fullState.art_style,
-            script: fullState.script,
-            storyboard: fullState.storyboard,
-            visual_highlights: fullState.visual_highlights,
-          });
+          if (isStaleEvent()) return;
+          applyFullState(fullState);
+          onProjectMutated();
 
           setMessages((prev) => [...prev, { role: "assistant", content: `🎉 全部生成完成！\n\n${formatResultSummary(fullState)}`, timestamp: Date.now() }]);
 
@@ -139,48 +248,61 @@ export default function ChatPanel({
       });
 
       evtSource.onerror = () => {
+        if (isStaleEvent()) return;
         evtSource.close();
         eventSourceRef.current = null;
         setIsGenerating(false);
         setProjectStatus("error");
-        setMessages((prev) => [...prev, { role: "assistant", content: "⚠️ 连接中断，请检查后端服务是否运行。", timestamp: Date.now() }]);
+        setMessages((prev) => [...prev, { role: "assistant", content: "⚠️ 连接中断或生成启动失败，请检查后端服务与模型配置。输入的内容已保存在项目中。", timestamp: Date.now() }]);
       };
     } catch (err: any) {
+      if (!mountedRef.current || !isSessionActive(epochAtStart)) return; // late failure: not this session's concern
       setIsGenerating(false);
       setProjectStatus("error");
+      // Keep inputValue so the user's text is not lost on failure.
       setMessages((prev) => [...prev, { role: "assistant", content: `❌ 错误: ${err.message}`, timestamp: Date.now() }]);
     }
-  }, [inputValue, isGenerating]);
+  }, [inputValue, isGenerating, sessionEpoch, isSessionActive, isProjectActive, applyFullState, onProjectCreated, onProjectMutated, setProjectStatus, setIsGenerating, onArtifactUpdate, onTabSwitch]);
 
   const handleRefine = useCallback(async () => {
     if (!projectId || !inputValue.trim() || isGenerating) return;
 
+    const refineText = inputValue.trim();
+    const originalInput = inputValue;
     setMessages((prev) => [
       ...prev,
-      { role: "user", content: `[修改] ${inputValue.trim()}`, timestamp: Date.now() },
+      { role: "user", content: `[修改] ${refineText}`, timestamp: Date.now() },
       { role: "assistant", content: "正在应用修改...", timestamp: Date.now() },
     ]);
-    setInputValue("");
 
     try {
-      await apiPost(`/projects/${projectId}/refine`, { message: inputValue.trim() });
+      await apiPost(`/projects/${projectId}/refine`, { message: refineText });
+      if (!mountedRef.current || !isProjectActive(projectId)) return;
+      // Consume the submitted instruction only if the composer still holds
+      // it; a draft typed while the model was processing must survive.
+      setInputValue((prev) => (prev === originalInput ? "" : prev));
       const fullState = await apiGet(`/projects/${projectId}`);
-      onArtifactUpdate({
-        refined_idea: fullState.refined_idea,
-        outline: fullState.outline,
-        characters: fullState.characters,
-        scenes: fullState.scenes,
-        art_style: fullState.art_style,
-        script: fullState.script,
-        storyboard: fullState.storyboard,
-        visual_highlights: fullState.visual_highlights,
-      });
+      if (!mountedRef.current || !isProjectActive(projectId)) return;
+      applyFullState(fullState);
+      onProjectMutated();
 
       setMessages((prev) => [...prev.slice(0, -1), { role: "assistant", content: "✅ 修改已应用。", timestamp: Date.now() }]);
     } catch (err: any) {
-      setMessages((prev) => [...prev.slice(0, -1), { role: "assistant", content: `❌ 修改失败: ${err.message}`, timestamp: Date.now() }]);
+      if (!mountedRef.current || !isProjectActive(projectId)) return; // late failure
+      // Keep inputValue so the user's text is not lost on failure.
+      if (err?.code === "revision_conflict") {
+        setMessages((prev) => [...prev.slice(0, -1), { role: "assistant", content: "⚠️ 项目已在其他窗口被修改，已为你重新加载最新内容。请基于最新内容重试修改。", timestamp: Date.now() }]);
+        try {
+          const fullState = await apiGet(`/projects/${projectId}`);
+          if (mountedRef.current && isProjectActive(projectId)) applyFullState(fullState);
+        } catch (fetchErr) {
+          console.error("Failed to reload project:", fetchErr);
+        }
+      } else {
+        setMessages((prev) => [...prev.slice(0, -1), { role: "assistant", content: `❌ 修改失败: ${err.message}`, timestamp: Date.now() }]);
+      }
     }
-  }, [projectId, inputValue, isGenerating]);
+  }, [projectId, inputValue, isGenerating, isProjectActive, applyFullState, onProjectMutated]);
 
   const toggleSkill = (skillId: string) => {
     setActiveSkillIds((prev) => {
@@ -221,7 +343,7 @@ export default function ChatPanel({
         }}>
           <Wand2 size={12} style={{ display: "inline", marginRight: 4 }} />Skills
         </button>
-        <button onClick={onCollapse} className="btn-ghost" style={{ width: 32, height: 32 }}>
+        <button onClick={onCollapse} className="btn-ghost" style={{ width: 32, height: 32 }} title="折叠对话面板" aria-label="折叠对话面板">
           <PanelLeftClose size={16} />
         </button>
       </div>
