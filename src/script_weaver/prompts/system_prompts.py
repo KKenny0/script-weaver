@@ -429,6 +429,43 @@ REVIEWER_PROMPT = """你是一位**资深剧本审稿人/质量审查专家**。
 """
 
 # ────────────────────────────────────────────────────────
+# Refine (modification) instructions — pipeline-composed user messages
+# ────────────────────────────────────────────────────────
+
+GENERAL_MODIFICATION_PROMPT = """【修改任务】这是对已有产物的修改，不是从零生成。
+
+用户修改要求：
+{request}
+
+当前 {label} 的完整内容（JSON，修改基线）：
+{artifact_json}
+
+执行要求：
+1. 以上方当前内容为基线，按用户要求做出实际修改，并提交修改后的完整 {artifact} 内容。
+2. 未被用户要求涉及的部分保持原样：保持场次/镜头的数量与顺序、既有 ID 与引用、角色名和地点不变。
+3. 必须提交真实修改后的内容；仅在 notes/备注里声称"已完成修改"而内容不变，不会被接受。
+4. 若无法理解或无法执行用户要求，直接说明原因并保持内容不变，不要提交未修改的内容冒充完成。
+"""
+
+SHORTEN_DIALOGUE_PROMPT = """【受限修改任务：只缩短剧本最后一句对白】
+
+唯一允许修改的位置：第 {scene_number} 场（scene_id={scene_id}）第 {block_ordinal} 个 block——按剧本顺序的最后一个非空对白 block。
+唯一允许修改的字段：该 block 的 content.dialogue。
+当前原文（去首尾空白后 {length} 字）：
+{original}
+
+执行要求：
+1. 提交这句对白更简短的版本：保持原意与语气，去首尾空白后必须非空、与原文不同、字符数严格少于 {length}。
+2. 除上述唯一字段外，提交的剧本必须与下方当前剧本完全一致：场次数、blocks 数量与顺序、所有 ID、角色名、动作、notes 及其他任何字段都不得变化。
+3. 不要在 notes 中声称完成修改；系统会逐字段比对，任何越界改动都会被整体拒绝。
+
+用户原始要求：{request}
+
+当前剧本完整内容（JSON，修改基线）：
+{script_json}
+"""
+
+# ────────────────────────────────────────────────────────
 # Orchestrator
 # ────────────────────────────────────────────────────────
 
@@ -462,6 +499,12 @@ ORCHESTRATOR_PROMPT = """你是 Script-Weaver 系统的**编排器 (Orchestrator
 - 如果用户说"修改/调整/改一下"→ 分析涉及哪个 artifact，路由到对应 agent
 - 如果用户要求审查 → 调用 reviewer
 
+## constraint 字段（仅修改请求需要）
+返回决策时附带 constraint 字段：
+- `general`：普通修改（默认）。
+- `shorten_last_dialogue`：当且仅当用户明确要求"只把剧本最后一句/结尾对白改得更简短，其他内容保持不变"这一受限修改时使用，且必须路由到 scriptwriter。
+- 用户想缩短对白但意图含糊（没说是最后一句、还夹带其他改动、或希望你自己挑选对白）时，不要猜测：改用 action=ask_user 向用户澄清。
+
 ## 输出
 返回一个决策 JSON：
 ```json
@@ -469,7 +512,8 @@ ORCHESTRATOR_PROMPT = """你是 Script-Weaver 系统的**编排器 (Orchestrator
   "next_agent": "agent_name 或 null",
   "reason": "决策理由",
   "message_to_user": "需要显示给用户的信息",
-  "action": "execute_agent | ask_user | pause | complete"
+  "action": "execute_agent | ask_user | pause | complete",
+  "constraint": "general | shorten_last_dialogue"
 }
 ```
 """
