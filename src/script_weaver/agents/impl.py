@@ -76,7 +76,7 @@ def _add_user_profile_hints(base_prompt: str, stage: str) -> str:
 # ────────────────────────────────────────────────────────
 
 
-class IdeaRefiner(SimpleAgent):
+class IdeaRefiner(BaseAgent):
     """Takes raw user idea → produces refined story concept."""
 
     name = "idea_refiner"
@@ -361,6 +361,49 @@ class StoryboardArtist(BaseAgent):
 
     def set_skill_registry(self, registry: SkillRegistry) -> None:
         self._skill_registry = registry
+
+    async def execute(self, state: ProjectState, user_message: str = "") -> Any:
+        if not state.script or not state.script.scenes:
+            return await super().execute(state, user_message)
+
+        combined: Storyboard | None = None
+        notes = []
+        for scene_index, scene in enumerate(state.script.scenes, 1):
+            # Scope both the prompt and read_artifact to the same scene. Never
+            # make one response carry the entire film's detailed shot list.
+            scoped = state.model_copy(update={
+                "script": state.script.model_copy(update={"scenes": [scene]}),
+                "storyboard": None,
+            })
+            instructions = (
+                f"只输出当前场次的分镜，场景ID为 {scene.scene_id}；不要添加其他场次。"
+                f"原始创作要求：{state.user_input}\n{user_message}"
+            )
+            if combined is not None:
+                instructions += (
+                    f"\n沿用画幅 {combined.aspect_ratio.value}、帧率 {combined.fps}。"
+                )
+            result = await super().execute(scoped, instructions)
+            if result.get("status") != "success":
+                return {**result, "failed_scene_id": scene.scene_id,
+                        "completed_scenes": scene_index - 1}
+            part = Storyboard.model_validate(result["data"])
+            if combined is None:
+                combined = part.model_copy(update={"shots": []})
+            elif (part.aspect_ratio, part.fps) != (combined.aspect_ratio, combined.fps):
+                return {"error": "storyboard_metadata_mismatch", "failed_scene_id": scene.scene_id}
+            for shot_index, shot in enumerate(part.shots, 1):
+                # IDs are assigned by the runtime, so scene-local model IDs
+                # cannot collide when independent responses are combined.
+                shot.shot_id = f"shot_{scene_index}_{shot_index}"
+                shot.scene_id = scene.scene_id
+                shot.sequence_number = shot_index
+                combined.shots.append(shot)
+            if part.notes:
+                notes.append(part.notes)
+        combined.notes = "\n".join(notes) or None
+        combined.compute_totals()
+        return {"status": "success", "data": combined.model_dump(mode="json")}
 
     def _build_system_prompt(self, state: ProjectState) -> str:
         prompt = _inject_skills(

@@ -10,10 +10,11 @@ import asyncio
 import json
 import logging
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Any
 
+from anyio import CancelScope
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -24,6 +25,7 @@ from script_weaver.core.config import get_settings
 from script_weaver.core.pipeline import PipelineEngine
 from script_weaver.core.types import (
     DecisionRecord,
+    ProjectMeta,
     ProjectState,
     SkillBinding,
     UserAction,
@@ -115,10 +117,10 @@ def _get_engine(project_id: str) -> tuple[PipelineEngine, dict]:
 @app.post("/api/projects")
 async def create_project(req: CreateProjectRequest) -> dict:
     """Create a new project from a story idea."""
-    project_id = uuid4().hex[:12]
+    project_id = uuid.uuid4().hex[:12]
     state = ProjectState(
         user_input=req.user_input,
-        meta_title=req.title or req.user_input[:40],
+        meta=ProjectMeta(title=req.title or req.user_input[:40]),
     )
     _projects[project_id] = {
         "state": state,
@@ -191,7 +193,7 @@ async def delete_project(project_id: str) -> dict:
 # ── Pipeline Execution (SSE Streaming) ───────────────
 
 
-@app.post("/api/projects/{project_id}/generate")
+@app.get("/api/projects/{project_id}/generate")
 async def generate(project_id: str) -> StreamingResponse:
     """Run the full pipeline with SSE progress streaming."""
 
@@ -202,20 +204,35 @@ async def generate(project_id: str) -> StreamingResponse:
         state: ProjectState = proj["state"]
         proj["status"] = "running"
 
-        # Override progress callback to emit SSE events
-        progress_events: list[dict] = []
+        # Bridge the sync progress callback to the async SSE stream via a queue
+        queue: asyncio.Queue = asyncio.Queue()
 
         def on_progress(stage: str, message: str) -> None:
-            evt = {"stage": stage, "message": message}
-            progress_events.append(evt)
+            queue.put_nowait({"stage": stage, "message": message})
 
         engine._progress = on_progress
 
-        try:
-            result_state = await engine.run_full_pipeline(
+        async def _run() -> ProjectState:
+            return await engine.run_full_pipeline(
                 user_input=state.user_input,
                 title=state.meta.title or None,
             )
+
+        task = asyncio.create_task(_run())
+        try:
+            # Stream progress events as the pipeline runs
+            while not task.done():
+                try:
+                    yield _sse_event("progress", queue.get_nowait())
+                except asyncio.QueueEmpty:
+                    await asyncio.sleep(0.1)
+
+            # Drain any remaining queued events
+            while not queue.empty():
+                yield _sse_event("progress", queue.get_nowait())
+
+            result_state = await task
+
             # Update stored state
             proj["state"] = result_state
             proj["status"] = "complete"
@@ -232,6 +249,15 @@ async def generate(project_id: str) -> StreamingResponse:
             logger.error(f"Pipeline error: {e}", exc_info=True)
             yield _sse_event("error", {"message": str(e)})
             yield _sse_event("done", {"project_id": project_id, "error": str(e)})
+        finally:
+            if not task.done():
+                task.cancel()
+            # Always retrieve the result/exception, including disconnect cancellation.
+            with CancelScope(shield=True):
+                with suppress(asyncio.CancelledError, Exception):
+                    await task
+            if proj["status"] == "running":
+                proj["status"] = "error"
 
     return EventSourceResponse(event_generator())
 
@@ -327,9 +353,11 @@ async def get_profile() -> dict:
 # ── Helpers ────────────────────────────────────────────────
 
 
-def _sse_event(event_type: str, data: Any) -> str:
-    """Format an SSE event."""
-    return f"event: {event_type}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+def _sse_event(event_type: str, data: Any) -> dict:
+    """Build an SSE event dict — EventSourceResponse serializes it with the
+    correct `event:` / `data:` fields (yielding a pre-formatted string would
+    lose the event type)."""
+    return {"event": event_type, "data": json.dumps(data, ensure_ascii=False)}
 
 
 def _build_result_summary(state: ProjectState) -> dict:

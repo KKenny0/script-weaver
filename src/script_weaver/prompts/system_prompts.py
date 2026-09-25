@@ -73,8 +73,8 @@ STRUCTURER_PROMPT = """你是一位**资深编剧/故事架构师**，精通多�
     "genre": "类型",
     "theme": "主题",
     "tone": "基调",
-    "episode_count": 集数/幕数,
-    "estimated_total_duration": "总时长"
+    "episode_count": 1,
+    "estimated_total_duration": "约30分钟"
   },
   "main_characters": [
     {
@@ -312,9 +312,9 @@ STORYBOARD_ARTIST_PROMPT = """你是一位**专业分镜师/影像导演**，精
 每个镜头都包含完整的摄影指令，可直接用于 AI 视频生成工具（Seiko/Runway/Kling 等）。
 
 ## 工作流程
-1. 用 `read_state` 获取完整项目状态
-2. 用 `read_artifact` 详细读取 script（最重要）、scenes、characters、art_style
-3. **逐场拆解**：对剧本中的每一场戏进行镜头级拆分
+1. 当前调用只处理一个场次；优先使用已提供的剧本和设计资料
+2. 仅在资料不足时用 `read_artifact` 补读，不要重复读取已有信息
+3. 对当前场次进行镜头级拆分；运行时会按剧本顺序汇总各场次
 4. 为每个镜头生成：画面描述、机位运动、时长、转场、以及视频生成提示词
 
 ## 分镜拆解原则
@@ -353,7 +353,7 @@ STORYBOARD_ARTIST_PROMPT = """你是一位**专业分镜师/影像导演**，精
       "camera_angle": "eye_level",
       "camera_movement": "static",
       "movement_description": "运动细节描述（如有）",
-      "visual_description": "画面内容的详细描述（200-400字，这是给视频生成模型的核心输入）",
+      "visual_description": "画面描述（40-100字，保留主体、构图、光线和动作，避免重复背景）",
       "action_description": "画面中的动作描述",
       "dialogue": "此镜头中的对白（如有）",
       "voiceover": "旁白（如有）",

@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import json
 from abc import ABC, abstractmethod
-from typing import Any, Literal
+from typing import Any, ClassVar, Literal
 
 import httpx
 from pydantic import BaseModel, Field
@@ -105,11 +105,29 @@ class AnthropicProvider(BaseLLMProvider):
         for msg in messages:
             if msg["role"] == "system":
                 system_content = msg["content"]
-            else:
-                api_messages.append({
-                    "role": msg["role"],
+            elif msg["role"] == "tool":
+                block = {
+                    "type": "tool_result", "tool_use_id": msg["tool_call_id"],
                     "content": msg["content"],
-                })
+                }
+                if (api_messages and api_messages[-1]["role"] == "user"
+                        and isinstance(api_messages[-1]["content"], list)):
+                    api_messages[-1]["content"].append(block)
+                else:
+                    api_messages.append({"role": "user", "content": [block]})
+            elif msg.get("tool_calls"):
+                blocks = []
+                if msg.get("content"):
+                    blocks.append({"type": "text", "text": msg["content"]})
+                for call in msg["tool_calls"]:
+                    function = call["function"]
+                    blocks.append({
+                        "type": "tool_use", "id": call["id"], "name": function["name"],
+                        "input": json.loads(function["arguments"]),
+                    })
+                api_messages.append({"role": "assistant", "content": blocks})
+            else:
+                api_messages.append({"role": msg["role"], "content": msg["content"]})
 
         payload: dict[str, Any] = {
             "model": self.model,
@@ -188,6 +206,7 @@ class OpenAICompatibleBase(BaseLLMProvider):
     """Base for all OpenAI-format providers (OpenAI, DeepSeek, GLM, Qwen)."""
 
     BASE_URL: str = ""  # Subclasses must override
+    REQUEST_OPTIONS: ClassVar[dict[str, Any]] = {}
 
     @property
     def provider_name(self) -> str:
@@ -211,6 +230,7 @@ class OpenAICompatibleBase(BaseLLMProvider):
             "messages": messages,
             "temperature": temperature,
             "max_tokens": max_tokens,
+            **self.REQUEST_OPTIONS,
         }
         if tools:
             payload["tools"] = [
@@ -290,6 +310,9 @@ class OpenAIProvider(OpenAICompatibleBase):
 class DeepSeekProvider(OpenAICompatibleBase):
     """DeepSeek API provider — OpenAI-compatible."""
     BASE_URL = "https://api.deepseek.com/v1/chat/completions"
+    # This adapter implements non-thinking tool history. DeepSeek now defaults
+    # to thinking, which requires a different reasoning-content replay contract.
+    REQUEST_OPTIONS: ClassVar[dict[str, Any]] = {"thinking": {"type": "disabled"}}
 
     @property
     def provider_name(self) -> str:

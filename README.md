@@ -238,6 +238,38 @@ ruff check src/ tests/
 python -m script_weaver generate "测试故事" --auto-approve --output-dir ./test-output
 ```
 
+## 真实模型验收
+
+DeepSeek 适配器显式使用非思考模式，匹配当前工具消息协议。分镜按剧本场次分别生成，
+全部成功后汇总；任一场次达到输出 token 上限会明确失败，不接受截断或缺场结果。
+
+按前面的环境变量说明配置模型和 API Key 后，可使用诊断脚本运行同一条流水线：
+
+```bash
+python scripts/verify_real_model.py --output-dir /tmp/script-weaver-verification \
+  --idea "60秒悬疑短片，两人一景。门牌为007，屏幕显示2026，结尾反转。"
+
+# 失败后复用已完成的阶段；不要删除该目录中的 checkpoint.json
+python scripts/verify_real_model.py --output-dir /tmp/script-weaver-verification --resume
+```
+
+每次新的验收使用新目录。`checkpoint.json` 保存已完成阶段的创作内容；`calls.jsonl`
+记录模型、阶段、停止原因、token 用量和工具名称；请求失败时记录异常类型与耗时，
+不记录 API Key 或消息正文。
+成功时同时生成 `project.json`、`script.fountain` 和 `video_gen/`。
+`PASS` 表示生成与导出完成，不代表时长、镜头数量等创作质量要求已全部满足；
+严格时长预算与跨场分镜节奏控制留待后续完善。
+已经完成的验收不能续跑，避免重复执行成长统计。恢复运行跳过的是已完成阶段，
+当前失败阶段会重新执行，不支持从半个场次的截断输出继续。
+第一阶段失败时尚无 checkpoint，需使用新目录重新执行，不能 `--resume`。
+
+包含 SSE 回归的完整测试需要 Web 依赖：
+
+```bash
+pip install -e ".[dev,web]"
+pytest
+```
+
 ## 项目结构
 
 ```

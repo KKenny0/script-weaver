@@ -1,6 +1,6 @@
 [build-system]
 requires = ["setuptools>=68.0", "wheel"]
-build-backend = "setuptools.backends._legacy:_Backend"
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "script-weaver"
@@ -37,6 +37,11 @@ dev = [
     "pytest-asyncio>=0.21",
     "pytest-cov>=4.0",
     "ruff>=0.1",
+]
+web = [
+    "fastapi>=0.100",
+    "uvicorn>=0.23",
+    "sse-starlette>=1.6",
 ]
 
 [project.scripts]

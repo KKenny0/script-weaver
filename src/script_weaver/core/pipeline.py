@@ -29,6 +29,7 @@ from script_weaver.core.types import (
     DecisionRecord,
     ProjectMeta,
     ProjectState,
+    ProjectStatus,
     UserAction,
     VisualHighlight,
 )
@@ -116,44 +117,22 @@ class PipelineEngine:
 
             elapsed = time.time() - start
 
-            # Integrate result into state
-            if isinstance(result, dict):
-                status = result.get("status", "")
-                data = result.get("data", result)
-
-                if status == "success" and isinstance(data, dict):
-                    await self._integrate_artifact(state, agent_name, data)
-                elif status == "text_response":
-                    # Agent returned text directly — try to parse as artifact
-                    text_data = data.get("text", "")
-                    self._notify(
-                        agent_name,
-                        f"Completed in {elapsed:.1f}s (text response)",
-                    )
-                    return result
-                else:
-                    self._notify(
-                        agent_name,
-                        f"Completed in {elapsed:.1f}s (status: {status})",
-                    )
-            else:
-                self._notify(
-                    agent_name,
-                    f"Completed in {elapsed:.1f}s (raw result)",
-                )
-
-            return result if isinstance(result, dict) else {"data": result}
+            if not isinstance(result, dict) or result.get("status") != "success":
+                raise ValueError(f"Agent did not produce a valid artifact: {result}")
+            await self._integrate_artifact(state, agent_name, result["data"])
+            self._notify(agent_name, f"Completed in {elapsed:.1f}s")
+            return result
 
         except Exception as e:
             logger.error(f"[{agent_name}] Failed: {e}", exc_info=True)
             self._notify(agent_name, f"FAILED: {e}")
-            return {"error": str(e)}
+            raise RuntimeError(f"{agent_name} failed: {e}") from e
 
     async def _integrate_artifact(
         self,
         state: ProjectState,
         agent_name: str,
-        data: dict[str, Any],
+        data: dict[str, Any] | list[Any],
     ) -> None:
         """Parse agent output and update project state."""
         from script_weaver.core.types import (  # Local import to avoid circular
@@ -167,12 +146,12 @@ class PipelineEngine:
                     state.refined_idea = data.get("title", "") + ": " + data.get(
                         "core_theme", ""
                     )
-                state.meta.status = "refining"
+                state.meta.status = ProjectStatus.REFINING
 
             elif agent_name == "structurer":
                 outline = Outline.model_validate(data) if data else Outline()
                 state.outline = outline
-                state.meta.status = "structured"
+                state.meta.status = ProjectStatus.STRUCTURED
 
             elif agent_name == "character_designer":
                 if isinstance(data, list):
@@ -180,7 +159,7 @@ class PipelineEngine:
                 else:
                     characters = [Character.model_validate(data)]
                 state.characters = characters
-                state.meta.status = "designing"
+                state.meta.status = ProjectStatus.DESIGNING
 
             elif agent_name == "scene_designer":
                 if isinstance(data, list):
@@ -194,17 +173,17 @@ class PipelineEngine:
 
             elif agent_name == "scriptwriter":
                 state.script = Script.model_validate(data)
-                state.meta.status = "scripting"
+                state.meta.status = ProjectStatus.SCRIPTING
 
             elif agent_name == "storyboard_artist":
                 sb = Storyboard.model_validate(data)
                 sb.compute_totals()
                 state.storyboard = sb
-                state.meta.status = "storyboarding"
+                state.meta.status = ProjectStatus.STORYBOARDING
 
             state.touch()
         except Exception as e:
-            logger.warning(f"Failed to integrate artifact from {agent_name}: {e}")
+            raise ValueError(f"Failed to integrate artifact from {agent_name}: {e}") from e
 
     # ── Main Pipeline Methods ───────────────────────────
 
@@ -238,14 +217,14 @@ class PipelineEngine:
         self._notify("pipeline", "--- Stage 1: Idea Refinement ---")
         await self._run_agent("idea_refiner", state, user_input)
 
-        if not self._await_gate("ideation", state):
+        if not await self._await_gate("ideation", state):
             return state
 
         # ── Stage 2: Structuring ───────────────────────
         self._notify("pipeline", "--- Stage 2: Story Structuring ---")
         await self._run_agent("structurer", state)
 
-        if not self._await_gate("structuring", state):
+        if not await self._await_gate("structuring", state):
             return state
 
         # ── Stage 3: Design (Parallel) ────────────────
@@ -254,14 +233,14 @@ class PipelineEngine:
         await self._run_agent("scene_designer", state)
         await self._run_agent("art_director", state)
 
-        if not self._await_gate("designing", state):
+        if not await self._await_gate("designing", state):
             return state
 
         # ── Stage 4: Script Writing ────────────────────
         self._notify("pipeline", "--- Stage 4: Script Writing ---")
         await self._run_agent("scriptwriter", state)
 
-        if not self._await_gate("scriptwriting", state):
+        if not await self._await_gate("scriptwriting", state):
             return state
 
         # ── Stage 5: Storyboarding ────────────────────
@@ -273,7 +252,7 @@ class PipelineEngine:
         await self._generate_visual_highlights(state)
 
         # ── Final State ───────────────────────────────
-        state.meta.status = "complete"
+        state.meta.status = ProjectStatus.COMPLETE
         state.touch()
 
         # ── Growth Loop ──────────────────────────────

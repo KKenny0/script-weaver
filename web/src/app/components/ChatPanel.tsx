@@ -12,7 +12,7 @@ interface Message {
   timestamp: number;
 }
 
-const API = "http://localhost:8000/api";
+const API = "/api";
 
 async function apiPost(path: string, body?: object) {
   const res = await fetch(`${API}${path}`, {
