@@ -12,7 +12,19 @@ interface Message {
   timestamp: number;
 }
 
+interface SessionNotice {
+  epoch: number;
+  text: string;
+}
+
 const API = "/api";
+
+function extractError(err: any, fallback = "请求失败"): string {
+  const d = err?.detail;
+  if (typeof d === "string") return d;
+  if (d?.message) return d.message;
+  return err?.message || fallback;
+}
 
 async function apiPost(path: string, body?: object) {
   const res = await fetch(`${API}${path}`, {
@@ -22,20 +34,24 @@ async function apiPost(path: string, body?: object) {
   });
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
-    throw new Error(err.detail || err.message || `HTTP ${res.status}`);
+    const e: any = new Error(extractError(err, `HTTP ${res.status}`));
+    e.code = err?.detail?.code;
+    throw e;
   }
   return res.json();
 }
 
 async function apiGet(path: string) {
   const res = await fetch(`${API}${path}`);
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(extractError(err, `HTTP ${res.status}`));
+  }
   return res.json();
 }
 
 interface ChatPanelProps {
   projectId: string;
-  setProjectId: (id: string) => void;
   isGenerating: boolean;
   setIsGenerating: (v: boolean) => void;
   projectStatus: "idle" | "running" | "complete" | "error";
@@ -43,14 +59,22 @@ interface ChatPanelProps {
   onArtifactUpdate: (data: Record<string, any>) => void;
   onTabSwitch: (tab: string) => void;
   onCollapse: () => void;
+  sessionNotice: SessionNotice | null;
+  closeStreamRef: React.MutableRefObject<() => void>;
+  onProjectCreated: (id: string) => void;
+  onProjectMutated: () => void;
 }
 
 export default function ChatPanel({
-  projectId, setProjectId,
+  projectId,
   isGenerating, setIsGenerating,
   projectStatus, setProjectStatus,
   onArtifactUpdate, onTabSwitch,
   onCollapse,
+  sessionNotice,
+  closeStreamRef,
+  onProjectCreated,
+  onProjectMutated,
 }: ChatPanelProps) {
   const [inputValue, setInputValue] = useState("");
   const [messages, setMessages] = useState<Message[]>([]);
@@ -60,6 +84,14 @@ export default function ChatPanel({
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const eventSourceRef = useRef<EventSource | null>(null);
+  // Latest-open project: async handlers compare against this so a late
+  // response for another project never lands in the current session.
+  const currentProjectRef = useRef(projectId);
+  const noticeEpochRef = useRef<number>(-1);
+
+  useEffect(() => {
+    currentProjectRef.current = projectId;
+  }, [projectId]);
 
   useEffect(() => { messagesEndRef.current?.scrollIntoView({ behavior: "smooth" }); }, [messages]);
 
@@ -69,14 +101,46 @@ export default function ChatPanel({
 
   useEffect(() => () => { eventSourceRef.current?.close(); }, []);
 
+  // Let the page close the subscription when the user switches projects.
+  useEffect(() => {
+    closeStreamRef.current = () => {
+      eventSourceRef.current?.close();
+      eventSourceRef.current = null;
+      setIsGenerating(false);
+    };
+  }, [setIsGenerating]);
+
+  // Session notices from the page (project opened / new project). A new epoch
+  // resets the conversation; follow-up texts with the same epoch append.
+  useEffect(() => {
+    if (!sessionNotice) return;
+    const isNewEpoch = sessionNotice.epoch !== noticeEpochRef.current;
+    noticeEpochRef.current = sessionNotice.epoch;
+    const notice: Message = { role: "assistant", content: sessionNotice.text, timestamp: Date.now() };
+    setMessages((prev) => (isNewEpoch ? [notice] : [...prev, notice]));
+  }, [sessionNotice]);
+
   // ── Handlers ──────────────────────────────────
+
+  const applyFullState = useCallback((fullState: any) => {
+    onArtifactUpdate({
+      refined_idea: fullState.refined_idea,
+      outline: fullState.outline,
+      characters: fullState.characters,
+      scenes: fullState.scenes,
+      art_style: fullState.art_style,
+      script: fullState.script,
+      storyboard: fullState.storyboard,
+      visual_highlights: fullState.visual_highlights,
+    });
+  }, [onArtifactUpdate]);
 
   const handleGenerate = useCallback(async () => {
     if (!inputValue.trim() || isGenerating) return;
 
-    const userMsg: Message = { role: "user", content: inputValue.trim(), timestamp: Date.now() };
+    const ideaText = inputValue.trim();
+    const userMsg: Message = { role: "user", content: ideaText, timestamp: Date.now() };
     setMessages((prev) => [...prev, userMsg]);
-    setInputValue("");
     setIsGenerating(true);
     setProjectStatus("running");
     onArtifactUpdate({});
@@ -84,8 +148,10 @@ export default function ChatPanel({
     setMessages((prev) => [...prev, { role: "assistant", content: "正在分析创意，启动 Pipeline...", timestamp: Date.now() }]);
 
     try {
-      const proj = await apiPost("/projects", { user_input: inputValue.trim(), auto_approve_gates: true, active_skills: {} });
-      setProjectId(proj.project_id);
+      const proj = await apiPost("/projects", { user_input: ideaText, auto_approve_gates: true, active_skills: {} });
+      // The project exists in persistent storage now — safe to consume the input.
+      setInputValue("");
+      onProjectCreated(proj.project_id);
 
       const evtSource = new EventSource(`${API}/projects/${proj.project_id}/generate`);
       eventSourceRef.current = evtSource;
@@ -107,6 +173,8 @@ export default function ChatPanel({
         setIsGenerating(false);
 
         const doneData = JSON.parse(e.data);
+        if (currentProjectRef.current !== proj.project_id) return; // late response after switching
+
         if (doneData.error) {
           setProjectStatus("error");
           setMessages((prev) => [...prev, { role: "assistant", content: `❌ 生成出错: ${doneData.error}`, timestamp: Date.now() }]);
@@ -117,16 +185,9 @@ export default function ChatPanel({
 
         try {
           const fullState = await apiGet(`/projects/${proj.project_id}`);
-          onArtifactUpdate({
-            refined_idea: fullState.refined_idea,
-            outline: fullState.outline,
-            characters: fullState.characters,
-            scenes: fullState.scenes,
-            art_style: fullState.art_style,
-            script: fullState.script,
-            storyboard: fullState.storyboard,
-            visual_highlights: fullState.visual_highlights,
-          });
+          if (currentProjectRef.current !== proj.project_id) return;
+          applyFullState(fullState);
+          onProjectMutated();
 
           setMessages((prev) => [...prev, { role: "assistant", content: `🎉 全部生成完成！\n\n${formatResultSummary(fullState)}`, timestamp: Date.now() }]);
 
@@ -143,44 +204,51 @@ export default function ChatPanel({
         eventSourceRef.current = null;
         setIsGenerating(false);
         setProjectStatus("error");
-        setMessages((prev) => [...prev, { role: "assistant", content: "⚠️ 连接中断，请检查后端服务是否运行。", timestamp: Date.now() }]);
+        setMessages((prev) => [...prev, { role: "assistant", content: "⚠️ 连接中断或生成启动失败，请检查后端服务与模型配置。输入的内容已保存在项目中。", timestamp: Date.now() }]);
       };
     } catch (err: any) {
       setIsGenerating(false);
       setProjectStatus("error");
+      // Keep inputValue so the user's text is not lost on failure.
       setMessages((prev) => [...prev, { role: "assistant", content: `❌ 错误: ${err.message}`, timestamp: Date.now() }]);
     }
-  }, [inputValue, isGenerating]);
+  }, [inputValue, isGenerating, applyFullState, onProjectCreated, onProjectMutated, setProjectStatus, setIsGenerating, onArtifactUpdate, onTabSwitch]);
 
   const handleRefine = useCallback(async () => {
     if (!projectId || !inputValue.trim() || isGenerating) return;
 
+    const refineText = inputValue.trim();
     setMessages((prev) => [
       ...prev,
-      { role: "user", content: `[修改] ${inputValue.trim()}`, timestamp: Date.now() },
+      { role: "user", content: `[修改] ${refineText}`, timestamp: Date.now() },
       { role: "assistant", content: "正在应用修改...", timestamp: Date.now() },
     ]);
-    setInputValue("");
 
     try {
-      await apiPost(`/projects/${projectId}/refine`, { message: inputValue.trim() });
+      await apiPost(`/projects/${projectId}/refine`, { message: refineText });
+      if (currentProjectRef.current !== projectId) return;
+      setInputValue("");
       const fullState = await apiGet(`/projects/${projectId}`);
-      onArtifactUpdate({
-        refined_idea: fullState.refined_idea,
-        outline: fullState.outline,
-        characters: fullState.characters,
-        scenes: fullState.scenes,
-        art_style: fullState.art_style,
-        script: fullState.script,
-        storyboard: fullState.storyboard,
-        visual_highlights: fullState.visual_highlights,
-      });
+      if (currentProjectRef.current !== projectId) return;
+      applyFullState(fullState);
+      onProjectMutated();
 
       setMessages((prev) => [...prev.slice(0, -1), { role: "assistant", content: "✅ 修改已应用。", timestamp: Date.now() }]);
     } catch (err: any) {
-      setMessages((prev) => [...prev.slice(0, -1), { role: "assistant", content: `❌ 修改失败: ${err.message}`, timestamp: Date.now() }]);
+      // Keep inputValue so the user's text is not lost on failure.
+      if (err?.code === "revision_conflict") {
+        setMessages((prev) => [...prev.slice(0, -1), { role: "assistant", content: "⚠️ 项目已在其他窗口被修改，已为你重新加载最新内容。请基于最新内容重试修改。", timestamp: Date.now() }]);
+        try {
+          const fullState = await apiGet(`/projects/${projectId}`);
+          if (currentProjectRef.current === projectId) applyFullState(fullState);
+        } catch (fetchErr) {
+          console.error("Failed to reload project:", fetchErr);
+        }
+      } else {
+        setMessages((prev) => [...prev.slice(0, -1), { role: "assistant", content: `❌ 修改失败: ${err.message}`, timestamp: Date.now() }]);
+      }
     }
-  }, [projectId, inputValue, isGenerating]);
+  }, [projectId, inputValue, isGenerating, applyFullState, onProjectMutated]);
 
   const toggleSkill = (skillId: string) => {
     setActiveSkillIds((prev) => {

@@ -199,6 +199,21 @@ Script-Weaver 不是一次性工具——它会随着使用越来越懂你：
 python -m script_weaver profile show
 ```
 
+## Web 项目持久化
+
+Web UI 创建的项目保存在 SQLite 数据库中，刷新页面或重启后端后仍可打开、继续修改和导出：
+
+- 数据位置：`<data_dir>/main-web/projects.sqlite3`（默认 `~/.scriptweaver/main-web/`），可用 `SCRIPTWEAVER_DATA_DIR` 重定向；不新增其他环境变量。
+- 打开哪个项目由页面 URL 的 `?project=<id>` 决定；项目 ID 与导出 JSON 中的 `meta.id` 一致。
+- 每次保存都会追加一条不可变历史版本（`GET /api/projects/{id}/versions`），重命名同样推进项目 revision；携带过期 revision 的写入会返回 409，不会产生部分写入。
+- 单实例运行：API 启动时对数据目录持有独占文件锁，同一数据目录上的第二个 API 实例会拒绝启动；正常退出后可立即重启。CLI 不会写该数据库。
+
+### 升级与回滚
+
+- 旧版本（纯内存 Web 项目）的内容不会迁移：升级前请先用旧版本导出需要的项目 JSON。
+- 回滚到旧代码不会删除或改动 `main-web` 数据库与历史版本，但旧版本无法展示其中的项目；重新部署新版本后仍可读取。
+- 数据库通过 `PRAGMA user_version` 管理格式版本；当数据库版本超出当前程序支持时会拒绝写入，不会自动降级。
+
 ## 导出格式
 
 ### VideoGen 导出（核心差异化功能）

@@ -1,0 +1,268 @@
+"""Offline checks for the SQLite project store (ticket #13)."""
+
+import sqlite3
+
+import pytest
+
+from script_weaver.core.project_store import (
+    DataDirLock,
+    DataDirLockError,
+    ProjectStore,
+    ProjectStoreError,
+    RevisionConflictError,
+    UnsupportedDatabaseVersionError,
+)
+from script_weaver.core.types import BasicInfo, Outline, ProjectState
+
+
+@pytest.fixture
+def store(tmp_path):
+    s = ProjectStore(tmp_path / "projects.sqlite3")
+    yield s
+    s.close()
+
+
+def _with_outline(state: ProjectState, logline: str) -> ProjectState:
+    state.outline = Outline(basic_info=BasicInfo(logline=logline))
+    return state
+
+
+# ── Creation & identity ────────────────────────────────────
+
+
+def test_create_pins_service_id_to_meta_id(store):
+    record = store.create_project(user_input="一个悬疑故事", title="悬疑A")
+    assert record.project_id == record.state.meta.id
+    assert record.revision == 1
+    assert record.title == "悬疑A"
+
+    loaded = store.get(record.project_id)
+    assert loaded is not None
+    assert loaded.state == record.state  # valid ProjectState round-trip
+    assert loaded.state.meta.id == record.project_id
+
+
+def test_get_missing_project_returns_none(store):
+    assert store.get("nope") is None
+    with pytest.raises(ProjectStoreError):
+        store.get_required("nope")
+
+
+# ── Multi-project isolation ────────────────────────────────
+
+
+def test_two_projects_do_not_cross_write(store):
+    a = store.create_project(user_input="A 的想法")
+    b = store.create_project(user_input="B 的想法")
+
+    updated = _with_outline(store.get(a.project_id).state, "A 的大纲")
+    saved = store.save_state(a.project_id, updated, 1, source="manual", summary="改A")
+    assert saved.revision == 2
+
+    rb = store.get(b.project_id)
+    assert rb.revision == 1
+    assert rb.state.outline is None
+    assert rb.state.user_input == "B 的想法"
+    # B's updated_at is untouched by A's save.
+    assert rb.updated_at == b.updated_at
+
+    ra = store.get(a.project_id)
+    assert ra.revision == 2
+    assert ra.state.outline.basic_info.logline == "A 的大纲"
+
+
+def test_list_orders_by_real_updated_time(store):
+    a = store.create_project(user_input="第一个")
+    b = store.create_project(user_input="第二个")
+    assert [p["project_id"] for p in store.list_projects()] == [b.project_id, a.project_id]
+
+    updated = _with_outline(store.get(a.project_id).state, "更新A")
+    store.save_state(a.project_id, updated, 1, source="manual", summary="x")
+    listed = store.list_projects()
+    assert listed[0]["project_id"] == a.project_id
+    assert listed[0]["updated_at"] >= listed[1]["updated_at"]
+    assert set(listed[0]) >= {"project_id", "title", "revision", "stage",
+                              "created_at", "updated_at"}
+
+
+# ── Rename ─────────────────────────────────────────────────
+
+
+def test_rename_advances_revision_and_appends_version(store):
+    record = store.create_project(user_input="想改名的项目")
+    renamed = store.rename_project(record.project_id, "新名字", 1)
+    assert renamed.revision == 2
+    assert renamed.title == "新名字"
+    assert renamed.state.meta.title == "新名字"
+    assert renamed.state.meta.id == record.project_id
+    versions = store.list_versions(record.project_id)
+    assert [v.revision for v in versions] == [2, 1]
+    assert versions[0].source == "manual"
+    assert "命名" in versions[0].summary
+
+
+def test_rename_rejects_empty_title(store):
+    record = store.create_project(user_input="x")
+    with pytest.raises(ProjectStoreError):
+        store.rename_project(record.project_id, "   ", 1)
+
+
+# ── Revision conflicts & atomicity ─────────────────────────
+
+
+def test_stale_revision_rejected_without_partial_write(store):
+    record = store.create_project(user_input="并发测试")
+    first = _with_outline(store.get(record.project_id).state, "第一次修改")
+    store.save_state(record.project_id, first, 1, source="manual", summary="第一次")
+
+    # A second writer still holds revision 1.
+    stale = _with_outline(store.get(record.project_id).state, "过期的修改")
+    with pytest.raises(RevisionConflictError) as exc:
+        store.save_state(record.project_id, stale, 1, source="manual", summary="过期")
+    assert exc.value.current_revision == 2
+
+    current = store.get(record.project_id)
+    assert current.revision == 2
+    assert current.state.outline.basic_info.logline == "第一次修改"
+    assert [v.revision for v in store.list_versions(record.project_id)] == [2, 1]
+
+
+def test_failed_write_leaves_no_partial_rows(store):
+    """A failure between UPDATE and INSERT must roll back completely."""
+    record = store.create_project(user_input="失败原子性")
+
+    # Sabotage: pre-insert a row for the revision the next save will try to
+    # write, so the version INSERT fails after the projects UPDATE ran.
+    store._conn.execute(
+        "INSERT INTO project_versions (project_id, revision, title, state_json,"
+        " source, summary, created_at) VALUES (?, 2, '占位', '{}', 'manual', '', 'now')",
+        (record.project_id,),
+    )
+
+    state = _with_outline(store.get(record.project_id).state, "将要失败")
+    with pytest.raises(sqlite3.IntegrityError):
+        store.save_state(record.project_id, state, 1, source="manual", summary="失败")
+
+    current = store.get(record.project_id)
+    assert current.revision == 1  # UPDATE rolled back too
+    assert current.state.outline is None
+    assert current.title == record.title
+
+
+def test_replace_state_tolerates_rename_during_generation(store):
+    record = store.create_project(user_input="生成期间被改名")
+    base_json = store.get(record.project_id).state_json
+
+    renamed = store.rename_project(record.project_id, "生成期间改名", 1)
+
+    generated = _with_outline(store.get(record.project_id).state, "生成结果")
+    result = store.replace_state(
+        record.project_id, generated,
+        base_revision=1, base_state_json=base_json,
+        source="pipeline", summary="完整生成",
+    )
+    assert result.revision == renamed.revision + 1
+    assert result.title == "生成期间改名"  # rename survives
+    assert result.state.outline.basic_info.logline == "生成结果"
+
+
+def test_replace_state_rejects_content_change_during_generation(store):
+    record = store.create_project(user_input="生成期间被编辑")
+    base_json = store.get(record.project_id).state_json
+
+    edited = _with_outline(store.get(record.project_id).state, "用户手工编辑")
+    store.save_state(record.project_id, edited, 1, source="manual", summary="并发编辑")
+
+    generated = _with_outline(store.get(record.project_id).state, "生成结果")
+    with pytest.raises(RevisionConflictError):
+        store.replace_state(
+            record.project_id, generated,
+            base_revision=1, base_state_json=base_json,
+            source="pipeline", summary="完整生成",
+        )
+    current = store.get(record.project_id)
+    assert current.state.outline.basic_info.logline == "用户手工编辑"
+
+
+# ── History ────────────────────────────────────────────────
+
+
+def test_versions_are_immutable_snapshots(store):
+    record = store.create_project(user_input="历史快照")
+    v1 = store.get_version(record.project_id, 1)
+    assert v1 is not None
+
+    # Mutating a returned historical copy must not affect stored history.
+    v1.state.user_input = "被篡改的历史"
+    again = store.get_version(record.project_id, 1)
+    assert again.state.user_input == "历史快照"
+
+    updated = _with_outline(store.get(record.project_id).state, "第二版内容")
+    store.save_state(record.project_id, updated, 1, source="manual", summary="第二版")
+    v2 = store.get_version(record.project_id, 2)
+    assert v2.state.outline is not None
+    assert v1.state.outline is None  # old revision still shows old content
+    assert store.get_version(record.project_id, 99) is None
+
+
+def test_delete_cascades_versions(store):
+    record = store.create_project(user_input="将被删除")
+    updated = _with_outline(store.get(record.project_id).state, "内容")
+    store.save_state(record.project_id, updated, 1, source="manual", summary="x")
+
+    assert store.delete_project(record.project_id) is True
+    assert store.get(record.project_id) is None
+    assert store.list_versions(record.project_id) == []
+    assert store.delete_project(record.project_id) is False
+
+
+# ── Persistence across reopen ──────────────────────────────
+
+
+def test_store_reopen_finds_projects(tmp_path):
+    db = tmp_path / "projects.sqlite3"
+    store = ProjectStore(db)
+    record = store.create_project(user_input="重启后仍在")
+    updated = _with_outline(store.get(record.project_id).state, "重启前保存")
+    store.save_state(record.project_id, updated, 1, source="manual", summary="x")
+    store.close()
+
+    reopened = ProjectStore(db)
+    loaded = reopened.get(record.project_id)
+    assert loaded is not None
+    assert loaded.revision == 2
+    assert loaded.state.outline.basic_info.logline == "重启前保存"
+    assert len(reopened.list_versions(record.project_id)) == 2
+    reopened.close()
+
+
+# ── Schema versioning ──────────────────────────────────────
+
+
+def test_future_schema_version_refused(tmp_path):
+    db = tmp_path / "projects.sqlite3"
+    store = ProjectStore(db)
+    store.close()
+    conn = sqlite3.connect(str(db))
+    conn.execute("PRAGMA user_version=99")
+    conn.close()
+
+    with pytest.raises(UnsupportedDatabaseVersionError):
+        ProjectStore(db)
+
+
+# ── Single-instance data dir lock ──────────────────────────
+
+
+def test_data_dir_lock_rejects_second_holder(tmp_path):
+    lock = DataDirLock(tmp_path)
+    lock.acquire()
+    try:
+        with pytest.raises(DataDirLockError):
+            DataDirLock(tmp_path).acquire()
+    finally:
+        lock.release()
+    # After a clean release the next instance may start.
+    second = DataDirLock(tmp_path)
+    second.acquire()
+    second.release()
