@@ -3,11 +3,12 @@
 import React from "react";
 import {
   FileText, Users, Map, Palette, Film, Eye,
-  Download, ChevronRight,
+  Download, ChevronRight, History,
   CheckCircle2, AlertCircle, Loader2,
   Sun, Moon,
 } from "lucide-react";
 import { ArtifactData, renderArtifactContent } from "./ArtifactContent";
+import VersionHistory, { HistoryPanelState } from "./VersionHistory";
 import { useTheme } from "./ThemeProvider";
 
 const ARTIFACT_TABS = [
@@ -34,6 +35,12 @@ interface ArtifactPanelProps {
   activeTab: string;
   onTabChange: (tab: string) => void;
   onCollapse: () => void;
+  historyPanel: HistoryPanelState;
+  onOpenHistory: () => void;
+  onRefreshHistory: () => void;
+  onSelectHistoryVersion: (revision: number) => void;
+  onBackToHistoryList: () => void;
+  onCloseHistory: () => void;
 }
 
 function iconBtnStyle(enabled: boolean): React.CSSProperties {
@@ -51,6 +58,8 @@ function iconBtnStyle(enabled: boolean): React.CSSProperties {
 export default function ArtifactPanel({
   projectId, artifactData, projectStatus,
   activeTab, onTabChange, onCollapse,
+  historyPanel, onOpenHistory, onRefreshHistory,
+  onSelectHistoryVersion, onBackToHistoryList, onCloseHistory,
 }: ArtifactPanelProps) {
   const { theme, toggleTheme } = useTheme();
 
@@ -100,6 +109,15 @@ export default function ArtifactPanel({
           <button onClick={toggleTheme} className="btn-ghost" title={theme === "dark" ? "切换到亮色模式" : "切换到暗色模式"}>
             {theme === "dark" ? <Sun size={16} /> : <Moon size={16} />}
           </button>
+          <button
+            onClick={onOpenHistory}
+            disabled={!projectId}
+            style={iconBtnStyle(!!projectId)}
+            title={historyPanel.open ? "关闭版本历史" : "查看版本历史"}
+            aria-label={historyPanel.open ? "关闭版本历史" : "查看版本历史"}
+          >
+            <History size={14} style={historyPanel.open ? { color: "var(--brand-primary)" } : undefined} />
+          </button>
           <button onClick={() => handleExport("json")} disabled={!projectId} style={iconBtnStyle(!!projectId)} title="导出 JSON"><Download size={14} /></button>
           <button onClick={() => handleExport("fountain")} disabled={!projectId || !artifactData.script} style={iconBtnStyle(!!projectId && !!artifactData.script)} title="导出 Fountain 格式"><FileText size={14} /></button>
           <button onClick={() => handleExport("video_gen")} disabled={!projectId || !artifactData.storyboard} style={iconBtnStyle(!!projectId && !!artifactData.storyboard)} title="导出 VideoGen 提示词"><Film size={14} /></button>
@@ -117,9 +135,21 @@ export default function ArtifactPanel({
         </div>
       </div>
 
-      {/* Content area */}
+      {/* Content area — history view takes precedence while open; it renders
+          read-only snapshots and never writes into the current artifacts. */}
       <div style={{ flex: 1, overflowY: "auto", padding: "20px 24px" }}>
-        {renderArtifactContent(activeTab, artifactData)}
+        {historyPanel.open ? (
+          <VersionHistory
+            state={historyPanel}
+            activeTab={activeTab}
+            onRefresh={onRefreshHistory}
+            onSelect={onSelectHistoryVersion}
+            onBackToList={onBackToHistoryList}
+            onClose={onCloseHistory}
+          />
+        ) : (
+          renderArtifactContent(activeTab, artifactData)
+        )}
       </div>
 
       {/* Bottom bar */}

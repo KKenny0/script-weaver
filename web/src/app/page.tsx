@@ -5,6 +5,7 @@ import { PanelLeftOpen } from "lucide-react";
 import ChatPanel from "./components/ChatPanel";
 import ArtifactPanel from "./components/ArtifactPanel";
 import ProjectList, { ProjectSummary } from "./components/ProjectList";
+import { HistoryPanelState, VersionSnapshot } from "./components/VersionHistory";
 import { ArtifactData } from "./components/ArtifactContent";
 
 const API = "/api";
@@ -50,6 +51,16 @@ interface SessionNotice {
   text: string;
 }
 
+const HISTORY_CLOSED: HistoryPanelState = {
+  open: false,
+  loading: false,
+  error: null,
+  versions: [],
+  currentRevision: 0,
+  viewing: null,
+  viewingLoading: false,
+};
+
 export default function HomePage() {
   const [projectId, setProjectId] = useState<string>("");
   const [projects, setProjects] = useState<ProjectSummary[]>([]);
@@ -60,6 +71,7 @@ export default function HomePage() {
   const [leftPanelCollapsed, setLeftPanelCollapsed] = useState(false);
   const [projectListOpen, setProjectListOpen] = useState(true);
   const [sessionNotice, setSessionNotice] = useState<SessionNotice | null>(null);
+  const [historyPanel, setHistoryPanel] = useState<HistoryPanelState>(HISTORY_CLOSED);
 
   // Late-response guard: async handlers compare against the project that is
   // open *now*, so a response for a previously selected project can never
@@ -95,6 +107,7 @@ export default function HomePage() {
     setArtifactData({});
     setActiveTab("outline");
     setProjectStatus("idle");
+    setHistoryPanel(HISTORY_CLOSED);
     window.history.replaceState(null, "", `/?project=${encodeURIComponent(id)}`);
     nextNotice("📂 正在打开项目…");
     try {
@@ -119,6 +132,7 @@ export default function HomePage() {
     setArtifactData({});
     setActiveTab("outline");
     setProjectStatus("idle");
+    setHistoryPanel(HISTORY_CLOSED);
     window.history.replaceState(null, "", "/");
     nextNotice("🆕 已开始一个新项目，输入故事想法开始生成。");
   }, [nextNotice]);
@@ -148,6 +162,64 @@ export default function HomePage() {
     }
     await refreshProjects();
   }, [refreshProjects]);
+
+  // ── Version history (read-only; separate from the live project state) ──
+
+  const refreshHistory = useCallback(async (projectId: string) => {
+    setHistoryPanel((prev) => ({ ...prev, loading: true, error: null }));
+    try {
+      const result = await apiGet(`/projects/${projectId}/versions`);
+      setHistoryPanel((prev) => ({
+        ...prev,
+        open: true,
+        loading: false,
+        error: null,
+        versions: result.versions || [],
+        currentRevision: result.current_revision ?? 0,
+      }));
+    } catch (err: any) {
+      // Keep the panel open so the failure is visible and retryable.
+      setHistoryPanel((prev) => ({ ...prev, open: true, loading: false, error: err.message }));
+    }
+  }, []);
+
+  const handleOpenHistory = useCallback(() => {
+    if (!projectId) return;
+    if (historyPanel.open) {
+      // Toggle: from a snapshot back to the list, from the list to closed.
+      setHistoryPanel((prev) => (prev.viewing ? { ...prev, viewing: null, error: null } : HISTORY_CLOSED));
+      return;
+    }
+    setHistoryPanel({ ...HISTORY_CLOSED, open: true, loading: true });
+    refreshHistory(projectId);
+  }, [projectId, historyPanel.open, refreshHistory]);
+
+  const handleSelectHistoryVersion = useCallback(async (revision: number) => {
+    if (!projectId) return;
+    setHistoryPanel((prev) => ({ ...prev, viewingLoading: true, error: null }));
+    try {
+      const snap = await apiGet(`/projects/${projectId}/versions/${revision}`);
+      const viewing: VersionSnapshot = {
+        revision: snap.revision,
+        title: snap.meta?.title ?? "",
+        source: snap.source ?? "manual",
+        summary: snap.summary ?? "",
+        created_at: snap.created_at ?? "",
+        data: snap,
+      };
+      setHistoryPanel((prev) => ({ ...prev, viewing, viewingLoading: false }));
+    } catch (err: any) {
+      setHistoryPanel((prev) => ({ ...prev, viewingLoading: false, error: err.message }));
+    }
+  }, [projectId]);
+
+  const handleBackToHistoryList = useCallback(() => {
+    setHistoryPanel((prev) => ({ ...prev, viewing: null, error: null }));
+  }, []);
+
+  const handleCloseHistory = useCallback(() => {
+    setHistoryPanel(HISTORY_CLOSED);
+  }, []);
 
   // On mount the URL decides which project is open, so a refresh restores it.
   useEffect(() => {
@@ -228,6 +300,12 @@ export default function HomePage() {
         activeTab={activeTab}
         onTabChange={setActiveTab}
         onCollapse={() => setLeftPanelCollapsed(true)}
+        historyPanel={historyPanel}
+        onOpenHistory={handleOpenHistory}
+        onRefreshHistory={() => projectId && refreshHistory(projectId)}
+        onSelectHistoryVersion={handleSelectHistoryVersion}
+        onBackToHistoryList={handleBackToHistoryList}
+        onCloseHistory={handleCloseHistory}
       />
     </div>
   );

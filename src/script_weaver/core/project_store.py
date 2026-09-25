@@ -20,9 +20,9 @@ import sys
 import threading
 import uuid
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -85,7 +85,8 @@ class DataDirLockError(ProjectStoreError):
 
 
 def _utcnow() -> str:
-    return datetime.now(UTC).isoformat()
+    # timezone.utc (not datetime.UTC): the project still supports Python 3.10.
+    return datetime.now(timezone.utc).isoformat()  # noqa: UP017
 
 
 if sys.platform == "win32":
@@ -245,10 +246,10 @@ class ProjectStore:
                 for statement in _SCHEMA_STATEMENTS:
                     self._conn.execute(statement)
                 self._conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+                self._conn.execute("COMMIT")
             except BaseException:
-                self._conn.execute("ROLLBACK")
+                self._rollback_quietly()
                 raise
-            self._conn.execute("COMMIT")
 
     @contextmanager
     def _write_tx(self) -> Iterator[sqlite3.Connection]:
@@ -257,10 +258,19 @@ class ProjectStore:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
                 yield self._conn
+                # COMMIT stays inside the guarded block: a rejected COMMIT
+                # must roll back instead of leaving an open transaction with
+                # half-applied writes visible to later reads.
+                self._conn.execute("COMMIT")
             except BaseException:
-                self._conn.execute("ROLLBACK")
+                self._rollback_quietly()
                 raise
-            self._conn.execute("COMMIT")
+
+    def _rollback_quietly(self) -> None:
+        """Roll back if a transaction is still open; never mask the cause."""
+        if self._conn.in_transaction:
+            with suppress(sqlite3.Error):
+                self._conn.execute("ROLLBACK")
 
     # ── Reads ─────────────────────────────────────────────
 

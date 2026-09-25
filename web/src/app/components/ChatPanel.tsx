@@ -87,11 +87,18 @@ export default function ChatPanel({
   // Latest-open project: async handlers compare against this so a late
   // response for another project never lands in the current session.
   const currentProjectRef = useRef(projectId);
+  // Session token (from page epochs): distinguishes two not-yet-created
+  // project sessions, which a project id alone cannot.
+  const sessionRef = useRef(0);
   const noticeEpochRef = useRef<number>(-1);
 
   useEffect(() => {
     currentProjectRef.current = projectId;
   }, [projectId]);
+
+  useEffect(() => {
+    sessionRef.current = sessionNotice?.epoch ?? 0;
+  }, [sessionNotice]);
 
   useEffect(() => { messagesEndRef.current?.scrollIntoView({ behavior: "smooth" }); }, [messages]);
 
@@ -139,6 +146,8 @@ export default function ChatPanel({
     if (!inputValue.trim() || isGenerating) return;
 
     const ideaText = inputValue.trim();
+    const originalInput = inputValue;
+    const epochAtStart = sessionRef.current;
     const userMsg: Message = { role: "user", content: ideaText, timestamp: Date.now() };
     setMessages((prev) => [...prev, userMsg]);
     setIsGenerating(true);
@@ -149,8 +158,16 @@ export default function ChatPanel({
 
     try {
       const proj = await apiPost("/projects", { user_input: ideaText, auto_approve_gates: true, active_skills: {} });
-      // The project exists in persistent storage now — safe to consume the input.
-      setInputValue("");
+      if (sessionRef.current !== epochAtStart) {
+        // The user moved to another project/session while this creation was
+        // in flight: the project exists server-side, so refresh the list,
+        // but do not touch the current session, URL, draft or subscription.
+        onProjectMutated();
+        return;
+      }
+      // The project exists in persistent storage now — consume the input,
+      // but only if the user has not started typing a new draft meanwhile.
+      setInputValue((prev) => (prev === originalInput ? "" : prev));
       onProjectCreated(proj.project_id);
 
       const evtSource = new EventSource(`${API}/projects/${proj.project_id}/generate`);
@@ -207,6 +224,7 @@ export default function ChatPanel({
         setMessages((prev) => [...prev, { role: "assistant", content: "⚠️ 连接中断或生成启动失败，请检查后端服务与模型配置。输入的内容已保存在项目中。", timestamp: Date.now() }]);
       };
     } catch (err: any) {
+      if (sessionRef.current !== epochAtStart) return; // late failure: not this session's concern
       setIsGenerating(false);
       setProjectStatus("error");
       // Keep inputValue so the user's text is not lost on failure.
@@ -218,6 +236,7 @@ export default function ChatPanel({
     if (!projectId || !inputValue.trim() || isGenerating) return;
 
     const refineText = inputValue.trim();
+    const originalInput = inputValue;
     setMessages((prev) => [
       ...prev,
       { role: "user", content: `[修改] ${refineText}`, timestamp: Date.now() },
@@ -227,7 +246,9 @@ export default function ChatPanel({
     try {
       await apiPost(`/projects/${projectId}/refine`, { message: refineText });
       if (currentProjectRef.current !== projectId) return;
-      setInputValue("");
+      // Consume the submitted instruction only if the composer still holds
+      // it; a draft typed while the model was processing must survive.
+      setInputValue((prev) => (prev === originalInput ? "" : prev));
       const fullState = await apiGet(`/projects/${projectId}`);
       if (currentProjectRef.current !== projectId) return;
       applyFullState(fullState);
@@ -235,6 +256,7 @@ export default function ChatPanel({
 
       setMessages((prev) => [...prev.slice(0, -1), { role: "assistant", content: "✅ 修改已应用。", timestamp: Date.now() }]);
     } catch (err: any) {
+      if (currentProjectRef.current !== projectId) return; // late failure
       // Keep inputValue so the user's text is not lost on failure.
       if (err?.code === "revision_conflict") {
         setMessages((prev) => [...prev.slice(0, -1), { role: "assistant", content: "⚠️ 项目已在其他窗口被修改，已为你重新加载最新内容。请基于最新内容重试修改。", timestamp: Date.now() }]);

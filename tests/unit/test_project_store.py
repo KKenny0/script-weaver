@@ -149,6 +149,103 @@ def test_failed_write_leaves_no_partial_rows(store):
     assert current.title == record.title
 
 
+class _CommitFailProxy:
+    """Delegate to a real sqlite3 connection but fail COMMIT N times.
+
+    sqlite3.Connection forbids attribute assignment, so failures are injected
+    by swapping the store's connection for this proxy.
+    """
+
+    def __init__(self, conn, failures=1):
+        self._conn = conn
+        self._failures = failures
+
+    def execute(self, sql, params=()):
+        if sql == "COMMIT" and self._failures > 0:
+            self._failures -= 1
+            raise sqlite3.OperationalError(
+                "disk I/O error during COMMIT (simulated)"
+            )
+        return self._conn.execute(sql, params)
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+
+def test_failed_commit_rolls_back_and_keeps_store_usable(tmp_path, monkeypatch):
+    """A rejected COMMIT must roll back, keep the original exception, and
+    leave the same store instance usable once the fault clears."""
+    db = tmp_path / "projects.sqlite3"
+    store = ProjectStore(db)
+    record = store.create_project(user_input="提交失败原子性")
+
+    proxy = _CommitFailProxy(store._conn)
+    monkeypatch.setattr(store, "_conn", proxy)
+    state = _with_outline(store.get(record.project_id).state, "COMMIT 将失败")
+    with pytest.raises(sqlite3.OperationalError, match="COMMIT"):
+        store.save_state(record.project_id, state, 1, source="manual", summary="x")
+    monkeypatch.undo()  # fault cleared
+
+    assert not store._conn.in_transaction, "failed COMMIT left a transaction open"
+
+    current = store.get(record.project_id)
+    assert current.revision == 1, "uncommitted revision became visible"
+    assert current.state.outline is None
+    assert [v.revision for v in store.list_versions(record.project_id)] == [1]
+
+    # The same instance saves successfully after the fault clears.
+    ok = store.save_state(
+        record.project_id,
+        _with_outline(current.state, "恢复后保存"),
+        1, source="manual", summary="y",
+    )
+    assert ok.revision == 2
+    store.close()
+
+    reopened = ProjectStore(db)
+    r = reopened.get(record.project_id)
+    assert r.revision == 2
+    assert r.state.outline.basic_info.logline == "恢复后保存"
+    assert len(reopened.list_versions(record.project_id)) == 2
+    reopened.close()
+
+
+def test_failed_commit_during_migration_rolls_back(tmp_path, monkeypatch):
+    """The migration transaction must handle a rejected COMMIT the same way."""
+    import script_weaver.core.project_store as ps
+
+    db = tmp_path / "projects.sqlite3"
+    store = ProjectStore(db)  # creates schema at user_version 1
+    store.close()
+
+    # Reset the version so the next open runs the migration again (the DDL
+    # is idempotent), with COMMIT failing through a connection proxy.
+    conn = sqlite3.connect(str(db))
+    conn.execute("PRAGMA user_version=0")
+    conn.commit()
+    conn.close()
+
+    real_connect = sqlite3.connect
+    proxies = []
+
+    def proxied_connect(*args, **kwargs):
+        proxies.append(_CommitFailProxy(real_connect(*args, **kwargs)))
+        return proxies[-1]
+
+    monkeypatch.setattr(sqlite3, "connect", proxied_connect)
+    with pytest.raises(sqlite3.OperationalError, match="COMMIT"):
+        ProjectStore(db)
+    monkeypatch.undo()
+
+    assert not proxies[0]._conn.in_transaction, "migration left a transaction open"
+    proxies[0]._conn.close()
+
+    # Reopening after the fault migrates cleanly; nothing half-applied.
+    reopened = ProjectStore(db)
+    assert reopened._conn.execute("PRAGMA user_version").fetchone()[0] == ps.SCHEMA_VERSION
+    reopened.close()
+
+
 def test_replace_state_tolerates_rename_during_generation(store):
     record = store.create_project(user_input="生成期间被改名")
     base_json = store.get(record.project_id).state_json
