@@ -7,6 +7,8 @@ import { defineConfig } from "@playwright/test";
  * Next dev server on 3100 whose /api proxy targets that backend. The
  * backend is forced model-less (see env below) and generation runs through
  * the in-page EventSource stand-in, so the suite never calls a real model.
+ * Ports 8310/3100 must be free: nothing is ever reused, so an occupied
+ * port fails the run before any test (see tests/e2e/verify-port-isolation.mjs).
  * Run with:
  *
  *   npx playwright install chromium   # first time only
@@ -27,7 +29,13 @@ export default defineConfig({
       command: ".venv/bin/python -m uvicorn web.api.main:app --host 127.0.0.1 --port 8310 --workers 1 --log-level warning",
       cwd: "..",
       url: "http://127.0.0.1:8310/api/projects",
-      reuseExistingServer: true,
+      // Never reuse a server that is already listening on the port: an
+      // unrelated backend would not carry this config's isolated env (data
+      // dir + neutralized model keys), and a probe/test could then reach a
+      // real, key-armed service. Playwright pre-checks the URL before
+      // spawning, so an occupied port fails the run before any test
+      // executes — without touching the existing service.
+      reuseExistingServer: false,
       env: {
         SCRIPTWEAVER_DATA_DIR: "/tmp/script-weaver-e2e-data",
         // The backend must stay model-less even on machines whose root .env
@@ -45,7 +53,7 @@ export default defineConfig({
     {
       command: "npm run dev -- --port 3100",
       url: "http://localhost:3100",
-      reuseExistingServer: true,
+      reuseExistingServer: false,
       env: { SCRIPTWEAVER_API_TARGET: "http://127.0.0.1:8310" },
     },
   ],

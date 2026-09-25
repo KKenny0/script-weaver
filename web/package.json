@@ -7,7 +7,8 @@
     "build": "next build --turbopack",
     "start": "next start",
     "lint": "next lint",
-    "test:e2e": "playwright test"
+    "test:e2e": "playwright test",
+    "check:e2e-ports": "node tests/e2e/verify-port-isolation.mjs"
   },
   "dependencies": {
     "lucide-react": "^0.468.0",
