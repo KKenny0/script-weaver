@@ -966,6 +966,17 @@ def _swap(script: dict) -> dict:
          "未知 constraint"),
         ({"next_agent": "storyboard_artist", "action": "execute_agent",
           "constraint": "shorten_last_dialogue"}, "受限约束必须路由 scriptwriter"),
+        # Review round 2: non-string routing fields must be refused as 422,
+        # not crash the handler with a TypeError (500).
+        ({"next_agent": "scriptwriter", "action": []}, "action 是数组"),
+        ({"next_agent": "scriptwriter", "action": {}}, "action 是对象"),
+        ({"next_agent": "scriptwriter", "action": 1}, "action 是数字"),
+        ({"next_agent": "scriptwriter", "action": "execute_agent", "constraint": {}},
+         "constraint 是对象"),
+        ({"next_agent": "scriptwriter", "action": "execute_agent", "constraint": []},
+         "constraint 是数组"),
+        ({"next_agent": "scriptwriter", "action": "execute_agent", "constraint": 3},
+         "constraint 是数字"),
     ],
 )
 async def test_refine_unusable_routing_is_not_executable(client, routing, reason):
@@ -1209,6 +1220,76 @@ async def test_refine_summary_truncates_to_ten_previews_300(client):
     for change in body["changes"]:
         assert len(change["before"]) <= 303  # 300 + "..."
         assert len(change["after"]) <= 303
+
+
+# ── Review round 2: raw strict compare + reference integrity ────────
+
+
+async def test_refine_shorten_whitespace_padded_other_id_rejected(client):
+    """The constrained check must compare raw values: padding another
+    scene's ID with whitespace is an out-of-bounds change, not a no-op."""
+    api, c = client
+    p = await seed_scripted_project(c, api, "空白ID越界")
+    base = scripted_script_dict(scripted_state())
+
+    def pad_other_scene_id(script: dict) -> dict:
+        out = with_shortened_last(script)
+        out["scenes"][0]["scene_id"] = f" {out['scenes'][0]['scene_id']} "
+        return out
+
+    llm = ScriptedLLM(ROUTE_SHORTEN, pad_other_scene_id(base))
+    real_engine(api, llm)
+
+    r = await c.post(f"/api/projects/{p['project_id']}/refine",
+                     json={"message": "只缩短最后一句对白"})
+    assert r.status_code == 422, r.text
+    assert r.json()["detail"]["code"] == "refine_constraint_failed"
+    assert "scene_id" in r.json()["detail"]["message"]
+    await assert_project_untouched(c, api, p)
+
+
+async def test_refine_general_rebuilt_referenced_id_rejected_no_write(client):
+    """Real Pipeline → API → Store chain: a substantive dialogue edit that
+    also rebuilds a storyboard-referenced scene_id must be refused whole —
+    saving it would leave the export's scene→character lookup dangling."""
+    api, c = client
+    p = await seed_scripted_project(c, api, "引用重建")
+    base = scripted_script_dict(scripted_state())
+
+    def shorten_first_and_rebuild_id(script: dict) -> dict:
+        out = copy.deepcopy(script)
+        out["scenes"][0]["blocks"][1]["content"]["dialogue"] = "灯，不能灭。"
+        out["scenes"][0]["scene_id"] = "sc_new"  # storyboard shot_1 refs sc_first
+        return out
+
+    llm = ScriptedLLM(ROUTE_GENERAL_SCRIPT, shorten_first_and_rebuild_id(base))
+    real_engine(api, llm)
+
+    r = await c.post(f"/api/projects/{p['project_id']}/refine",
+                     json={"message": "第一句对白加顿号"})
+    assert r.status_code == 422, r.text
+    assert r.json()["detail"]["code"] == "refine_constraint_failed"
+    assert "storyboard.shots[0].scene_id" in r.json()["detail"]["message"]
+    await assert_project_untouched(c, api, p)
+
+
+async def test_refine_general_intact_references_succeed(client):
+    api, c = client
+    p = await seed_scripted_project(c, api, "引用完整修改")
+    base = scripted_script_dict(scripted_state())
+
+    def keep_ids_change_dialogue(script: dict) -> dict:
+        out = copy.deepcopy(script)
+        out["scenes"][0]["blocks"][1]["content"]["dialogue"] = "灯，不能灭。"
+        return out
+
+    llm = ScriptedLLM(ROUTE_GENERAL_SCRIPT, keep_ids_change_dialogue(base))
+    real_engine(api, llm)
+
+    r = await c.post(f"/api/projects/{p['project_id']}/refine",
+                     json={"message": "第一句对白加顿号"})
+    assert r.status_code == 200, r.text
+    assert r.json()["changed_artifacts"] == ["script"]
 
 
 def test_cli_generate_does_not_touch_web_database(tmp_path, monkeypatch):

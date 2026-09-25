@@ -27,6 +27,7 @@ from script_weaver.core.types import (
     DecisionRecord,
     Outline,
     ProjectState,
+    SceneDesign,
     Script,
     ScriptBlock,
     ScriptBlockType,
@@ -34,6 +35,7 @@ from script_weaver.core.types import (
     ScriptSceneHeading,
     Shot,
     Storyboard,
+    VisualHighlight,
 )
 from script_weaver.llm.providers import ChatResponse, ToolCall
 from script_weaver.memory import profile
@@ -469,3 +471,133 @@ async def test_refine_model_error_is_sanitized_execution_error():
     with pytest.raises(refinement.RefineExecutionError) as exc:
         await engine.refine(state, "只缩短最后一句对白")
     assert "sk-hush" not in str(exc.value)
+
+
+# ── Review round 2 regressions ──────────────────────────
+# Four defects found in review of 0cc162e: strict mode must compare raw
+# field values, general refines must preserve reference integrity, routing
+# fields must be type-checked before enum membership, and the frontend must
+# not write a stale refresh-failure outcome into another project's chat
+# (covered in web/tests/e2e/refinement-outcome.spec.ts).
+
+
+def test_strict_diff_flags_whitespace_only_id_change():
+    """Raw comparison: an ID padded with whitespace is a real difference."""
+    before = sample_state()
+    after = before.model_copy(deep=True)
+    after.script.scenes[0].scene_id = f" {after.script.scenes[0].scene_id} "
+    paths = {c.path for c in refinement.diff_field_changes(before, after, strict=True)}
+    assert paths == {"script.scenes[0].scene_id"}
+    # The evidence diff still treats whitespace-only changes as no-ops.
+    assert refinement.diff_field_changes(before, after) == []
+
+
+def test_shorten_with_whitespace_padded_other_id_is_rejected():
+    before = sample_state()
+    target = refinement.locate_last_dialogue(before)
+    after = with_shortened(before)
+    after.script.scenes[0].scene_id = " sc_1 "  # out-of-bounds raw change
+    with pytest.raises(RefineConstraintFailed):
+        refinement.validate_shorten_result(before, after, target)
+
+
+def test_shorten_target_judgement_uses_stripped_text():
+    """Only the target dialogue's non-empty/different/shorter rules use the
+    stripped string; legitimate punctuation-preserving rewrites pass."""
+    before = sample_state()
+    target = refinement.locate_last_dialogue(before)
+    after = before.model_copy(deep=True)
+    # Same shortened text with harmless surrounding whitespace must pass.
+    after.script.scenes[1].blocks[1].content["dialogue"] = f"  {SHORT_LAST}  "
+    change = refinement.validate_shorten_result(before, after, target)
+    assert change.after.strip() == SHORT_LAST
+
+
+def _with_highlights(state: ProjectState) -> ProjectState:
+    out = state.model_copy(deep=True)
+    out.visual_highlights = [
+        VisualHighlight(title="亮点1", description="码头告别",
+                        related_shot_ids=["shot_1", "shot_2"]),
+    ]
+    return out
+
+
+def test_general_rebuilt_referenced_scene_id_is_rejected():
+    """Substantive dialogue edit + rebuilt scene_id: storyboard still points
+    at the old ID, so the export loses the scene→character link."""
+    before = _with_highlights(sample_state())
+    after = before.model_copy(deep=True)
+    after.script.scenes[0].scene_id = "sc_rebuilt"
+    after.script.scenes[0].blocks[1].content["dialogue"] = "灯，不能灭。"
+    with pytest.raises(RefineConstraintFailed) as exc:
+        refinement.validate_general_result(before, after, "scriptwriter")
+    assert "storyboard.shots[0].scene_id" in str(exc.value)
+
+
+def test_general_rebuilt_shot_id_breaking_highlights_is_rejected():
+    before = _with_highlights(sample_state())
+    after = before.model_copy(deep=True)
+    after.storyboard.shots[0].shot_id = "shot_rebuilt"
+    after.storyboard.shots[0].visual_description = "新的画面描述"
+    with pytest.raises(RefineConstraintFailed) as exc:
+        refinement.validate_general_result(before, after, "storyboard_artist")
+    assert "visual_highlights[0].related_shot_ids[0]" in str(exc.value)
+
+
+def test_general_rebuilt_scene_design_id_is_rejected():
+    before = sample_state()
+    before.scenes = [SceneDesign(id="sd_1", name="天台", environment="夜风中的天台")]
+    before.script.scenes[0].scene_design_id = "sd_1"
+    after = before.model_copy(deep=True)
+    after.scenes = [SceneDesign(id="sd_rebuilt", name="天台", environment="夜风中的天台，加了旗杆")]
+    with pytest.raises(RefineConstraintFailed) as exc:
+        refinement.validate_general_result(before, after, "scene_designer")
+    assert "script.scenes[0].scene_design_id" in str(exc.value)
+
+
+def test_general_duplicate_referenced_scene_id_is_rejected():
+    """Two scenes sharing one ID make the storyboard's reference ambiguous."""
+    before = _with_highlights(sample_state())
+    after = before.model_copy(deep=True)
+    after.script.scenes[1].scene_id = "sc_1"  # duplicate of scene 0; shots ref both
+    after.script.scenes[0].blocks[1].content["dialogue"] = "灯，不能灭。"
+    with pytest.raises(RefineConstraintFailed) as exc:
+        refinement.validate_general_result(before, after, "scriptwriter")
+    assert "ambiguous" in str(exc.value)
+
+
+def test_general_preexisting_dangling_ref_does_not_block_unrelated_edit():
+    before = _with_highlights(sample_state())
+    before.storyboard.shots[1].scene_id = "sc_missing"  # historical defect
+    after = before.model_copy(deep=True)
+    after.script.scenes[0].blocks[1].content["dialogue"] = "灯，不能灭。"
+    changes = refinement.validate_general_result(before, after, "scriptwriter")
+    assert any(c.path.endswith("dialogue") for c in changes)
+
+
+def test_general_intact_references_still_pass():
+    before = _with_highlights(sample_state())
+    after = before.model_copy(deep=True)
+    after.script.scenes[0].blocks[1].content["dialogue"] = "灯，不能灭。"
+    changes = refinement.validate_general_result(before, after, "scriptwriter")
+    assert len(changes) == 1
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        {"next_agent": "scriptwriter", "action": []},
+        {"next_agent": "scriptwriter", "action": {}},
+        {"next_agent": "scriptwriter", "action": 1},
+        {"next_agent": "scriptwriter", "action": None},
+        {"next_agent": "scriptwriter", "action": "execute_agent", "constraint": []},
+        {"next_agent": "scriptwriter", "action": "execute_agent", "constraint": {}},
+        {"next_agent": "scriptwriter", "action": "execute_agent", "constraint": 2},
+        {"next_agent": "scriptwriter", "action": "execute_agent", "constraint": None},
+    ],
+)
+def test_parse_routing_rejects_non_string_action_or_constraint(data):
+    """Type check before enum membership: unhashable values must not crash
+    into a 500 — they are ordinary unusable routing decisions."""
+    with pytest.raises(RefineNotExecutable):
+        refinement.parse_routing(_routing_payload(data))

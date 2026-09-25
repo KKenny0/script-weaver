@@ -158,6 +158,69 @@ test("revision conflict reloads latest content and asks to retry", async ({ page
   await expect(page.getByRole("button", { name: "分镜脚本" })).toBeEnabled();
 });
 
+test("late refresh failure after a project switch must not write A's summary into B", async ({
+  page,
+  request,
+}) => {
+  const a = await seedProject(request, "刷新失败回写A");
+  await seedExportableProject(a.project_id, "长提示词占位");
+  const b = await seedProject(request, "刷新失败保护B");
+  await seedSecondRevision(request, b.project_id, `${b.title}-r2`);
+  await seedOutline(b.project_id, "B的专属大纲内容");
+
+  await openApp(page, `/?project=${a.project_id}`);
+  await expect(page.getByText(new RegExp(`已打开项目「${a.title}`))).toBeVisible();
+  await gateRespond(page, "POST /refine", 200, REFINE_OK_BODY(a.project_id));
+
+  // Hold A's project reads at the network layer until the test releases
+  // them, so the refresh failure lands well after the switch to B.
+  let releaseGet!: () => void;
+  const getGate = new Promise<void>((resolve) => {
+    releaseGet = resolve;
+  });
+  await page.route(`**/api/projects/${a.project_id}`, async (route) => {
+    await getGate;
+    await route.fulfill({
+      status: 500,
+      contentType: "application/json",
+      body: JSON.stringify({ detail: { code: "internal_error", message: "模拟读取失败" } }),
+    });
+  });
+
+  await page.getByPlaceholder("输入修改指令，按 Enter 发送...").fill("对A的修改指令");
+  await page.locator("textarea ~ button").click();
+  await release(page, "POST /refine"); // refine saved; A's reload now hangs
+
+  // While A's refresh is pending, switch to B and start a new draft there.
+  await page.getByRole("button", { name: new RegExp(`^${b.title}`) }).click();
+  await expect(page).toHaveURL(new RegExp(`project=${b.project_id}`));
+  await expect(page.getByText("B的专属大纲内容")).toBeVisible();
+  await page.getByPlaceholder("输入修改指令，按 Enter 发送...").fill("B的新草稿");
+
+  // Now A's late refresh failure lands — wait until the page has really
+  // processed it before asserting anything, so the test cannot pass early.
+  const failed = page.waitForResponse(
+    (r) => r.url().includes(`/api/projects/${a.project_id}`) && r.status() === 500,
+  );
+  releaseGet();
+  await failed;
+  await page.evaluate(
+    () =>
+      new Promise<void>((resolve) =>
+        requestAnimationFrame(() => setTimeout(() => requestAnimationFrame(() => resolve()), 0)),
+      ),
+  );
+
+  // A's saved-but-refresh-failed outcome must not appear in B's chat, and
+  // B's own notice, content and draft must survive untouched.
+  await expect(page.getByText("修改已保存", { exact: false })).toHaveCount(0);
+  await expect(page.getByText("正在应用修改...")).toHaveCount(0);
+  await expect(page.getByText(new RegExp(`已打开项目「${b.title}-r2`))).toBeVisible();
+  await expect(page.getByText("B的专属大纲内容")).toBeVisible();
+  await expect(page.getByPlaceholder("输入修改指令，按 Enter 发送...")).toHaveValue("B的新草稿");
+  await expect(page).toHaveURL(new RegExp(`project=${b.project_id}`));
+});
+
 test("late refused response after a project switch writes nothing", async ({ page, request }) => {
   const a = await seedProject(request, "修改发起项目A");
   await seedExportableProject(a.project_id, "长提示词占位");

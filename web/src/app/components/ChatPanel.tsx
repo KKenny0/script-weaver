@@ -283,7 +283,6 @@ export default function ChatPanel({
       // the model was processing must survive.
       setInputValue((prev) => (prev === originalInput ? "" : prev));
 
-      const summary = formatChangeSummary(body);
       let reloaded = false;
       try {
         const fullState = await apiGet(`/projects/${projectId}`);
@@ -292,11 +291,19 @@ export default function ChatPanel({
         onProjectMutated();
         reloaded = true;
       } catch (fetchErr) {
-        // Saved, but the reload failed — say exactly that so the user does
-        // not resubmit a modification that already persisted.
+        // Saved, but the reload failed — the catch must NOT write anything
+        // itself; the shared exit guard below decides whether this instance
+        // still owns the chat.
         console.error("Failed to reload project:", fetchErr);
       }
+      // Common exit after the refresh settled, success or failure: the
+      // outcome message may only be written while this instance is still
+      // mounted AND the user has not moved to another project — otherwise a
+      // late refresh failure would splice A's summary into B's chat and
+      // delete B's latest message.
+      if (!mountedRef.current || !isProjectActive(projectId)) return;
 
+      const summary = formatChangeSummary(body);
       const outcome = summary
         ? `✅ 修改已保存。\n\n${summary}`
         : "修改请求已返回，但未检测到内容差异；未产生新版本。";

@@ -153,7 +153,7 @@ def parse_routing(result: Any) -> RoutingDecision:
         raise RefineNotExecutable("路由决策不是有效的 JSON 对象，修改未应用")
 
     action = data.get("action")
-    if action not in ROUTING_ACTIONS:
+    if not isinstance(action, str) or action not in ROUTING_ACTIONS:
         raise RefineNotExecutable(f"路由决策包含未知 action: {action!r}，修改未应用")
     if action != "execute_agent":
         note = str(data.get("message_to_user") or data.get("reason") or action)
@@ -164,7 +164,7 @@ def parse_routing(result: Any) -> RoutingDecision:
         raise RefineNotExecutable(f"路由目标不可用于修改: {next_agent!r}")
 
     constraint = data.get("constraint", "general")
-    if constraint not in ROUTING_CONSTRAINTS:
+    if not isinstance(constraint, str) or constraint not in ROUTING_CONSTRAINTS:
         raise RefineNotExecutable(f"路由决策包含未知 constraint: {constraint!r}")
     if constraint == "shorten_last_dialogue" and next_agent != "scriptwriter":
         raise RefineNotExecutable(
@@ -270,19 +270,22 @@ def _collect(
     after: Any,
     out: list[FieldChange],
     skips: tuple[tuple[Any, ...], ...],
+    normalize: bool = True,
 ) -> None:
     if _path_skipped(path, skips):
         return
-    b, a = _normalize(before), _normalize(after)
+    b = _normalize(before) if normalize else before
+    a = _normalize(after) if normalize else after
     if isinstance(b, dict) and isinstance(a, dict):
         for key in sorted(b.keys() | a.keys(), key=str):
-            _collect(path + (key,), b.get(key, _MISSING), a.get(key, _MISSING), out, skips)
+            _collect(path + (key,), b.get(key, _MISSING), a.get(key, _MISSING),
+                     out, skips, normalize)
         return
     if isinstance(b, list) and isinstance(a, list):
         for index in range(max(len(b), len(a))):
             bv = b[index] if index < len(b) else _MISSING
             av = a[index] if index < len(a) else _MISSING
-            _collect(path + (index,), bv, av, out, skips)
+            _collect(path + (index,), bv, av, out, skips, normalize)
         return
     if type(b) is not type(a) or b != a:
         out.append(FieldChange(path=_format_path(path), before=b, after=a))
@@ -293,17 +296,20 @@ def diff_field_changes(
 ) -> list[FieldChange]:
     """Field-level diff over the creative artifacts of two snapshots.
 
-    ``strict=True`` compares raw fields with no exclusions — used by the
-    shorten_last_dialogue check, where any out-of-bounds change must fail
-    the whole result. The default excludes auto-regenerated IDs, references
-    and notes fields, which alone are never a substantive modification.
+    ``strict=True`` compares raw field values with no exclusions and no
+    string normalization — used by the shorten_last_dialogue check, where
+    even a whitespace-padded ID is an out-of-bounds change that must fail
+    the whole result. The default (evidence) mode strips surrounding
+    whitespace and excludes auto-regenerated IDs, references and notes
+    fields, which alone are never a substantive modification.
     """
     skips = () if strict else _EVIDENCE_EXCLUDED_PATHS
+    normalize = not strict
     changes: list[FieldChange] = []
     for field in CREATIVE_ARTIFACTS:
         _collect(
             (field,), _dump(getattr(before, field)), _dump(getattr(after, field)),
-            changes, skips,
+            changes, skips, normalize,
         )
     return changes
 
@@ -326,7 +332,88 @@ def validate_general_result(
         raise RefineNoMeaningfulChange(
             f"模型未对 {artifact} 产生实质修改（仅备注、自动 ID 或元数据变化不算修改），修改未应用",
         )
+    validate_reference_integrity(before, after)
     return changes
+
+
+# Relations confirmed from the models and their consumers: the VideoGen
+# export resolves a shot's scene via scene_id to attach character context,
+# script scenes may point at a scene design, and visual highlights point at
+# storyboard shots. IDs and references are exact strings — a whitespace-
+# padded or rebuilt ID is a different key and breaks the lookup.
+
+
+def _duplicates(values: list[str]) -> set[str]:
+    seen: set[str] = set()
+    duplicated: set[str] = set()
+    for value in values:
+        if value in seen:
+            duplicated.add(value)
+        seen.add(value)
+    return duplicated
+
+
+def _reference_violations(state: ProjectState) -> set[tuple[str, str]]:
+    """(reference path, kind) pairs for dangling or ambiguous references.
+
+    Empty optional references mean "unlinked" per the existing model
+    semantics and are skipped; duplicate keys make references to them
+    ambiguous.
+    """
+    violations: set[tuple[str, str]] = set()
+
+    scene_ids = [s.scene_id for s in state.script.scenes] if state.script else []
+    scene_id_dups = _duplicates(scene_ids)
+    if state.storyboard:
+        for index, shot in enumerate(state.storyboard.shots):
+            if not shot.scene_id:
+                continue
+            path = f"storyboard.shots[{index}].scene_id"
+            if shot.scene_id in scene_id_dups:
+                violations.add((path, "ambiguous"))
+            elif shot.scene_id not in set(scene_ids):
+                violations.add((path, "dangling"))
+
+    design_ids = [s.id for s in (state.scenes or [])]
+    design_dups = _duplicates(design_ids)
+    if state.script:
+        for index, scene in enumerate(state.script.scenes):
+            if not scene.scene_design_id:
+                continue
+            path = f"script.scenes[{index}].scene_design_id"
+            if scene.scene_design_id in design_dups:
+                violations.add((path, "ambiguous"))
+            elif scene.scene_design_id not in set(design_ids):
+                violations.add((path, "dangling"))
+
+    shot_ids = [s.shot_id for s in state.storyboard.shots] if state.storyboard else []
+    shot_dups = _duplicates(shot_ids)
+    for index, highlight in enumerate(state.visual_highlights or []):
+        for ref_index, ref in enumerate(highlight.related_shot_ids):
+            if not ref:
+                continue
+            path = f"visual_highlights[{index}].related_shot_ids[{ref_index}]"
+            if ref in shot_dups:
+                violations.add((path, "ambiguous"))
+            elif ref not in set(shot_ids):
+                violations.add((path, "dangling"))
+
+    return violations
+
+
+def validate_reference_integrity(before: ProjectState, after: ProjectState) -> None:
+    """Reject references this modification newly breaks.
+
+    Pre-existing defects (already present in the before snapshot) do not
+    block unrelated edits — only violations the modification introduces
+    fail the request. The check is independent of the evidence diff's
+    ID/reference exclusions, IDs are never rewritten or guessed on the
+    model's behalf, and no downstream artifact is dropped to "fix" a link.
+    """
+    new_violations = _reference_violations(after) - _reference_violations(before)
+    if new_violations:
+        shown = ", ".join(f"{path}({kind})" for path, kind in sorted(new_violations)[:5])
+        raise RefineConstraintFailed(f"修改破坏了引用完整性: {shown}，修改未应用")
 
 
 def validate_shorten_result(
@@ -334,10 +421,12 @@ def validate_shorten_result(
 ) -> FieldChange:
     """Deterministic check for the constrained shorten-last-dialogue edit.
 
-    Everything is compared raw: the only permitted difference is the target
-    dialogue itself, which must stay non-empty, change, and strictly shrink
-    in character count. Any out-of-bounds change fails the whole result —
-    partial adoption from an over-reaching rewrite is forbidden.
+    Everything except the target dialogue is compared raw — the only
+    permitted difference is the target field itself. The target's rules
+    (non-empty, different, strictly fewer characters) are judged on the
+    stripped string, mirroring how the target was located. Any out-of-
+    bounds change fails the whole result — partial adoption from an
+    over-reaching rewrite is forbidden.
     """
     allowed = (
         f"script.scenes[{target.scene_index}].blocks[{target.block_index}]"
@@ -351,8 +440,10 @@ def validate_shorten_result(
     target_change = next((c for c in raw_changes if c.path == allowed), None)
     if target_change is None:
         raise RefineConstraintFailed("最后一句对白未被修改，修改未应用")
-    new_text = target_change.after
-    if not isinstance(new_text, str) or not new_text.strip():
+    if not isinstance(target_change.after, str):
+        raise RefineConstraintFailed("修改后的对白不是文本，修改未应用")
+    new_text = target_change.after.strip()
+    if not new_text:
         raise RefineConstraintFailed("修改后的对白为空，修改未应用")
     if new_text == target.original:
         raise RefineConstraintFailed("修改后的对白与原文相同，修改未应用")
