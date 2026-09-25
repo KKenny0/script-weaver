@@ -10,10 +10,11 @@ import asyncio
 import json
 import logging
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Any
 
+from anyio import CancelScope
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -244,12 +245,19 @@ async def generate(project_id: str) -> StreamingResponse:
             yield _sse_event("done", {"project_id": project_id})
 
         except Exception as e:
-            if not task.done():
-                task.cancel()
             proj["status"] = "error"
             logger.error(f"Pipeline error: {e}", exc_info=True)
             yield _sse_event("error", {"message": str(e)})
             yield _sse_event("done", {"project_id": project_id, "error": str(e)})
+        finally:
+            if not task.done():
+                task.cancel()
+            # Always retrieve the result/exception, including disconnect cancellation.
+            with CancelScope(shield=True):
+                with suppress(asyncio.CancelledError, Exception):
+                    await task
+            if proj["status"] == "running":
+                proj["status"] = "error"
 
     return EventSourceResponse(event_generator())
 

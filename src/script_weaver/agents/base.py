@@ -16,6 +16,8 @@ import json
 import logging
 from typing import Any
 
+from pydantic import TypeAdapter
+
 from script_weaver.core.config import get_settings
 from script_weaver.core.types import (
     DecisionRecord,
@@ -62,6 +64,24 @@ class BaseAgent:
 
         # Combine built-in tools with any extra tools
         self._tool_schemas = get_builtin_tool_schemas() + (extra_tools or [])
+        for tool in self._tool_schemas:
+            if tool["name"] in ("read_state", "read_artifact", "write_artifact"):
+                parameters = tool["parameters"]
+                parameters["properties"].pop("project_state_json", None)
+                parameters["required"] = [
+                    name for name in parameters["required"] if name != "project_state_json"
+                ]
+            if tool["name"] == "write_artifact" and self.output_artifact_type:
+                properties = tool["parameters"]["properties"]
+                properties["artifact_type"]["enum"] = [self.output_artifact_type]
+                field = ProjectState.model_fields.get(self.output_artifact_type)
+                # refined_idea has a richer generation shape than its stored string.
+                if field is not None and self.output_artifact_type != "refined_idea":
+                    schema = TypeAdapter(field.annotation).json_schema()
+                    properties["content"]["description"] = (
+                        "JSON string matching this schema; generated content must not be empty:\n"
+                        + json.dumps(schema, ensure_ascii=False)
+                    )
 
     async def execute(self, state: ProjectState, user_message: str = "") -> Any:
         """Main entry point: run the agent loop to produce an artifact.
@@ -80,7 +100,7 @@ class BaseAgent:
         # Build initial messages
         messages = [
             {"role": "system", "content": self._build_system_prompt(state)},
-            {"role": "user", "content": self._build_user_prompt(state, user_message)},
+            {"role": "user", "content": self._build_constrained_user_prompt(state, user_message)},
         ]
 
         # Run the agent loop
@@ -93,6 +113,19 @@ class BaseAgent:
         """Build the full system prompt. Override in subclasses for skill injection."""
         return self.system_prompt
 
+    def _build_constrained_user_prompt(self, state: ProjectState, user_message: str) -> str:
+        prompt = self._build_user_prompt(state, user_message)
+        if not state.user_input:
+            return prompt
+        return (
+            f"=== 原始创作要求 ===\n{state.user_input}\n"
+            "原始创作要求优先于下游扩写资料、示例和默认创作模板；"
+            "保留明确指定的总时长、人物数量、地点数量、文字及其呈现载体。"
+            "总时长不是故事中的倒计时；不要因节拍或灯光状态变化新增地点。"
+            "若已有资料与原始要求冲突，应收敛到原始要求。\n\n"
+            + prompt
+        )
+
     def _build_user_prompt(self, state: ProjectState, user_message: str) -> str:
         """Build the initial user message. Override in subclasses."""
         if user_message:
@@ -101,13 +134,13 @@ class BaseAgent:
 
     async def _agent_loop(
         self,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         state_json: str,
     ) -> dict[str, Any]:
         """Core agent loop: LLM call → tool execution → repeat until done."""
         iteration = 0
         last_content = ""
-        last_artifact: dict[str, Any] | list[Any] | None = None
+        last_error = "No artifact was submitted"
 
         while iteration < self._max_iterations:
             iteration += 1
@@ -119,17 +152,31 @@ class BaseAgent:
                     tools=self._tool_schemas if self._tool_schemas else None,
                 )
             except Exception as e:
-                logger.error(f"[{self.name}] LLM call failed: {e}")
-                return {"error": f"LLM call failed: {e}", "raw_response": last_content}
+                detail = f"{type(e).__name__}: {e}"
+                logger.error(f"[{self.name}] LLM call failed: {detail}")
+                return {"error": f"LLM call failed: {detail}", "raw_response": last_content,
+                        "last_error": last_error}
+
+            logger.debug(
+                "[%s] iteration=%s stop_reason=%s tools=%s",
+                self.name, iteration, response.stop_reason,
+                [call.name for call in response.tool_calls],
+            )
+            if response.stop_reason == "max_tokens":
+                last_error = (
+                    "max_tokens: output was truncated "
+                    f"(completion_tokens={response.usage.completion_tokens}); "
+                    "reduce the generation scope or explicitly increase SCRIPTWEAVER_LLM_MAX_TOKENS"
+                )
+                return {"error": "output_token_limit", "last_error": last_error}
 
             # Build assistant message from response
             assistant_msg: dict[str, Any] = {}
             if response.content:
                 last_content = response.content
             if response.tool_calls:
-                # OpenAI tool-call format: content must be null, and each call
-                # needs the type/function wrapper with arguments as a JSON string.
-                assistant_msg["content"] = None
+                # Providers adapt this shared OpenAI-format history as needed.
+                assistant_msg["content"] = response.content
                 assistant_msg["tool_calls"] = [
                     {
                         "id": tc.id,
@@ -156,42 +203,26 @@ class BaseAgent:
                     logger.debug(
                         f"[{self.name}] Tool call: {tool_call.name}({tool_call.arguments})"
                     )
-                    # Capture write_artifact payload so it can be integrated into state
+                    result = await self._execute_tool(
+                        tool_name=tool_call.name, arguments=tool_call.arguments,
+                        state_json=state_json,
+                    )
                     if tool_call.name == "write_artifact":
-                        args = tool_call.arguments
-                        if isinstance(args, str):
-                            try:
-                                args = json.loads(args)
-                            except json.JSONDecodeError:
-                                args = {}
-                        if isinstance(args, dict):
-                            content = args.get("content")
-                            parsed: dict[str, Any] | list[Any] | None = None
-                            if isinstance(content, str):
-                                try:
-                                    parsed = json.loads(content)
-                                except json.JSONDecodeError:
-                                    parsed = None
-                            elif isinstance(content, (dict, list)):
-                                parsed = content
-                            if parsed is not None:
-                                # Artifact written — return immediately. The LLM
-                                # often keeps calling read_state/request_review
-                                # after writing and never emits a final text, which
-                                # previously made the loop spin to max iterations.
-                                logger.info(
-                                    f"[{self.name}] Artifact captured via write_artifact "
-                                    f"on iteration {iteration}."
-                                )
-                                return {
-                                    "status": "success",
-                                    "data": parsed,
-                                    "raw": (
-                                        content if isinstance(content, str)
-                                        else json.dumps(content, ensure_ascii=False)
-                                    ),
-                                }
-                    result = await self._execute_tool(tool_name=tool_call.name, arguments=tool_call.arguments)
+                        try:
+                            written = json.loads(result)
+                            if written.get("status") == "success":
+                                if written["artifact_type"] != self.output_artifact_type:
+                                    raise ValueError(
+                                        f"Expected artifact_type {self.output_artifact_type}"
+                                    )
+                                self._validate_artifact(written["data"])
+                                return {"status": "success", "data": written["data"], "raw": result}
+                        except json.JSONDecodeError:
+                            pass  # Keep the tool's plain-text validation error for the model.
+                        except (ValueError, TypeError, KeyError) as e:
+                            result = json.dumps({"error": str(e)})
+                        last_error = result
+                        logger.debug("[%s] Artifact rejected: %s", self.name, last_error)
                     messages.append({
                         "role": "tool",
                         "tool_call_id": tool_call.id,
@@ -201,22 +232,60 @@ class BaseAgent:
             else:
                 # No tool calls — agent has finished its reasoning
                 # Try to extract structured output from the content
-                parsed = self._parse_final_output(response.content, state_json)
-                if last_artifact is not None and parsed.get("status") != "success":
-                    parsed = {
-                        "status": "success",
-                        "data": last_artifact,
-                        "raw": response.content,
-                    }
-                return parsed
+                try:
+                    parsed = self._parse_final_output(response.content, state_json)
+                    if parsed.get("status") != "success":
+                        messages.append({
+                            "role": "user",
+                            "content": "Return a JSON artifact or call write_artifact. "
+                                       f"Last failure: {last_error}",
+                        })
+                        continue
+                    self._validate_artifact(parsed["data"])
+                    return parsed
+                except (ValueError, TypeError) as e:
+                    last_error = str(e)
+                    logger.debug("[%s] Artifact rejected: %s", self.name, last_error)
+                    messages.append({
+                        "role": "user", "content": f"Invalid artifact: {e}. Please correct it.",
+                    })
 
         # Exceeded max iterations — force return whatever we have
         logger.warning(f"[{self.name}] Max iterations ({self._max_iterations}) reached.")
-        if last_artifact is not None:
-            return {"status": "success", "data": last_artifact, "raw": last_content}
-        return {"error": "max_iterations_exceeded", "raw_response": last_content}
+        return {"error": "max_iterations_exceeded", "raw_response": last_content,
+                "last_error": last_error}
 
-    async def _execute_tool(self, tool_name: str, arguments: dict[str, Any] | str) -> str:
+    def _validate_artifact(self, data: Any) -> None:
+        """Validate generated output without weakening the saved project schema."""
+        kind = self.output_artifact_type
+        if kind == "refined_idea":
+            if not isinstance(data, dict):
+                raise ValueError("refined_idea must be an object")
+            for key in ("logline", "title", "core_theme"):
+                if key in data and not isinstance(data[key], str):
+                    raise ValueError(f"{key} must be text")
+            if not (data.get("logline", "").strip() or data.get("core_theme", "").strip()):
+                raise ValueError("refined_idea needs a logline or core_theme")
+            return
+        if kind in ("characters", "scenes") and isinstance(data, dict):
+            data = [data]
+        if kind not in ProjectState.model_fields:
+            raise ValueError(f"Unsupported artifact type: {kind}")
+        artifact = getattr(ProjectState.model_validate({kind: data}), kind)
+        if artifact is None:
+            raise ValueError(f"{kind} must not be null")
+        required_content = {
+            "outline": "plot_outline", "script": "scenes",
+            "storyboard": "shots", "art_style": "overall_style",
+        }
+        content = getattr(artifact, required_content[kind]) if kind in required_content else artifact
+        if not content:
+            raise ValueError(f"{kind} must not be empty")
+
+    async def _execute_tool(
+        self, tool_name: str, arguments: dict[str, Any] | str,
+        *, state_json: str | None = None,
+    ) -> str:
         """Execute a single tool call with error handling."""
         # Arguments might be a JSON string (Anthropic format) or already a dict
         if isinstance(arguments, str):
@@ -224,6 +293,10 @@ class BaseAgent:
                 arguments = json.loads(arguments)
             except json.JSONDecodeError:
                 arguments = {"raw_input": arguments}
+
+        if (state_json is not None and isinstance(arguments, dict)
+                and tool_name in ("read_state", "read_artifact", "write_artifact")):
+            arguments = {**arguments, "project_state_json": state_json}
 
         try:
             return await execute_tool_call(tool_name, arguments)
@@ -304,7 +377,7 @@ class SimpleAgent(BaseAgent):
 
         messages = [
             {"role": "system", "content": self._build_system_prompt(state)},
-            {"role": "user", "content": self._build_user_prompt(state, user_message)},
+            {"role": "user", "content": self._build_constrained_user_prompt(state, user_message)},
         ]
 
         try:
@@ -312,5 +385,6 @@ class SimpleAgent(BaseAgent):
             parsed = self._parse_final_output(response.content, state.model_dump_json())
             return parsed
         except Exception as e:
-            logger.error(f"[{self.name}] Execution error: {e}")
-            return {"error": str(e)}
+            detail = f"{type(e).__name__}: {e}"
+            logger.error(f"[{self.name}] Execution error: {detail}")
+            return {"error": detail}

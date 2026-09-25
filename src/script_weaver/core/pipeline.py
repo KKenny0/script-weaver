@@ -44,30 +44,6 @@ logger = logging.getLogger(__name__)
 AsyncFunc = Callable[..., Coroutine[Any, Any, Any]]
 
 
-def _coerce_llm_types(data: Any) -> Any:
-    """Recursively coerce LLM output: pure-numeric strings → int/float.
-
-    LLMs frequently emit numbers as strings (e.g. "1" instead of 1), which
-    fails strict Pydantic validation and discards an entire artifact. This
-    normalizes the common cases so one type mismatch doesn't lose everything.
-    """
-    if isinstance(data, dict):
-        return {k: _coerce_llm_types(v) for k, v in data.items()}
-    if isinstance(data, list):
-        return [_coerce_llm_types(v) for v in data]
-    if isinstance(data, str):
-        s = data.strip()
-        if s:
-            try:
-                return int(s)
-            except ValueError:
-                try:
-                    return float(s)
-                except ValueError:
-                    return data
-    return data
-
-
 class HumanGateResult:
     """Result of a human-in-the-loop gate."""
 
@@ -141,51 +117,27 @@ class PipelineEngine:
 
             elapsed = time.time() - start
 
-            # Integrate result into state
-            if isinstance(result, dict):
-                status = result.get("status", "")
-                data = result.get("data", result)
-
-                if status == "success" and isinstance(data, (dict, list)):
-                    await self._integrate_artifact(state, agent_name, data)
-                elif status == "text_response":
-                    # Agent returned text directly — try to parse as artifact
-                    text_data = data.get("text", "")
-                    self._notify(
-                        agent_name,
-                        f"Completed in {elapsed:.1f}s (text response)",
-                    )
-                    return result
-                else:
-                    self._notify(
-                        agent_name,
-                        f"Completed in {elapsed:.1f}s (status: {status})",
-                    )
-            else:
-                self._notify(
-                    agent_name,
-                    f"Completed in {elapsed:.1f}s (raw result)",
-                )
-
-            return result if isinstance(result, dict) else {"data": result}
+            if not isinstance(result, dict) or result.get("status") != "success":
+                raise ValueError(f"Agent did not produce a valid artifact: {result}")
+            await self._integrate_artifact(state, agent_name, result["data"])
+            self._notify(agent_name, f"Completed in {elapsed:.1f}s")
+            return result
 
         except Exception as e:
             logger.error(f"[{agent_name}] Failed: {e}", exc_info=True)
             self._notify(agent_name, f"FAILED: {e}")
-            return {"error": str(e)}
+            raise RuntimeError(f"{agent_name} failed: {e}") from e
 
     async def _integrate_artifact(
         self,
         state: ProjectState,
         agent_name: str,
-        data: dict[str, Any],
+        data: dict[str, Any] | list[Any],
     ) -> None:
         """Parse agent output and update project state."""
         from script_weaver.core.types import (  # Local import to avoid circular
             ArtStyle, Character, Outline, Script, SceneDesign, Storyboard,
         )
-
-        data = _coerce_llm_types(data)
 
         try:
             if agent_name == "idea_refiner":
@@ -231,7 +183,7 @@ class PipelineEngine:
 
             state.touch()
         except Exception as e:
-            logger.warning(f"Failed to integrate artifact from {agent_name}: {e}")
+            raise ValueError(f"Failed to integrate artifact from {agent_name}: {e}") from e
 
     # ── Main Pipeline Methods ───────────────────────────
 

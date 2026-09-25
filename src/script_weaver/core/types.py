@@ -20,24 +20,24 @@ class _LenientStrEnum:
     LLMs frequently emit near-miss enum values — synonyms ("extreme_wide_shot"
     instead of "extreme_long_shot") or Chinese labels ("特写" instead of
     "close_up"). Instead of failing validation and discarding the whole
-    artifact, coerce known synonyms and fall back to a sensible default member.
+    artifact, coerce known synonyms and reject unknown values instead of changing their meaning.
     """
 
     __synonyms__: dict[str, str] = {}
-    __default_value__: str | None = None
 
     @classmethod
     def _missing_(cls, value):
         if isinstance(value, str):
             norm = value.strip().lower().replace("-", "_").replace(" ", "_")
+            for member in cls:
+                if member.value.lower().replace("-", "_").replace(" ", "_") == norm:
+                    return member
             for key, target in cls.__synonyms__.items():
                 if key.lower().replace("-", "_").replace(" ", "_") == norm:
                     try:
                         return cls(target)
                     except ValueError:
                         continue
-        if cls.__default_value__ is not None:
-            return cls(cls.__default_value__)
         return None
 
 
@@ -106,7 +106,6 @@ class ShotSize(_LenientStrEnum, str, Enum):
         "中近景": "medium_close_up", "近景": "medium_close_up",
         "特写": "close_up", "大特写": "extreme_close_up",
     }
-    __default_value__ = "medium_shot"
 
 
 class CameraMovement(_LenientStrEnum, str, Enum):
@@ -140,7 +139,6 @@ class CameraMovement(_LenientStrEnum, str, Enum):
         "手持": "handheld", "斯坦尼康": "steadicam", "航拍": "aerial",
         "变焦推": "zoom_in", "变焦拉": "zoom_out", "zoom": "zoom_in",
     }
-    __default_value__ = "static"
 
 
 class CameraAngle(_LenientStrEnum, str, Enum):
@@ -163,7 +161,6 @@ class CameraAngle(_LenientStrEnum, str, Enum):
         "pov": "point_of_view", "主观": "point_of_view",
         "双人": "two_shot",
     }
-    __default_value__ = "eye_level"
 
 
 class SceneLocationType(_LenientStrEnum, str, Enum):
@@ -176,7 +173,6 @@ class SceneLocationType(_LenientStrEnum, str, Enum):
         "外景": "EXT.", "ext": "EXT.", "室外": "EXT.",
         "内外景": "INT./EXT.", "int/ext": "INT./EXT.",
     }
-    __default_value__ = "INT."
 
 
 class TransitionType(_LenientStrEnum, str, Enum):
@@ -197,7 +193,6 @@ class TransitionType(_LenientStrEnum, str, Enum):
         "叠化": "dissolve", "溶解": "dissolve", "交叉溶解": "cross_dissolve",
         "跳切": "jump_cut", "匹配剪辑": "match_cut", "划像": "wipe",
     }
-    __default_value__ = "cut"
 
 
 class CharacterRole(_LenientStrEnum, str, Enum):
@@ -210,7 +205,6 @@ class CharacterRole(_LenientStrEnum, str, Enum):
         "主角": "protagonist", "反派": "antagonist",
         "配角": "supporting", "龙套": "extra", "群众": "extra",
     }
-    __default_value__ = "supporting"
 
 
 class EnvironmentType(_LenientStrEnum, str, Enum):
@@ -225,7 +219,6 @@ class EnvironmentType(_LenientStrEnum, str, Enum):
         "内外景": "mixed", "混合": "mixed", "int/ext": "mixed",
         "interior/exterior": "mixed",
     }
-    __default_value__ = "interior"
 
 
 class ScriptBlockType(_LenientStrEnum, str, Enum):
@@ -241,7 +234,6 @@ class ScriptBlockType(_LenientStrEnum, str, Enum):
         "对白": "dialogue", "对话": "dialogue", "dialogue_block": "dialogue",
         "转场": "transition", "transition_block": "transition",
     }
-    __default_value__ = "action"
 
 
 class AspectRatio(_LenientStrEnum, str, Enum):
@@ -257,7 +249,6 @@ class AspectRatio(_LenientStrEnum, str, Enum):
         "方形": "1:1", "1比1": "1:1",
         "宽银幕": "21:9", "21比9": "21:9",
     }
-    __default_value__ = "16:9"
 
 
 class UserAction(str, Enum):
@@ -316,7 +307,7 @@ class BasicInfo(BaseModel):
     theme: str = ""                                # Core theme
     tone: str = ""                                 # e.g., "虐心", "热血"
     target_audience: str | None = None
-    episode_count: int | str = 1
+    episode_count: int = 1
     estimated_total_duration: str = ""             # e.g., "约30分钟"
 
 
