@@ -5,12 +5,14 @@ controlled fakes so no network or model calls happen.
 """
 
 import asyncio
+import io
 import json
 import os
 import socket
 import subprocess
 import sys
 import time
+import zipfile
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -23,7 +25,10 @@ from script_weaver.core.types import (
     ProjectState,
     ProjectStatus,
     Script,
+    ScriptBlock,
+    ScriptBlockType,
     ScriptScene,
+    ScriptSceneHeading,
     Shot,
     Storyboard,
 )
@@ -239,8 +244,9 @@ async def test_generate_persists_result_and_survives_restart(api_factory):
             assert reopened["outline"]["basic_info"]["logline"] == "生成的大纲"
             assert reopened["revision"] == 2
 
-            exported = (await c2.get(f"/api/projects/{p['project_id']}/export/json")).json()
-            assert json.loads(exported["content"])["meta"]["id"] == p["project_id"]
+            export_res = await c2.get(f"/api/projects/{p['project_id']}/export/json")
+            assert export_res.status_code == 200
+            assert json.loads(export_res.text)["meta"]["id"] == p["project_id"]
 
 
 async def test_generate_rejects_concurrent_edit_without_overwrite(client):
@@ -324,40 +330,217 @@ async def test_refine_persists_via_store(client):
     assert after["meta"]["id"] == p["project_id"]
 
 
-# ── Export uses persisted state ────────────────────────────
+# ── Export serves real, tool-readable files ────────────────
 
 
-async def test_export_formats_use_persisted_state(client):
-    api, c = client
-    p = await create_project(c, "可导出的故事", "导出测试")
+# >200 chars so the CSV summary rule (truncate to 200 + "...") is exercised
+# while JSON and per-shot TXT must keep the full text.
+LONG_PROMPT = "夜色中的灯塔守望者" + "，海风呼啸而过" * 30
 
-    state = outlined_state("可导出的故事", "导出用大纲")
-    state.script = Script(title="t", scenes=[ScriptScene()], total_estimated_duration=10)
-    state.storyboard = Storyboard(shots=[Shot(visual_description="x", duration_seconds=2)])
+
+def exportable_state(logline: str) -> ProjectState:
+    """A persisted-ready state with Chinese script + 2-shot storyboard."""
+    state = outlined_state("可导出的故事", logline)
+    state.script = Script(
+        title="夜行灯塔",
+        scenes=[
+            ScriptScene(
+                heading=ScriptSceneHeading(location="灯塔顶层", time_of_day="夜"),
+                blocks=[
+                    ScriptBlock(
+                        block_type=ScriptBlockType.ACTION,
+                        content={"description": "阿芸推开锈蚀的铁门，寒风灌入。"},
+                    ),
+                    ScriptBlock(
+                        block_type=ScriptBlockType.DIALOGUE,
+                        content={"character_name": "阿芸", "dialogue": "灯不能灭。"},
+                    ),
+                ],
+                characters_involved=["阿芸"],
+            ),
+        ],
+        total_estimated_duration=10,
+    )
+    state.storyboard = Storyboard(shots=[
+        Shot(
+            shot_id="shot_lighthouse_01", scene_id="sc_1",
+            visual_description="灯塔外景，巨浪拍岸",
+            image_prompt=LONG_PROMPT, video_prompt=LONG_PROMPT,
+            dialogue="灯不能灭。", duration_seconds=2,
+        ),
+        Shot(
+            shot_id="shot_lighthouse_02", scene_id="sc_1",
+            visual_description="阿芸特写，眼神坚定",
+            image_prompt="近景：阿芸握紧灯芯", video_prompt="镜头缓缓推近",
+            duration_seconds=3,
+        ),
+    ])
     state.storyboard.compute_totals()
+    return state
 
+
+async def seed_exportable(client, api, logline="导出用大纲") -> dict:
+    """Create a project whose persisted state has script + storyboard."""
+    p = await create_project(client, "可导出的故事", "导出测试")
     record = api._runtime.store.get_required(p["project_id"])
     api._runtime.store.save_state(
-        p["project_id"], state, record.revision, source="manual", summary="可导出内容",
+        p["project_id"], exportable_state(logline), record.revision,
+        source="manual", summary="可导出内容",
     )
+    return p
+
+
+async def test_export_json_is_raw_project_state_file(client):
+    api, c = client
+    p = await seed_exportable(c, api)
 
     r = await c.get(f"/api/projects/{p['project_id']}/export/json")
-    assert r.status_code == 200
-    exported = json.loads(r.json()["content"])
-    assert exported["meta"]["id"] == p["project_id"]
+    assert r.status_code == 200, r.text
+    assert r.headers["content-type"].startswith("application/json")
+    assert r.headers["content-disposition"] == (
+        f'attachment; filename="{p["project_id"]}.json"'
+    )
+
+    # The body IS the ProjectState object: top-level meta/script, no
+    # {"content": ...} envelope, no second layer of string encoding.
+    body = r.text
+    parsed = json.loads(body)
+    assert set(parsed) >= {"meta", "user_input", "script", "storyboard"}
+    assert "content" not in parsed
+    assert parsed["meta"]["id"] == p["project_id"]
+    reparsed = ProjectState.model_validate_json(body)
+    assert reparsed.script.title == "夜行灯塔"
+    assert reparsed.storyboard.shots[0].dialogue == "灯不能灭。"
+
+
+async def test_export_fountain_is_plain_text_file(client):
+    api, c = client
+    p = await seed_exportable(c, api)
 
     r = await c.get(f"/api/projects/{p['project_id']}/export/fountain")
-    assert r.status_code == 200
-    assert "content" in r.json()
+    assert r.status_code == 200, r.text
+    assert r.headers["content-type"] == "text/plain; charset=utf-8"
+    assert r.headers["content-disposition"] == (
+        f'attachment; filename="{p["project_id"]}.fountain"'
+    )
+
+    text = r.text
+    assert not text.lstrip().startswith("{"), "fountain must not be JSON-wrapped"
+    assert "Title: 夜行灯塔" in text
+    assert "INT 灯塔顶层 - 夜" in text
+    assert "阿芸推开锈蚀的铁门" in text
+    assert "灯不能灭。" in text
+
+
+async def test_export_video_gen_is_real_zip(client):
+    api, c = client
+    p = await seed_exportable(c, api)
 
     r = await c.get(f"/api/projects/{p['project_id']}/export/video_gen")
-    assert r.status_code == 200
+    assert r.status_code == 200, r.text
+    assert r.headers["content-type"].startswith("application/zip")
+    assert r.headers["content-disposition"] == (
+        f'attachment; filename="{p["project_id"]}_video_gen.zip"'
+    )
 
-    # 400s and 404s keep their meaning.
+    payload = io.BytesIO(r.content)
+    assert zipfile.is_zipfile(payload), "video_gen download must be a real ZIP"
+    with zipfile.ZipFile(payload) as zf:
+        assert zf.testzip() is None, "ZIP members must decompress cleanly"
+        assert set(zf.namelist()) == {
+            "video_gen_shots.json", "video_gen_shots.csv",
+            "shots/shot_lighthouse_01.txt", "shots/shot_lighthouse_02.txt",
+        }
+
+        shots_json = json.loads(zf.read("video_gen_shots.json").decode("utf-8"))
+        assert [s["shot_id"] for s in shots_json] == [
+            "shot_lighthouse_01", "shot_lighthouse_02",
+        ]
+        assert shots_json[0]["dialogue_text"] == "灯不能灭。"
+
+        # Full long prompts survive in JSON and per-shot TXT; CSV keeps its
+        # 200-char summary rule ("..." suffix), i.e. it is NOT lossless.
+        assert shots_json[0]["image_prompt"] == LONG_PROMPT
+        txt = zf.read("shots/shot_lighthouse_01.txt").decode("utf-8")
+        assert LONG_PROMPT in txt
+        assert "Shot: shot_lighthouse_01" in txt
+        csv_text = zf.read("video_gen_shots.csv").decode("utf-8")
+        assert LONG_PROMPT[:200] + "..." in csv_text
+        assert LONG_PROMPT not in csv_text
+
+
+async def test_export_rejects_unsafe_shot_ids(client):
+    """Shot ids become filenames inside the ZIP; risky ones must be refused."""
+    api, c = client
+
+    bad_ids = ["../../evil", "a/b", "a\\b", "", ".."]
+    for bad in bad_ids:
+        p = await create_project(c, f"危险镜头 {bad!r}")
+        state = exportable_state("危险镜头")
+        state.storyboard.shots[0].shot_id = bad
+        record = api._runtime.store.get_required(p["project_id"])
+        api._runtime.store.save_state(
+            p["project_id"], state, record.revision, source="manual", summary="x",
+        )
+        r = await c.get(f"/api/projects/{p['project_id']}/export/video_gen")
+        assert r.status_code == 422, (bad, r.status_code, r.text)
+        assert "detail" in r.json()
+
+    # Duplicate ids would silently overwrite files inside the ZIP.
+    p = await create_project(c, "重复镜头")
+    state = exportable_state("重复")
+    state.storyboard.shots[1].shot_id = state.storyboard.shots[0].shot_id
+    record = api._runtime.store.get_required(p["project_id"])
+    api._runtime.store.save_state(
+        p["project_id"], state, record.revision, source="manual", summary="x",
+    )
+    r = await c.get(f"/api/projects/{p['project_id']}/export/video_gen")
+    assert r.status_code == 422, r.text
+    assert "detail" in r.json()
+
+
+async def test_export_error_semantics(client):
+    api, c = client
+    p = await seed_exportable(c, api)
     fresh = await create_project(c, "空项目")
-    assert (await c.get(f"/api/projects/{fresh['project_id']}/export/fountain")).status_code == 400
-    assert (await c.get("/api/projects/none/export/json")).status_code == 404
-    assert (await c.get(f"/api/projects/{p['project_id']}/export/nope")).status_code == 400
+
+    # Unknown project → 404 for every format.
+    for fmt in ("json", "fountain", "video_gen"):
+        r = await c.get(f"/api/projects/none/export/{fmt}")
+        assert r.status_code == 404, (fmt, r.status_code)
+        assert "detail" in r.json()
+
+    # Unknown format → 400.
+    r = await c.get(f"/api/projects/{p['project_id']}/export/nope")
+    assert r.status_code == 400
+    assert "detail" in r.json()
+
+    # Missing required artifacts → 400 with a reason, no fake file.
+    for fmt in ("fountain", "video_gen"):
+        r = await c.get(f"/api/projects/{fresh['project_id']}/export/{fmt}")
+        assert r.status_code == 400, (fmt, r.status_code)
+        assert "detail" in r.json()
+
+
+async def test_export_never_mutates_project_history(client):
+    api, c = client
+    p = await seed_exportable(c, api)
+
+    before = (await c.get(f"/api/projects/{p['project_id']}")).json()
+    versions_before = (
+        await c.get(f"/api/projects/{p['project_id']}/versions")
+    ).json()["versions"]
+
+    for fmt in ("json", "fountain", "video_gen"):
+        assert (await c.get(f"/api/projects/{p['project_id']}/export/{fmt}")).status_code == 200
+
+    after = (await c.get(f"/api/projects/{p['project_id']}")).json()
+    versions_after = (
+        await c.get(f"/api/projects/{p['project_id']}/versions")
+    ).json()["versions"]
+
+    assert after["revision"] == before["revision"]
+    assert versions_after == versions_before
 
 
 # ── Storage failure handling ───────────────────────────────

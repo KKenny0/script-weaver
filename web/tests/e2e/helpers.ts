@@ -296,3 +296,111 @@ store.close()
     );
   });
 }
+
+/** Write script + storyboard (Chinese, one >200-char prompt) via the store.
+ *
+ * Mirrors the API unit tests' exportable_state: two shots, the first carrying
+ * `longPrompt` as image/video prompt, dialogue "灯不能灭。". Export e2e tests
+ * read the very same strings back out of the downloaded files.
+ */
+export async function seedExportableProject(
+  projectId: string,
+  longPrompt: string,
+): Promise<void> {
+  const { execFile } = await import("node:child_process");
+  const script = `
+import sys
+from pathlib import Path
+from script_weaver.core.project_store import ProjectStore
+from script_weaver.core.types import (
+    Outline, BasicInfo, ProjectStatus, Script, ScriptScene, ScriptSceneHeading,
+    ScriptBlock, ScriptBlockType, Storyboard, Shot,
+)
+pid, long_prompt = sys.argv[1], sys.argv[2]
+store = ProjectStore(Path("/tmp/script-weaver-e2e-data/main-web/projects.sqlite3"))
+rec = store.get_required(pid)
+s = rec.state
+s.outline = Outline(basic_info=BasicInfo(logline="导出验收", genre="e2e"))
+s.refined_idea = "导出验收"
+s.meta.status = ProjectStatus.STRUCTURED
+s.script = Script(
+    title="夜行灯塔",
+    scenes=[ScriptScene(
+        heading=ScriptSceneHeading(location="灯塔顶层", time_of_day="夜"),
+        blocks=[
+            ScriptBlock(block_type=ScriptBlockType.ACTION,
+                        content={"description": "阿芸推开锈蚀的铁门。"}),
+            ScriptBlock(block_type=ScriptBlockType.DIALOGUE,
+                        content={"character_name": "阿芸", "dialogue": "灯不能灭。"}),
+        ],
+        characters_involved=["阿芸"],
+    )],
+    total_estimated_duration=10,
+)
+s.storyboard = Storyboard(shots=[
+    Shot(shot_id="shot_e2e_01", scene_id="sc_1",
+         visual_description="灯塔外景", image_prompt=long_prompt,
+         video_prompt=long_prompt, dialogue="灯不能灭。", duration_seconds=2),
+    Shot(shot_id="shot_e2e_02", scene_id="sc_1",
+         visual_description="阿芸特写", image_prompt="近景：阿芸",
+         video_prompt="镜头缓推", duration_seconds=3),
+])
+s.storyboard.compute_totals()
+store.save_state(pid, s, rec.revision, source="manual", summary="e2e export seed")
+store.close()
+`;
+  await new Promise<void>((resolve, reject) => {
+    execFile(
+      "../.venv/bin/python",
+      ["-c", script, projectId, longPrompt],
+      { cwd: process.cwd() },
+      (err, stdout) =>
+        err ? reject(new Error(`${err}\n${stdout}`)) : resolve(),
+    );
+  });
+}
+
+/** Inspect a downloaded ZIP with Python's zipfile and return the evidence:
+ * is_zipfile, testzip, member list, the parsed shots JSON, the CSV text and
+ * one per-shot TXT. Assertions stay in the spec; this only reads the file.
+ */
+export async function inspectZip(zipPath: string): Promise<{
+  isZip: boolean;
+  badMember: string | null;
+  members: string[];
+  shotsJson: Array<Record<string, unknown>>;
+  csvText: string;
+  firstShotTxt: string;
+}> {
+  const { execFile } = await import("node:child_process");
+  const script = `
+import io, json, sys, zipfile
+payload = open(sys.argv[1], "rb").read()
+info = {"is_zip": zipfile.is_zipfile(io.BytesIO(payload))}
+if info["is_zip"]:
+    with zipfile.ZipFile(io.BytesIO(payload)) as zf:
+        info["bad_member"] = zf.testzip()
+        info["members"] = sorted(zf.namelist())
+        info["shots_json"] = json.loads(zf.read("video_gen_shots.json").decode("utf-8"))
+        info["csv_text"] = zf.read("video_gen_shots.csv").decode("utf-8")
+        info["first_shot_txt"] = zf.read("shots/shot_e2e_01.txt").decode("utf-8")
+print(json.dumps(info, ensure_ascii=False))
+`;
+  const { stdout } = await new Promise<{ stdout: string }>((resolve, reject) => {
+    execFile(
+      "../.venv/bin/python",
+      ["-c", script, zipPath],
+      { cwd: process.cwd(), maxBuffer: 10 * 1024 * 1024 },
+      (err, stdout) => (err ? reject(err) : resolve({ stdout })),
+    );
+  });
+  const raw = JSON.parse(stdout);
+  return {
+    isZip: raw.is_zip,
+    badMember: raw.bad_member ?? null,
+    members: raw.members ?? [],
+    shotsJson: raw.shots_json ?? [],
+    csvText: raw.csv_text ?? "",
+    firstShotTxt: raw.first_shot_txt ?? "",
+  };
+}

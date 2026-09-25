@@ -216,6 +216,18 @@ Web UI 创建的项目保存在 SQLite 数据库中，刷新页面或重启后�
 
 ## 导出格式
 
+### Web 导出 API（`GET /api/projects/{id}/export/{format}`）
+
+三种格式都返回真实文件字节（`Content-Disposition: attachment`，文件名 = 项目 ID + 格式扩展名，与项目标题无关），供对应工具直接打开；全部内容来自该项目当前持久化快照的一次读取，导出本身不写库、不新增版本、不触发任何模型调用：
+
+| format | Content-Type | 内容 |
+| --- | --- | --- |
+| `json` | `application/json` | 原始 `ProjectState` 对象（顶层即 `meta`、`script` 等，UTF-8） |
+| `fountain` | `text/plain; charset=utf-8` | 实际 Fountain 文本 |
+| `video_gen` | `application/zip` | `ZIP_DEFLATED` 包：根目录 `video_gen_shots.json`、`video_gen_shots.csv`，以及 `shots/` 下逐镜头 `.txt` |
+
+注意：这是旧版导出响应形状的**有意变更** —— 外部调用方不应再读取旧的 `{"content": ...}` JSON 包装；CLI 的文件输出契约保持不变。错误语义：项目不存在返回 404，格式不支持或必需产物缺失返回 400，危险（含路径分隔符/父路径）或重复的 `shot_id` 返回 422，服务失败保持非 2xx。
+
 ### VideoGen 导出（核心差异化功能）
 
 每个 Shot 都会被导出为视频生成工具可用的格式：
@@ -236,6 +248,8 @@ output/video_gen/
 - **duration_seconds**: 时长
 - **transition_in/out**: 转场方式
 - **dialogue_text / voiceover_text**: 音频轨道信息
+
+> CSV 是表格工作流用的**摘要格式**：超过 200 字符的字段会截断加 `...`。完整提示词以 `video_gen_shots.json` 和 `shots/*.txt` 为准。
 
 ## 开发
 

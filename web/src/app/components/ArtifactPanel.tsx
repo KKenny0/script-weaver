@@ -22,12 +22,6 @@ const ARTIFACT_TABS = [
 
 const API = "/api";
 
-async function apiGet(path: string) {
-  const res = await fetch(`${API}${path}`);
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  return res.json();
-}
-
 interface ArtifactPanelProps {
   projectId: string;
   artifactData: ArtifactData;
@@ -66,12 +60,26 @@ export default function ArtifactPanel({
   const handleExport = async (format: string) => {
     if (!projectId) return;
     try {
-      const result = await apiGet(`/projects/${projectId}/export/${format}`);
-      const blob = new Blob([JSON.stringify(result, null, 2)], { type: "application/json" });
+      // The backend serves real files (JSON state / Fountain text / ZIP) with
+      // a Content-Disposition filename; the blob is saved as-is, never
+      // re-wrapped through JSON.stringify.
+      const res = await fetch(`${API}/projects/${projectId}/export/${format}`);
+      if (!res.ok) {
+        let message = `HTTP ${res.status}`;
+        try {
+          const body = await res.json();
+          if (body && typeof body.detail === "string") message = body.detail;
+        } catch { /* non-JSON error body: keep the status message */ }
+        throw new Error(message);
+      }
+      const blob = await res.blob();
+      const disposition = res.headers.get("Content-Disposition") ?? "";
+      const filename = /filename="?([^";]+)"?/.exec(disposition)?.[1]
+        ?? `${projectId}.${format === "video_gen" ? "zip" : format}`;
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
-      a.download = `${projectId}_${format}.${format === "fountain" ? "fountain" : format === "video_gen" ? "zip" : "json"}`;
+      a.download = filename;
       a.click();
       URL.revokeObjectURL(url);
     } catch (err: any) {
