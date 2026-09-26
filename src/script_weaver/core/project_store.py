@@ -31,6 +31,7 @@ from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
+from script_weaver.core.resume import update_checkpoint_envelope
 from script_weaver.core.types import ProjectState
 
 SCHEMA_VERSION = 2
@@ -176,14 +177,15 @@ else:
 class DataDirLock:
     """Exclusive OS-level lock on the web data directory.
 
-    Holds an open file description on ``api.lock`` for the process lifetime so
-    a second API instance on the same data directory refuses to start. The OS
-    releases the lock when the process exits, so a clean shutdown allows the
-    next instance to start.
+    Holds an open file description on the lock file for the process
+    lifetime so a second API instance on the same data directory refuses to
+    start. The OS releases the lock when the process exits, so a clean
+    shutdown allows the next instance to start. ``lock_name`` lets other
+    surfaces (the CLI's output directory) reuse the same capability.
     """
 
-    def __init__(self, directory: Path):
-        self._path = directory / "api.lock"
+    def __init__(self, directory: Path, *, lock_name: str = "api.lock"):
+        self._path = directory / lock_name
         self._fd: int | None = None
 
     def acquire(self) -> None:
@@ -288,7 +290,7 @@ def serialize_state(state: ProjectState) -> str:
     return state.model_dump_json(indent=2, ensure_ascii=False)
 
 
-def _content_signature(state_json: str) -> str:
+def content_signature(state_json: str) -> str:
     """Signature of a state ignoring fields a rename may legitimately touch.
 
     Renaming syncs ``meta.title`` and ``meta.updated_at`` inside the stored
@@ -569,9 +571,9 @@ class ProjectStore:
             ).fetchone()
             if row is None:
                 raise ProjectNotFoundError(f"Project '{project_id}' not found")
-            if row["revision"] != base_revision and _content_signature(
+            if row["revision"] != base_revision and content_signature(
                 row["state_json"]
-            ) != _content_signature(base_state_json):
+            ) != content_signature(base_state_json):
                 raise RevisionConflictError(
                     "项目内容在生成期间已被修改，生成结果未覆盖当前内容",
                     current_revision=row["revision"],
@@ -636,6 +638,7 @@ class ProjectStore:
         base_revision: int,
         base_state_json: str,
         checkpoint_json: str | None,
+        completed_steps: list[str] | None = None,
     ) -> GenerationRun:
         """Insert a run in ``running`` status; the caller then starts its task."""
         run_id = uuid.uuid4().hex[:12]
@@ -646,11 +649,13 @@ class ProjectStore:
                 " request_hash, status, base_revision, base_state_json,"
                 " request_json, completed_steps_json, checkpoint_json,"
                 " created_at, updated_at)"
-                " VALUES (?, ?, ?, ?, ?, 'running', ?, ?, ?, '[]', ?, ?, ?)",
+                " VALUES (?, ?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?)",
                 (
                     run_id, project_id, kind, request_key,
                     hash_run_request(request), base_revision, base_state_json,
-                    json.dumps(request, ensure_ascii=False), checkpoint_json,
+                    json.dumps(request, ensure_ascii=False),
+                    json.dumps(completed_steps or [], ensure_ascii=False),
+                    checkpoint_json,
                     now, now,
                 ),
             )
@@ -667,18 +672,23 @@ class ProjectStore:
         base_revision: int,
         base_state_json: str,
         checkpoint_json: str | None,
+        completed_steps: list[str] | None = None,
     ) -> tuple[GenerationRun, bool]:
         """Idempotently admit a run; lookup and insert share one transaction.
 
         The ``(project_id, request_key)`` lookup covers runs in **every**
         status, earliest record first — a key keeps pointing at its original
         request even when later runs (other keys) overshadow it, and input
-        equality is judged against the stored snapshot's hash, never by
-        re-interpreting the project's current content. Same key + same input
+        equality is judged against the stored snapshot's hash for fresh runs.
+        Resume requests instead use the immutable resume_of target: progress
+        and later configuration changes cannot invalidate an admitted intent.
+        Same key + same input
         returns the original run (``created=False``); same key + different
         input raises :class:`RequestKeyConflictError`; another active run
         raises :class:`ActiveRunConflictError`; otherwise the row is created
-        ``running`` in this same transaction.
+        ``running`` in this same transaction. ``completed_steps`` seeds the
+        row's progress prefix (a resumed run inherits the checkpointed
+        stages of the run it continues).
         """
         run_id = uuid.uuid4().hex[:12]
         now = _utcnow()
@@ -691,11 +701,22 @@ class ProjectStore:
             ).fetchone()
             if existing is not None:
                 run = self._row_to_run(existing)
-                if run.request_hash != request_hash:
+                same_resume = request.get("resume_of") is not None and request.get("resume_of") == run.request.get("resume_of")
+                if not same_resume and run.request_hash != request_hash:
                     raise RequestKeyConflictError(
                         "同一 request_key 已绑定其他输入，提交被拒绝。", run=run
                     )
                 return run, False
+            if request.get("resume_of") is not None:
+                project = conn.execute(
+                    "SELECT revision, state_json FROM projects WHERE id = ?", (project_id,)
+                ).fetchone()
+                if project is None:
+                    raise ProjectNotFoundError(f"Project '{project_id}' not found")
+                if content_signature(project["state_json"]) != content_signature(base_state_json):
+                    raise RevisionConflictError(
+                        "项目内容在恢复校验后已被修改。", current_revision=project["revision"]
+                    )
             active = conn.execute(
                 f"SELECT {self._RUN_COLUMNS} FROM generation_runs"
                 f" WHERE project_id = ? AND status IN ({','.join('?' * len(RUN_ACTIVE_STATUSES))})"
@@ -711,11 +732,13 @@ class ProjectStore:
                 " request_hash, status, base_revision, base_state_json,"
                 " request_json, completed_steps_json, checkpoint_json,"
                 " created_at, updated_at)"
-                " VALUES (?, ?, ?, ?, ?, 'running', ?, ?, ?, '[]', ?, ?, ?)",
+                " VALUES (?, ?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?)",
                 (
                     run_id, project_id, kind, request_key, request_hash,
                     base_revision, base_state_json,
-                    json.dumps(request, ensure_ascii=False), checkpoint_json,
+                    json.dumps(request, ensure_ascii=False),
+                    json.dumps(completed_steps or [], ensure_ascii=False),
+                    checkpoint_json,
                     now, now,
                 ),
             )
@@ -816,7 +839,10 @@ class ProjectStore:
 
         A single SQLite transaction performs the revision CAS, the project
         snapshot update, the immutable version insert and the run's
-        base-revision/completed-steps/checkpoint/last-progress update. Any
+        base-revision/completed-steps/checkpoint/last-progress update. The
+        checkpoint column stores the ticket-#15 resume envelope (input,
+        state snapshot + digest, completed prefix, execution fingerprint,
+        growth status, basis revision) carried forward from admission. Any
         failure rolls the whole stage back; the returned record and run are
         the exact rows this transaction wrote (never a later re-read). A run
         that already left ``running`` (e.g. an accepted stop) rejects the
@@ -841,9 +867,9 @@ class ProjectStore:
             ).fetchone()
             if proj is None:
                 raise ProjectNotFoundError(f"Project '{project_id}' not found")
-            if proj["revision"] != base_revision and _content_signature(
+            if proj["revision"] != base_revision and content_signature(
                 proj["state_json"]
-            ) != _content_signature(base_state_json):
+            ) != content_signature(base_state_json):
                 raise RevisionConflictError(
                     "项目内容在生成期间已被修改，生成结果未覆盖当前内容",
                     current_revision=proj["revision"],
@@ -854,6 +880,12 @@ class ProjectStore:
             )
             completed = json.loads(run_row["completed_steps_json"] or "[]")
             completed.append(step)
+            checkpoint_text = update_checkpoint_envelope(
+                run_row["checkpoint_json"],
+                state_json=new_state_json,
+                completed_steps=completed,
+                revision=new_revision,
+            )
             conn.execute(
                 "UPDATE generation_runs SET base_revision = ?, base_state_json = ?,"
                 " completed_steps_json = ?, checkpoint_json = ?,"
@@ -861,7 +893,7 @@ class ProjectStore:
                 (
                     new_revision, new_state_json,
                     json.dumps(completed, ensure_ascii=False),
-                    new_state_json,
+                    checkpoint_text,
                     json.dumps(progress, ensure_ascii=False),
                     _utcnow(), run_id,
                 ),
@@ -889,6 +921,16 @@ class ProjectStore:
             row = self._conn.execute(
                 f"SELECT {self._RUN_COLUMNS} FROM generation_runs WHERE id = ?",
                 (run_id,),
+            ).fetchone()
+        return self._row_to_run(row) if row else None
+
+    def generation_run_for_key(self, project_id: str, request_key: str) -> GenerationRun | None:
+        with self._lock:
+            row = self._conn.execute(
+                f"SELECT {self._RUN_COLUMNS} FROM generation_runs"
+                " WHERE project_id = ? AND request_key = ?"
+                " ORDER BY created_at ASC, rowid ASC LIMIT 1",
+                (project_id, request_key),
             ).fetchone()
         return self._row_to_run(row) if row else None
 
@@ -966,16 +1008,48 @@ class ProjectStore:
 
         Runs whose in-memory task died with the previous process are facts to
         report, never work to silently resume: no model call happens here.
+        A checkpoint whose growth was still ``running`` is converged to
+        ``interrupted`` in the same transaction — the side effects may have
+        partially happened and must stay recorded, never replayed.
         """
         now = _utcnow()
         with self._write_tx() as conn:
-            cursor = conn.execute(
+            stale = conn.execute(
+                "SELECT id, checkpoint_json FROM generation_runs"
+                " WHERE status IN ('running', 'stopping')"
+            ).fetchall()
+            if not stale:
+                return 0
+            conn.execute(
                 "UPDATE generation_runs SET status = 'interrupted',"
                 " error = COALESCE(error, '服务在运行期间重启，生成已中断；不会自动继续。'),"
                 " updated_at = ? WHERE status IN ('running', 'stopping')",
                 (now,),
             )
-            return cursor.rowcount
+            for row in stale:
+                try:
+                    envelope = json.loads(row["checkpoint_json"] or "")
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                if (
+                    isinstance(envelope, dict)
+                    and envelope.get("growth_status") == "running"
+                ):
+                    conn.execute(
+                        "UPDATE generation_runs SET checkpoint_json = ? WHERE id = ?",
+                        (
+                            update_checkpoint_envelope(
+                                row["checkpoint_json"],
+                                growth_status="interrupted",
+                                growth_error=(
+                                    "服务重启时成长任务仍在执行，"
+                                    "其副作用可能已部分发生；不会自动重放。"
+                                ),
+                            ),
+                            row["id"],
+                        ),
+                    )
+            return len(stale)
 
     # ── Internals ─────────────────────────────────────────
 

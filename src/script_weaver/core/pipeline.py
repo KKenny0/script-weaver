@@ -27,6 +27,13 @@ from script_weaver.agents.impl import (
 )
 from script_weaver.core import refinement
 from script_weaver.core.refinement import RefineExecutionError
+from script_weaver.core.resume import (
+    ResumeCheckpoint,
+    ResumeRejected,
+    assert_fingerprint_match,
+    current_fingerprint,
+    validate_completed_steps,
+)
 from script_weaver.core.types import (
     DecisionRecord,
     ProjectMeta,
@@ -71,6 +78,10 @@ GENERATION_STEP_LABELS = {
 }
 
 StageCompleteCallback = Callable[[str, ProjectState], Coroutine[Any, Any, None]]
+# Growth lifecycle notifications (ticket #15 §5): status is one of
+# pending/running/succeeded/failed/interrupted; "running" is reported BEFORE
+# any growth side effect starts so the caller can persist it first.
+GrowthEventCallback = Callable[[str, str | None], Coroutine[Any, Any, None]]
 
 
 class PipelineStopped(Exception):
@@ -233,20 +244,42 @@ class PipelineEngine:
         initial_state: ProjectState | None = None,
         completed_steps: Iterable[str] = (),
         on_stage_complete: StageCompleteCallback | None = None,
+        resume_from: ResumeCheckpoint | None = None,
+        on_growth_event: GrowthEventCallback | None = None,
     ) -> ProjectState:
         """Run the complete pipeline from idea to storyboard.
 
-        The keyword arguments are the ticket-#14 detach contract:
+        The keyword arguments are the ticket-#14/#15 contracts:
         ``initial_state`` resumes from an explicit snapshot instead of a
         fresh state, ``completed_steps`` names steps that already succeeded
-        (they and their gates are skipped), and ``on_stage_complete`` is
-        awaited after every step's artifact validated and integrated — the
-        caller persists its checkpoint there and may raise (e.g.
-        :class:`PipelineStopped`) to abort before the next stage. Legacy
-        callers pass only ``user_input``/``title`` and keep today's
-        behavior.
+        (they and their gates are skipped), ``on_stage_complete`` is awaited
+        after every step's artifact validated and integrated — the caller
+        persists its checkpoint there and may raise (e.g.
+        :class:`PipelineStopped`) to abort before the next stage.
+        ``resume_from`` additionally validates the checkpoint BEFORE any
+        model call: ``completed_steps`` must be a strict contiguous prefix
+        of :data:`GENERATION_STEPS` with its artifacts present, and the
+        execution fingerprint must match the engine's own resolved
+        settings/skills (a drift raises :class:`ResumeRejected`). A
+        checkpoint whose content already completed skips every stage AND
+        the growth loop — completed content is never regenerated and
+        growth is never replayed. ``on_growth_event`` receives the growth
+        lifecycle transitions. Legacy callers pass only
+        ``user_input``/``title`` and keep today's behavior.
         """
         self._notify("pipeline", "=== Starting Full Pipeline ===")
+
+        resumed = resume_from is not None
+        if resumed:
+            # The checkpoint is the single source of truth for the success
+            # prefix: callers pass the same list, but conflicting values
+            # can never widen what is skipped.
+            completed_steps = list(resume_from.completed_steps)
+            validate_completed_steps(
+                resume_from.completed_steps, state=resume_from.state_model()
+            )
+            if initial_state is None and resume_from.state is not None:
+                initial_state = resume_from.state_model()
 
         # Initialize state
         if initial_state is not None:
@@ -265,9 +298,7 @@ class PipelineEngine:
                 state.meta.title = idea[:50] + ("..." if len(idea) > 50 else "")
 
         done: set[str] = set(completed_steps)
-        unknown = done - set(GENERATION_STEPS)
-        if unknown:
-            raise ValueError(f"Unknown completed steps: {sorted(unknown)}")
+        validate_completed_steps(completed_steps, state=state if resumed else None)
 
         async def _checkpoint(step: str) -> None:
             if on_stage_complete is not None:
@@ -279,6 +310,20 @@ class PipelineEngine:
             "pipeline",
             f"Skills discovered: {len(self._skill_registry.list_all())}",
         )
+
+        # Resume basis: the fingerprint of the config/skills this engine
+        # just resolved — BEFORE the first model call, so a drifted basis
+        # can never spend one.
+        if resumed:
+            actual = await current_fingerprint(
+                skill_registry=self._skill_registry,
+                skill_bindings={
+                    k: v.model_dump(mode="json")
+                    for k, v in (state.skill_bindings or {}).items()
+                },
+                auto_approve=self._auto_approve,
+            )
+            assert_fingerprint_match(resume_from.fingerprint, actual)
 
         # ── Stage 1: Idea Refinement ────────────────────
         if "idea_refiner" not in done:
@@ -303,7 +348,11 @@ class PipelineEngine:
                 await self._run_agent(designer, state)
                 await _checkpoint(designer)
         designers_done = {"character_designer", "scene_designer", "art_director"} <= done
-        if not designers_done and not await self._await_gate("designing", state):
+        # A checkpoint commits each designer BEFORE the designing gate, so a
+        # resumed run with all designers saved but scriptwriter not yet run
+        # must re-ask that gate: a saved artifact is not a confirmed gate.
+        gate_needed = not designers_done or (resumed and "scriptwriter" not in done)
+        if gate_needed and not await self._await_gate("designing", state):
             return state
 
         # ── Stage 4: Script Writing ────────────────────
@@ -329,7 +378,16 @@ class PipelineEngine:
             await _checkpoint("finalize")
 
         # ── Growth Loop ──────────────────────────────
-        await self._run_growth_loop(state)
+        # Growth runs only when THIS run completed the content; a resumed
+        # already-complete checkpoint neither regenerates content nor
+        # replays growth (highlights are deterministic and were kept).
+        content_pre_complete = resumed and resume_from.content_complete
+        if not content_pre_complete:
+            growth_status = await self._run_growth_loop(
+                state, on_event=on_growth_event
+            )
+            if growth_status == "failed":
+                self._notify("growth", "内容已完成；成长任务失败已记录，不影响内容。")
 
         self._notify("pipeline", "=== Pipeline Complete ===")
         return state
@@ -401,9 +459,25 @@ class PipelineEngine:
         if highlights:
             state.visual_highlights = highlights
 
-    async def _run_growth_loop(self, state: ProjectState) -> None:
-        """Execute the Grows With User growth cycle."""
+    async def _run_growth_loop(
+        self,
+        state: ProjectState,
+        *,
+        on_event: GrowthEventCallback | None = None,
+    ) -> str:
+        """Execute the Grows With User growth cycle; report its outcome.
+
+        Returns ``"succeeded"`` or ``"failed"`` and notifies ``on_event``
+        with the lifecycle transitions. ``running`` is reported BEFORE the
+        first side effect — the caller persists it first, so a crash later
+        leaves a durable record that side effects may have partially
+        happened (a restart converges it to ``interrupted``). A failure is
+        reported as data, never swallowed: the content stays complete.
+        """
         self._notify("growth", "--- Running Growth Loop ---")
+
+        if on_event is not None:
+            await on_event("running", None)
 
         try:
             # 1. Extract patterns from decisions
@@ -438,9 +512,15 @@ class PipelineEngine:
                 self._profile_manager.record_decision(decision)
 
             self._notify("growth", "Growth loop complete.")
+            if on_event is not None:
+                await on_event("succeeded", None)
+            return "succeeded"
 
         except Exception as e:
             logger.warning(f"Growth loop error (non-fatal): {e}")
+            if on_event is not None:
+                await on_event("failed", str(e))
+            return "failed"
 
     # ── Iterative Refinement ───────────────────────────
 

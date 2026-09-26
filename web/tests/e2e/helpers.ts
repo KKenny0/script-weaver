@@ -369,7 +369,7 @@ if status != "running":
                                 error="种子运行预先写好的失败原因" if status == "failed" else None)
 if progress:
     store.update_generation_run(run.run_id,
-        last_progress={"stage": "seed", "message": progress["message"]},
+        last_progress={"stage": "seed", "message": progress.get("message") or "种子进度"},
         completed_steps=progress.get("completedSteps") or [])
 run = store.get_generation_run(run.run_id)
 print(json.dumps({"run_id": run.run_id, "status": run.status}))

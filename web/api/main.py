@@ -15,6 +15,13 @@ is CAS-committed as it validates, and GET endpoints only observe. A page
 refresh, close or SSE disconnect never cancels a run; an explicit stop or a
 service restart does (restarts mark leftover runs ``interrupted`` and never
 re-arm model calls on their own).
+
+Failed/cancelled/interrupted runs can be resumed from their checkpoint
+(ticket #15): POST /runs/{run_id}/resume validates the success prefix, the
+execution fingerprint and the project basis under the project lock, then
+creates a NEW run that skips the completed stages. Growth (profile/skill
+side effects) is recorded separately from content completion and never
+replayed by a resume or an export.
 """
 
 from __future__ import annotations
@@ -40,6 +47,7 @@ from script_weaver.core import refinement
 from script_weaver.core.config import get_settings
 from script_weaver.core.pipeline import (
     GENERATION_STEP_LABELS,
+    GENERATION_STEPS,
     PipelineEngine,
     PipelineStopped,
 )
@@ -56,10 +64,23 @@ from script_weaver.core.project_store import (
     RequestKeyConflictError,
     RevisionConflictError,
     RunStageRejectedError,
+    content_signature,
     hash_run_request,
     serialize_state,
 )
 from script_weaver.core.refinement import RefineExecutionError, RefinementError
+from script_weaver.core.resume import (
+    GROWTH_STATUS_MESSAGES,
+    ResumeCheckpoint,
+    ResumeRejected,
+    assert_fingerprint_match,
+    build_checkpoint,
+    current_fingerprint,
+    decode_checkpoint,
+    encode_checkpoint,
+    update_checkpoint_envelope,
+    validate_completed_steps,
+)
 from script_weaver.core.types import ProjectState, Shot
 from script_weaver.exporters.fountain_exporter import export_fountain
 from script_weaver.exporters.json_exporter import export_json
@@ -163,6 +184,17 @@ class GenerateRequest(BaseModel):
 
     request_key: str | None = Field(default=None, max_length=200)
     user_input: str | None = Field(default=None, max_length=20000)
+
+
+class ResumeRequest(BaseModel):
+    """POST /runs/{run_id}/resume body (ticket #15).
+
+    ``request_key`` is this resume intent's idempotency key: resending the
+    same intent returns the same new run; the same key against a different
+    resume target or input is a 409.
+    """
+
+    request_key: str | None = Field(default=None, max_length=200)
 
 
 class SkillActivateRequest(BaseModel):
@@ -275,6 +307,20 @@ async def _get_engine(
 # ── Background generation runs (ticket #14) ────────────
 
 
+def _state_skill_bindings(state: ProjectState) -> dict[str, Any]:
+    """The skill bindings execution actually reads: the STATE's bindings.
+
+    Agents consume ``state.skill_bindings`` (not the projects-table
+    column), so the resume fingerprint is computed from the same source —
+    a checkpoint recorded under one binding set cannot be resumed under
+    another.
+    """
+    return {
+        key: binding.model_dump(mode="json")
+        for key, binding in (state.skill_bindings or {}).items()
+    }
+
+
 class RunSubmitConflict(Exception):
     """A submission violates idempotency or the one-active-run rule."""
 
@@ -354,11 +400,14 @@ class _RunManager:
         runs in every status: same key + same snapshot returns the original
         run without ever building a model instance; same key + different
         snapshot is a conflict; any other active run makes the project busy.
-        A genuinely created run registers its task INSIDE the same project
-        lock — from the moment the row exists, a cancellable task owns it
-        through initialization to the terminal state (engine construction
-        happens in the task, so a stop during it cancels the run for good).
-        The response is re-read after registration: it reports the run's
+        Admission also records the execution fingerprint and the resume
+        envelope (ticket #15): every stage commit advances that envelope, so
+        the run is resumable from its last successful stage. A genuinely
+        created run registers its task INSIDE the same project lock — from
+        the moment the row exists, a cancellable task owns it through
+        initialization to the terminal state (engine construction happens
+        in the task, so a stop during it cancels the run for good). The
+        response is re-read after registration: it reports the run's
         current state, never the admission-time snapshot.
         """
         try:
@@ -370,8 +419,21 @@ class _RunManager:
             "auto_approve": bool(record.auto_approve),
             "skill_bindings": record.skill_bindings or {},
         }
+        # The execution fingerprint lives on the CHECKPOINT (the resume
+        # basis), not in the request snapshot: a resent request_key must
+        # keep answering with its original run even if skill files or
+        # model settings changed meanwhile — no new run, no model call.
+        fingerprint = await current_fingerprint(
+            skill_bindings=_state_skill_bindings(record.state),
+            auto_approve=record.auto_approve,
+        )
         request_hash = hash_run_request(request)
         key = request_key or f"auto-{request_hash}"
+        checkpoint = build_checkpoint(
+            user_input=request["user_input"],
+            fingerprint=fingerprint,
+            basis={"revision": record.revision},
+        )
 
         async with self._project_lock(project_id):
             if project_id in self._refine_projects:
@@ -388,7 +450,7 @@ class _RunManager:
                     request_hash=request_hash,
                     base_revision=record.revision,
                     base_state_json=record.state_json,
-                    checkpoint_json=record.state_json,
+                    checkpoint_json=encode_checkpoint(checkpoint),
                 )
             except RequestKeyConflictError as exc:
                 raise RunSubmitConflict(
@@ -409,6 +471,168 @@ class _RunManager:
             self._spawn(run.run_id)
         # Report the run's CURRENT state: an immediate initialization
         # failure or a racing stop may already have settled the row.
+        run = await asyncio.to_thread(
+            self.store.get_generation_run_required, run.run_id
+        )
+        return run, True
+
+    async def resume(
+        self, project_id: str, run_id: str, request_key: str | None
+    ) -> tuple[GenerationRun, bool]:
+        """Admit a run that continues a terminal run from its checkpoint.
+
+        Every eligibility check and the new run's admission coordinate
+        under the SAME project lock as submit/refine, so the validated
+        store admission also checks the content basis atomically against manual edits. The
+        original run row is never resurrected: a new run record is created
+        that inherits the checkpointed success prefix, and the original
+        (failed/cancelled/interrupted) row plus its checkpoint stay intact
+        for history. All refusals raise :class:`RunSubmitConflict` with a
+        stable code — none of them builds a model instance.
+        """
+        async with self._project_lock(project_id):
+            try:
+                record = await asyncio.to_thread(self.store.get_required, project_id)
+            except ProjectStoreError as exc:
+                raise _store_error(exc) from exc
+            key = request_key or f"auto-resume-{run_id}"
+            existing = await asyncio.to_thread(
+                self.store.generation_run_for_key, project_id, key
+            )
+            if existing is not None:
+                if existing.request.get("resume_of") != run_id:
+                    raise RunSubmitConflict(
+                        "request_conflict", "同一 request_key 已绑定其他恢复目标或输入。",
+                        run=existing,
+                    )
+                return existing, False
+            if project_id in self._refine_projects:
+                raise RunSubmitConflict(
+                    "run_active", "该项目正在处理修改请求，请稍后再恢复生成。"
+                )
+            original = await asyncio.to_thread(
+                self.store.get_generation_run, run_id
+            )
+            if original is None or original.project_id != project_id:
+                raise ProjectNotFoundError(f"Run '{run_id}' not found")
+            if original.status in RUN_ACTIVE_STATUSES:
+                raise RunSubmitConflict(
+                    "run_active",
+                    "原运行仍在进行中，无法恢复；请先等待完成或停止。",
+                    run=original,
+                )
+            # A pre-#15 run stored a raw ProjectState as its checkpoint:
+            # preserved and viewable, but never a basis to guess a resume.
+            checkpoint: ResumeCheckpoint | None = None
+            if original.checkpoint_json is not None:
+                try:
+                    checkpoint = decode_checkpoint(original.checkpoint_json)
+                except ResumeRejected as exc:
+                    raise RunSubmitConflict(
+                        "resume_basis_missing",
+                        "该运行缺少可用的恢复依据（旧格式或已损坏），"
+                        "已保留可查看；如需继续请从头生成。",
+                        run=original,
+                    ) from exc
+            if checkpoint is not None and checkpoint.content_complete:
+                raise RunSubmitConflict(
+                    "content_complete",
+                    "该运行的内容已完整生成，无需恢复；可直接查看或导出。",
+                    run=original,
+                )
+            if original.status not in ("failed", "cancelled", "interrupted"):
+                raise RunSubmitConflict(
+                    "resume_not_allowed",
+                    f"状态为 {original.status} 的运行不能恢复。",
+                    run=original,
+                )
+            if checkpoint is None:
+                raise RunSubmitConflict(
+                    "resume_basis_missing",
+                    "该运行缺少恢复依据（未保存任何进度），已保留可查看；"
+                    "如需继续请从头生成。",
+                    run=original,
+                )
+            state_model = checkpoint.state_model()
+            try:
+                validate_completed_steps(
+                    original.completed_steps, state=state_model
+                )
+            except ResumeRejected as exc:
+                raise RunSubmitConflict(exc.code, exc.message, run=original) from exc
+            if original.completed_steps and checkpoint.completed_steps != (
+                original.completed_steps
+            ):
+                raise RunSubmitConflict(
+                    "resume_basis_missing",
+                    "运行进度与 checkpoint 记录不一致，拒绝猜测续跑；已保留原记录。",
+                    run=original,
+                )
+            # The project must still hold exactly the checkpointed content:
+            # any real edit since the interruption refuses the resume (a
+            # rename alone stays resumable — it is not a content change).
+            if state_model is not None and content_signature(
+                record.state_json
+            ) != content_signature(serialize_state(state_model)):
+                raise RunSubmitConflict(
+                    "project_changed",
+                    "项目内容在运行中断后已被修改，无法安全续跑；可从头生成"
+                    "（历史版本会保留）。",
+                    run=original,
+                )
+            fingerprint = await current_fingerprint(
+                skill_bindings=_state_skill_bindings(record.state),
+                auto_approve=record.auto_approve,
+            )
+            try:
+                assert_fingerprint_match(checkpoint.fingerprint, fingerprint)
+            except ResumeRejected as exc:
+                raise RunSubmitConflict(exc.code, exc.message, run=original) from exc
+
+            request = {
+                "user_input": checkpoint.user_input or record.state.user_input,
+                "auto_approve": bool(record.auto_approve),
+                "skill_bindings": record.skill_bindings or {},
+                "resume_of": original.run_id,
+            }
+            request_hash = hash_run_request(request)
+            resumed_checkpoint = checkpoint.model_copy(deep=True)
+            resumed_checkpoint.user_input = request["user_input"]
+            resumed_checkpoint.growth_status = "pending"
+            resumed_checkpoint.growth_error = None
+            resumed_checkpoint.basis = {
+                "revision": record.revision,
+                "resumed_from": original.run_id,
+            }
+            try:
+                run, created = await asyncio.to_thread(
+                    self.store.admit_generation_run,
+                    project_id,
+                    kind="generate",
+                    request_key=key,
+                    request=request,
+                    request_hash=request_hash,
+                    base_revision=record.revision,
+                    base_state_json=record.state_json,
+                    checkpoint_json=encode_checkpoint(resumed_checkpoint),
+                    completed_steps=list(original.completed_steps),
+                )
+            except RevisionConflictError as exc:
+                raise RunSubmitConflict("project_changed", "项目内容在恢复校验后已被修改，拒绝恢复。", run=original) from exc
+            except RequestKeyConflictError as exc:
+                raise RunSubmitConflict(
+                    "request_conflict",
+                    "同一 request_key 已绑定其他恢复目标或输入，提交被拒绝。",
+                    run=exc.run,
+                ) from exc
+            except ActiveRunConflictError as exc:
+                raise RunSubmitConflict(
+                    "run_active", "该项目已有生成运行进行中，请等待完成或先停止。",
+                    run=exc.run,
+                ) from exc
+            if not created:
+                return run, False
+            self._spawn(run.run_id)
         run = await asyncio.to_thread(
             self.store.get_generation_run_required, run.run_id
         )
@@ -537,6 +761,30 @@ class _RunManager:
             base_state_json = run.base_state_json
             completed: list[str] = list(run.completed_steps)
 
+            # Ticket #15: a run admitted with a resume envelope continues
+            # from the checkpointed success prefix. The envelope was fully
+            # validated at admission; decoding here feeds the SAME public
+            # contract into the pipeline, which re-validates prefix and
+            # fingerprint against its own resolved instance before the
+            # first model call — check and execution share one basis.
+            resume_from: ResumeCheckpoint | None = None
+            if run.checkpoint_json is not None:
+                try:
+                    resume_from = decode_checkpoint(run.checkpoint_json)
+                except ResumeRejected as exc:
+                    if completed:
+                        # A broken basis under a claimed prefix must never
+                        # silently restart those stages from zero.
+                        raise _StageConflict(
+                            f"运行检查点不可用，已停止：{exc.message}", ctx.state
+                        ) from None
+                    resume_from = None
+            initial_state = (
+                resume_from.state_model() if resume_from is not None else None
+            )
+            if resume_from is not None:
+                completed = list(resume_from.completed_steps)
+
             async def _on_stage_complete(step: str, working: ProjectState) -> None:
                 nonlocal base_revision, base_state_json, completed
                 if stop_event.is_set():
@@ -582,12 +830,45 @@ class _RunManager:
                 progress["revision"] = record.revision
                 self.broadcast(run_id, "progress", progress)
 
+            async def _on_growth_event(status: str, error: str | None) -> None:
+                """Persist each growth transition onto the run's checkpoint.
+
+                ``running`` lands before any side effect; a terminal status
+                records the outcome. Non-envelope runs (legacy seeds) are
+                skipped — nothing to record on.
+                """
+                try:
+                    current = await asyncio.to_thread(
+                        self.store.get_generation_run_required, run_id
+                    )
+                except ProjectStoreError:
+                    return
+                if current.checkpoint_json is None:
+                    return
+                updated = update_checkpoint_envelope(
+                    current.checkpoint_json,
+                    growth_status=status,
+                    growth_error=error,
+                )
+                with suppress(ProjectStoreError):
+                    await asyncio.to_thread(
+                        self.store.update_generation_run,
+                        run_id,
+                        checkpoint_json=updated,
+                    )
+                message = GROWTH_STATUS_MESSAGES.get(status, status)
+                if status == "failed" and error:
+                    message = f"{message}（{error}）"
+                self.broadcast(run_id, "progress", {"stage": "growth", "message": message})
+
             result = await engine.run_full_pipeline(
                 user_input=run.request.get("user_input") or ctx.state.user_input,
                 title=ctx.state.meta.title or None,
-                initial_state=None,
-                completed_steps=[],
+                initial_state=initial_state,
+                completed_steps=completed,
                 on_stage_complete=_on_stage_complete,
+                resume_from=resume_from,
+                on_growth_event=_on_growth_event,
             )
             if not completed:
                 # Engines that never invoked the stage callback (pre-#14
@@ -632,16 +913,14 @@ class _RunManager:
             )
             self.broadcast(run_id, "done", _run_done_payload(run))
         except PipelineStopped:
-            run = await asyncio.to_thread(
-                self.store.settle_generation_run,
+            run = await self._settle_terminal(
                 run_id,
                 status="cancelled",
                 last_progress={"stage": "stop", "message": "生成已停止；已完成阶段保留。"},
             )
             self.broadcast(run_id, "done", _run_done_payload(run))
         except _StageConflict as exc:
-            run = await asyncio.to_thread(
-                self.store.settle_generation_run,
+            run = await self._settle_terminal(
                 run_id,
                 status="failed",
                 error=exc.message,
@@ -660,22 +939,54 @@ class _RunManager:
                 else "服务关闭，生成中断；已完成阶段保留，不会自动继续。"
             )
             with suppress(asyncio.CancelledError, ProjectStoreError):
-                run = await asyncio.to_thread(
-                    self.store.settle_generation_run,
-                    run_id,
-                    status=status,
-                    error=message,
-                )
+                run = await self._settle_terminal(run_id, status=status, error=message)
                 self.broadcast(run_id, "done", _run_done_payload(run))
         except Exception as exc:
             logger.exception("Generation run %s failed", run_id)
-            run = await asyncio.to_thread(
-                self.store.settle_generation_run,
-                run_id,
-                status="failed",
-                error=f"生成失败：{exc}",
+            run = await self._settle_terminal(
+                run_id, status="failed", error=f"生成失败：{exc}"
             )
             self.broadcast(run_id, "done", _run_done_payload(run))
+
+    async def _settle_terminal(
+        self, run_id: str, *, status: str, **updates: Any
+    ) -> GenerationRun:
+        """Settle a run, converging a still-running growth record first.
+
+        A run that ends while its growth was mid-flight (stop, crash,
+        shutdown) leaves ``growth_status=running`` on its checkpoint — an
+        unfinished side-effect window. It is converged to ``interrupted``
+        in the same settle write, so the record never implies completed
+        growth effects and a later export never replays them.
+        """
+        if status != "succeeded":
+            with suppress(ProjectStoreError):
+                current = await asyncio.to_thread(
+                    self.store.get_generation_run, run_id
+                )
+                if current is not None and current.checkpoint_json:
+                    try:
+                        envelope = json.loads(current.checkpoint_json)
+                    except json.JSONDecodeError:
+                        envelope = None
+                    if (
+                        isinstance(envelope, dict)
+                        and envelope.get("growth_status") == "running"
+                    ):
+                        updates.setdefault(
+                            "checkpoint_json",
+                            update_checkpoint_envelope(
+                                current.checkpoint_json,
+                                growth_status="interrupted",
+                                growth_error=(
+                                    "成长任务随运行中止而中断，"
+                                    "其副作用可能已部分发生；不会自动重放。"
+                                ),
+                            ),
+                        )
+        return await asyncio.to_thread(
+            self.store.settle_generation_run, run_id, status=status, **updates
+        )
 
     # ── Stop / shutdown ────────────────────────────────
 
@@ -792,8 +1103,24 @@ async def _run_event_stream(manager: _RunManager, run_id: str):
         manager.unregister(run_id, queue)
 
 
+def _growth_outcome(run: GenerationRun) -> dict:
+    try:
+        checkpoint = decode_checkpoint(run.checkpoint_json)
+    except ResumeRejected:
+        return {"growth_status": None, "growth_error": None}
+    return {"growth_status": checkpoint.growth_status, "growth_error": checkpoint.growth_error}
+
+
 def _serialize_run(run: GenerationRun) -> dict:
-    """API shape of a run — progress facts only, no bulky state blobs."""
+    """API shape of a run — progress facts only, no bulky state blobs.
+
+    ``content_complete`` and ``next_step``/``next_step_label`` are the
+    ticket-#15 resume facts: what already finished and where a resume
+    would continue from. Pure local computation — no store or model work.
+    """
+    completed = run.completed_steps
+    pending = [s for s in GENERATION_STEPS if s not in completed]
+    next_step = pending[0] if pending else None
     return {
         "run_id": run.run_id,
         "project_id": run.project_id,
@@ -801,22 +1128,41 @@ def _serialize_run(run: GenerationRun) -> dict:
         "request_key": run.request_key,
         "status": run.status,
         "base_revision": run.base_revision,
-        "completed_steps": run.completed_steps,
+        "completed_steps": completed,
+        "completed_step_labels": [
+            GENERATION_STEP_LABELS.get(s, s) for s in completed
+        ],
+        "next_step": next_step,
+        "next_step_label": GENERATION_STEP_LABELS.get(next_step, next_step) if next_step else None,
+        "content_complete": "finalize" in completed,
         "last_progress": run.last_progress,
         "error": run.error,
         "result_summary": run.result_summary,
+        **_growth_outcome(run),
         "created_at": run.created_at,
         "updated_at": run.updated_at,
     }
 
 
 def _run_done_payload(run: GenerationRun) -> dict:
+    completed = run.completed_steps
+    pending = [s for s in GENERATION_STEPS if s not in completed]
+    next_step = pending[0] if pending else None
     return {
         "run_id": run.run_id,
         "status": run.status,
         "error": run.error,
-        "completed_steps": run.completed_steps,
+        "completed_steps": completed,
+        "completed_step_labels": [
+            GENERATION_STEP_LABELS.get(s, s) for s in completed
+        ],
+        "next_step": next_step,
+        "next_step_label": (
+            GENERATION_STEP_LABELS.get(next_step, next_step) if next_step else None
+        ),
+        "content_complete": "finalize" in completed,
         "result_summary": run.result_summary,
+        **_growth_outcome(run),
     }
 
 
@@ -1070,6 +1416,35 @@ async def stop_run(project_id: str, run_id: str) -> dict:
         return {"run": _serialize_run(run), "stopped": False}
     run, stopped = await manager.request_stop(run_id)
     return {"run": _serialize_run(run), "stopped": stopped}
+
+
+@app.post("/api/projects/{project_id}/runs/{run_id}/resume")
+async def resume_run(project_id: str, run_id: str, req: ResumeRequest) -> dict:
+    """Resume a failed/cancelled/interrupted run from its checkpoint.
+
+    Creates a NEW run that reuses every still-valid successful stage; the
+    original row and its checkpoint are preserved untouched (a failed run
+    is never flipped back to running). The response matches the generate
+    submit contract (``run`` + ``created``); resending one intent's
+    ``request_key`` returns the same new run. Every refusal is a 409 with
+    a stable ``detail.code`` — run_active / content_complete /
+    resume_basis_missing / invalid_prefix / config_changed /
+    project_changed / resume_not_allowed — and none of them ever builds a
+    model instance.
+    """
+    try:
+        run, created = await _runs().resume(project_id, run_id, req.request_key)
+    except ProjectNotFoundError as exc:
+        raise HTTPException(
+            404,
+            detail={"code": "run_not_found", "message": f"运行 '{run_id}' 不存在"},
+        ) from exc
+    except RunSubmitConflict as exc:
+        detail: dict[str, Any] = {"code": exc.code, "message": exc.message}
+        if exc.run is not None:
+            detail["run"] = _serialize_run(exc.run)
+        raise HTTPException(409, detail=detail) from exc
+    return {"run": _serialize_run(run), "created": created}
 
 
 @app.post("/api/projects/{project_id}/refine")
