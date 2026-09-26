@@ -22,9 +22,11 @@ import pytest
 
 from script_weaver.core.types import (
     BasicInfo,
+    Character,
     Outline,
     ProjectState,
     ProjectStatus,
+    SceneDesign,
     Script,
     ScriptBlock,
     ScriptBlockType,
@@ -1290,6 +1292,130 @@ async def test_refine_general_intact_references_succeed(client):
                      json={"message": "第一句对白加顿号"})
     assert r.status_code == 200, r.text
     assert r.json()["changed_artifacts"] == ["script"]
+
+
+# ── Review round 3: stable defect identity + auto-ID exclusions ────
+
+ROUTE_GENERAL_CHARACTERS = {
+    "next_agent": "character_designer",
+    "action": "execute_agent",
+    "constraint": "general",
+    "reason": "普通角色修改",
+    "message_to_user": "",
+}
+
+ROUTE_GENERAL_SCENES = {
+    "next_agent": "scene_designer",
+    "action": "execute_agent",
+    "constraint": "general",
+    "reason": "普通场景设计修改",
+    "message_to_user": "",
+}
+
+
+def designed_scripted_state() -> ProjectState:
+    """scripted_state plus a historical defect: sc_first→old_missing
+    (dangling), sc_last→sd_ok (valid)."""
+    state = scripted_state()
+    state.scenes = [SceneDesign(id="sd_ok", name="码头", environment="夜色中的码头")]
+    state.script.scenes[0].scene_design_id = "old_missing"
+    state.script.scenes[1].scene_design_id = "sd_ok"
+    return state
+
+
+async def seed_designed_project(c: httpx.AsyncClient, api, title: str) -> dict:
+    p = await create_project(c, "修改目标故事", title)
+    record = api._runtime.store.get_required(p["project_id"])
+    api._runtime.store.save_state(
+        p["project_id"], designed_scripted_state(), record.revision,
+        source="manual", summary="seed",
+    )
+    return p
+
+
+async def test_refine_repair_one_break_other_same_index_rejected_no_write(client):
+    """Real Pipeline → API → Store leak regression: repairing sc_first's
+    design ref while breaking sc_last's — after a swap both snapshots show
+    the defect at scenes[0], so the index-keyed comparison waved it through
+    and saved a new revision. Identity-keyed comparison must refuse whole."""
+    api, c = client
+    p = await seed_designed_project(c, api, "同位换缺陷")
+    base = scripted_script_dict(designed_scripted_state())
+
+    def swap_repair_and_break(script: dict) -> dict:
+        out = copy.deepcopy(script)
+        out["scenes"].reverse()                                # sc_last first now
+        out["scenes"][0]["scene_design_id"] = "new_missing"    # sc_last breaks
+        out["scenes"][1]["scene_design_id"] = "sd_ok"          # sc_first repaired
+        out["scenes"][0]["blocks"][1]["content"]["dialogue"] = "请一定记住今晚。"
+        return out
+
+    llm = ScriptedLLM(ROUTE_GENERAL_SCRIPT, swap_repair_and_break(base))
+    real_engine(api, llm)
+
+    r = await c.post(f"/api/projects/{p['project_id']}/refine",
+                     json={"message": "交换两场并修好第一场的场景引用"})
+    assert r.status_code == 422, r.text
+    assert r.json()["detail"]["code"] == "refine_constraint_failed"
+    assert "scene_design_id" in r.json()["detail"]["message"]
+    await assert_project_untouched(c, api, p)
+    current = (await c.get(f"/api/projects/{p['project_id']}")).json()
+    assert current["script"]["scenes"][0]["scene_design_id"] == "old_missing"
+    assert current["script"]["scenes"][1]["scene_design_id"] == "sd_ok"
+
+
+async def test_refine_character_id_rebuild_only_is_no_meaningful_change(client):
+    """Real Pipeline → API → Store: the model echoes the character minus
+    its id; Pydantic regenerates char_xxx and the echo used to count as a
+    substantive edit (200 + new revision). Only real content may."""
+    api, c = client
+    p = await create_project(c, "修改目标故事", "角色ID重建")
+    state = scripted_state()
+    state.characters = [Character(id="char_ayun", name="阿芸", personality="坚韧")]
+    record = api._runtime.store.get_required(p["project_id"])
+    api._runtime.store.save_state(
+        p["project_id"], state, record.revision, source="manual", summary="seed")
+
+    # The model echoes the identical content but omits id — Pydantic's
+    # default_factory mints a fresh char_xxx during integration.
+    echoed_without_id = [{"name": "阿芸", "personality": "坚韧"}]
+    llm = ScriptedLLM(ROUTE_GENERAL_CHARACTERS, echoed_without_id,
+                      artifact_type="characters")
+    real_engine(api, llm)
+
+    r = await c.post(f"/api/projects/{p['project_id']}/refine",
+                     json={"message": "把主角性格写得更鲜明"})
+    assert r.status_code == 422, r.text
+    assert r.json()["detail"]["code"] == "refine_no_meaningful_change"
+    await assert_project_untouched(c, api, p)
+    current = (await c.get(f"/api/projects/{p['project_id']}")).json()
+    assert current["characters"][0]["id"] == "char_ayun"
+
+
+async def test_refine_scene_design_id_rebuild_only_is_no_meaningful_change(client):
+    """Same defect shape on an unreferenced SceneDesign: id regeneration
+    alone must not create a version."""
+    api, c = client
+    p = await create_project(c, "修改目标故事", "场景ID重建")
+    state = scripted_state()
+    state.scenes = [SceneDesign(id="sd_roof", name="天台", environment="夜风中的天台")]
+    record = api._runtime.store.get_required(p["project_id"])
+    api._runtime.store.save_state(
+        p["project_id"], state, record.revision, source="manual", summary="seed")
+
+    # Identical content, id omitted — a fresh scene_xxx is minted on save.
+    echoed_without_id = [{"name": "天台", "environment": "夜风中的天台"}]
+    llm = ScriptedLLM(ROUTE_GENERAL_SCENES, echoed_without_id,
+                      artifact_type="scenes")
+    real_engine(api, llm)
+
+    r = await c.post(f"/api/projects/{p['project_id']}/refine",
+                     json={"message": "把天台环境写得更具体"})
+    assert r.status_code == 422, r.text
+    assert r.json()["detail"]["code"] == "refine_no_meaningful_change"
+    await assert_project_untouched(c, api, p)
+    current = (await c.get(f"/api/projects/{p['project_id']}")).json()
+    assert current["scenes"][0]["id"] == "sd_roof"
 
 
 def test_cli_generate_does_not_touch_web_database(tmp_path, monkeypatch):

@@ -24,6 +24,7 @@ from script_weaver.core.refinement import (
 )
 from script_weaver.core.types import (
     BasicInfo,
+    Character,
     DecisionRecord,
     Outline,
     ProjectState,
@@ -581,6 +582,174 @@ def test_general_intact_references_still_pass():
     after.script.scenes[0].blocks[1].content["dialogue"] = "灯，不能灭。"
     changes = refinement.validate_general_result(before, after, "scriptwriter")
     assert len(changes) == 1
+
+
+# ── Review round 3: stable defect identity ────────────────────
+
+
+def _with_designs(state: ProjectState) -> ProjectState:
+    """Attach scene designs: sc_1→old_missing (historical defect), sc_2→sd_ok."""
+    out = state.model_copy(deep=True)
+    out.scenes = [SceneDesign(id="sd_ok", name="码头", environment="夜色中的码头")]
+    out.script.scenes[0].scene_design_id = "old_missing"
+    out.script.scenes[1].scene_design_id = "sd_ok"
+    return out
+
+
+def test_historical_design_defect_reorder_does_not_block_unrelated_edit():
+    """A pre-existing dangling design ref that moves with its owner (the
+    scene is reordered) is the same defect — it must not block a real edit."""
+    before = _with_designs(sample_state())
+    after = before.model_copy(deep=True)
+    after.script.scenes.reverse()  # sc_1 (old_missing) moves to index 1
+    after.script.scenes[0].blocks[1].content["dialogue"] = "请一定记住今晚。"
+    changes = refinement.validate_general_result(before, after, "scriptwriter")
+    assert any(c.path.endswith("dialogue") for c in changes)
+
+
+def test_historical_shot_defect_reorder_does_not_block_storyboard_edit():
+    """Same rule on the storyboard→script relation: shot_2's historical
+    dangling scene ref stays historical when the shots are reordered."""
+    before = _with_highlights(sample_state())
+    before.storyboard.shots[1].scene_id = "sc_missing"
+    after = before.model_copy(deep=True)
+    after.storyboard.shots.reverse()  # shot_2 (defect) moves to index 0
+    after.storyboard.shots[0].visual_description = "新的画面描述"
+    changes = refinement.validate_general_result(before, after, "storyboard_artist")
+    assert any(c.path.endswith("visual_description") for c in changes)
+
+
+def test_related_shot_ids_reorder_keeps_historical_exemption():
+    """A highlight's related_shot_ids list reorder is not a new reference:
+    identity follows the highlight ID and the referenced value, not the
+    position inside the list."""
+    before = _with_highlights(sample_state())
+    before.visual_highlights[0].related_shot_ids = ["shot_missing", "shot_1"]
+    after = before.model_copy(deep=True)
+    after.visual_highlights[0].related_shot_ids = ["shot_1", "shot_missing"]
+    after.script.scenes[0].blocks[1].content["dialogue"] = "灯，不能灭。"
+    changes = refinement.validate_general_result(before, after, "scriptwriter")
+    assert any(c.path.endswith("dialogue") for c in changes)
+
+
+def test_repair_one_break_other_at_same_index_is_rejected():
+    """The reviewed leak: fix sc_1's ref while breaking sc_2's — after a
+    swap both snapshots show a dangling ref at scenes[0], but sc_2's is a
+    new defect and must fail the request."""
+    before = _with_designs(sample_state())
+    after = before.model_copy(deep=True)
+    after.script.scenes.reverse()
+    after.script.scenes[0].scene_design_id = "new_missing"  # sc_2 breaks
+    after.script.scenes[1].scene_design_id = "sd_ok"        # sc_1 repaired
+    after.script.scenes[0].blocks[1].content["dialogue"] = "请一定记住今晚。"
+    with pytest.raises(RefineConstraintFailed) as exc:
+        refinement.validate_general_result(before, after, "scriptwriter")
+    assert "scene_design_id" in str(exc.value)
+
+
+def test_same_object_new_dangling_value_is_a_new_defect():
+    """old_missing → new_missing on the same scene is a new broken
+    reference, not the historical one under a different name."""
+    before = _with_designs(sample_state())
+    after = before.model_copy(deep=True)
+    after.script.scenes[0].scene_design_id = "new_missing"
+    after.script.scenes[0].blocks[1].content["dialogue"] = "灯，不能灭。"
+    with pytest.raises(RefineConstraintFailed):
+        refinement.validate_general_result(before, after, "scriptwriter")
+
+
+def test_duplicate_owner_id_cannot_borrow_historical_exemption():
+    """A second object sharing sc_1's ID adds a second bad reference —
+    local counting, not mere presence, decides the exemption."""
+    before = _with_designs(sample_state())
+    before.storyboard.shots[0].scene_id = ""  # isolate: no shot refs sc_1
+    after = before.model_copy(deep=True)
+    extra = after.script.scenes[0].model_copy(deep=True)  # same scene_id sc_1
+    after.script.scenes.append(extra)
+    after.script.scenes[0].blocks[1].content["dialogue"] = "请一定记住今晚。"
+    with pytest.raises(RefineConstraintFailed):
+        refinement.validate_general_result(before, after, "scriptwriter")
+
+
+def test_new_object_cannot_borrow_historical_exemption():
+    """A freshly added scene with its own dangling ref is new, even though
+    an identical-looking historical defect already exists elsewhere."""
+    before = _with_designs(sample_state())
+    after = before.model_copy(deep=True)
+    extra = after.script.scenes[1].model_copy(deep=True)
+    extra.scene_id = "sc_new"
+    extra.scene_design_id = "old_missing"  # same target value, new owner
+    after.script.scenes.append(extra)
+    after.script.scenes[0].blocks[1].content["dialogue"] = "灯，不能灭。"
+    with pytest.raises(RefineConstraintFailed):
+        refinement.validate_general_result(before, after, "scriptwriter")
+
+
+# ── Review round 3: character/scene-design ID rebuilds ─────────
+
+
+def test_character_and_scene_design_id_rebuild_alone_is_not_substantive():
+    """Character.id / SceneDesign.id regenerate when the model omits them;
+    the echo is otherwise identical, so nothing substantive changed."""
+    before = sample_state()
+    before.characters = [Character(id="char_1", name="阿芸", personality="坚韧")]
+    before.scenes = [SceneDesign(id="sd_1", name="天台", environment="夜风中的天台")]
+    after = before.model_copy(deep=True)
+    after.characters[0].id = "char_regenerated"
+    after.scenes[0].id = "sd_regenerated"
+    assert refinement.diff_field_changes(before, after) == []
+
+
+def test_character_and_scene_design_id_rebuild_is_visible_to_strict_diff():
+    before = sample_state()
+    before.characters = [Character(id="char_1", name="阿芸", personality="坚韧")]
+    before.scenes = [SceneDesign(id="sd_1", name="天台", environment="夜风中的天台")]
+    after = before.model_copy(deep=True)
+    after.characters[0].id = "char_regenerated"
+    after.scenes[0].id = "sd_regenerated"
+    paths = {c.path for c in refinement.diff_field_changes(before, after, strict=True)}
+    assert paths == {"characters[0].id", "scenes[0].id"}
+
+
+def test_general_character_id_only_rebuild_is_no_meaningful_change():
+    before = sample_state()
+    before.characters = [Character(id="char_1", name="阿芸", personality="坚韧")]
+    after = before.model_copy(deep=True)
+    after.characters[0].id = "char_regenerated"
+    with pytest.raises(RefineNoMeaningfulChange):
+        refinement.validate_general_result(before, after, "character_designer")
+
+
+def test_general_scene_design_id_only_rebuild_is_no_meaningful_change():
+    before = sample_state()
+    before.scenes = [SceneDesign(id="sd_1", name="天台", environment="夜风中的天台")]
+    after = before.model_copy(deep=True)
+    after.scenes[0].id = "sd_regenerated"
+    with pytest.raises(RefineNoMeaningfulChange):
+        refinement.validate_general_result(before, after, "scene_designer")
+
+
+def test_general_character_content_change_with_kept_id_succeeds():
+    """Positive control: a real personality edit with the ID intact is a
+    legitimate characters refinement — the exclusion must not hide it."""
+    before = sample_state()
+    before.characters = [Character(id="char_1", name="阿芸", personality="坚韧")]
+    after = before.model_copy(deep=True)
+    after.characters[0].personality = "外冷内热，坚韧"
+    changes = refinement.validate_general_result(before, after, "character_designer")
+    assert [c.path for c in changes] == ["characters[0].personality"]
+
+
+def test_general_scene_design_content_change_with_reference_intact_succeeds():
+    """Positive control: a real environment edit on a referenced design
+    (ID kept) still passes both the diff and the integrity check."""
+    before = sample_state()
+    before.scenes = [SceneDesign(id="sd_1", name="天台", environment="夜风中的天台")]
+    before.script.scenes[0].scene_design_id = "sd_1"
+    after = before.model_copy(deep=True)
+    after.scenes[0].environment = "夜风中的天台，加了旗杆"
+    changes = refinement.validate_general_result(before, after, "scene_designer")
+    assert [c.path for c in changes] == ["scenes[0].environment"]
 
 
 @pytest.mark.parametrize(

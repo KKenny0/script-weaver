@@ -12,6 +12,7 @@ never claim a modification the saved content does not contain.
 
 from __future__ import annotations
 
+import collections
 import dataclasses
 import json
 from typing import Any
@@ -217,9 +218,14 @@ def locate_last_dialogue(state: ProjectState) -> DialogueTarget:
 # are not evidence of a substantive edit. The paths are surgical — known
 # model fields only — so a "notes"-alike key anywhere else in an artifact
 # still counts as a real change and cannot smuggle a no-op past validation.
+# The auto-ID entries cover every creative-model ID field with a
+# default_factory: script scene, storyboard shot, visual highlight,
+# character and scene-design IDs.
 _EVIDENCE_EXCLUDED_PATHS: tuple[tuple[Any, ...], ...] = (
     ("script", "notes"),
     ("storyboard", "notes"),
+    ("characters", "*", "id"),
+    ("scenes", "*", "id"),
     ("script", "scenes", "*", "scene_id"),
     ("script", "scenes", "*", "scene_design_id"),
     ("storyboard", "shots", "*", "shot_id"),
@@ -342,6 +348,32 @@ def validate_general_result(
 # storyboard shots. IDs and references are exact strings — a whitespace-
 # padded or rebuilt ID is a different key and breaks the lookup.
 
+_REL_SHOT_TO_SCENE = "storyboard.shots.scene_id"
+_REL_SCENE_TO_DESIGN = "script.scenes.scene_design_id"
+_REL_HIGHLIGHT_TO_SHOT = "visual_highlights.related_shot_ids"
+
+
+@dataclasses.dataclass(frozen=True)
+class ReferenceDefect:
+    """One dangling or ambiguous reference, keyed by stable content.
+
+    ``identity`` — the relation, the owning object's stable ID, the raw
+    referenced value and the defect kind — is what the before/after
+    comparison uses. Array positions live only in ``path``, the display
+    string, so a reorder can neither mint nor pardon a defect and a
+    defect that moves with its owner stays historical.
+    """
+
+    relation: str
+    owner_id: str
+    target: str
+    kind: str
+    path: str
+
+    @property
+    def identity(self) -> tuple[str, str, str, str]:
+        return (self.relation, self.owner_id, self.target, self.kind)
+
 
 def _duplicates(values: list[str]) -> set[str]:
     seen: set[str] = set()
@@ -353,14 +385,16 @@ def _duplicates(values: list[str]) -> set[str]:
     return duplicated
 
 
-def _reference_violations(state: ProjectState) -> set[tuple[str, str]]:
-    """(reference path, kind) pairs for dangling or ambiguous references.
+def _reference_defects(state: ProjectState) -> list[ReferenceDefect]:
+    """All dangling or ambiguous references in a snapshot.
 
-    Empty optional references mean "unlinked" per the existing model
-    semantics and are skipped; duplicate keys make references to them
-    ambiguous.
+    Owning objects are matched by their own stable IDs (shot_id, the
+    script scene's scene_id, the highlight's id); empty optional
+    references mean "unlinked" per the existing model semantics and are
+    skipped; duplicate keys make references to them ambiguous. Values are
+    raw — no normalization.
     """
-    violations: set[tuple[str, str]] = set()
+    defects: list[ReferenceDefect] = []
 
     scene_ids = [s.scene_id for s in state.script.scenes] if state.script else []
     scene_id_dups = _duplicates(scene_ids)
@@ -368,11 +402,17 @@ def _reference_violations(state: ProjectState) -> set[tuple[str, str]]:
         for index, shot in enumerate(state.storyboard.shots):
             if not shot.scene_id:
                 continue
-            path = f"storyboard.shots[{index}].scene_id"
             if shot.scene_id in scene_id_dups:
-                violations.add((path, "ambiguous"))
+                kind = "ambiguous"
             elif shot.scene_id not in set(scene_ids):
-                violations.add((path, "dangling"))
+                kind = "dangling"
+            else:
+                continue
+            defects.append(ReferenceDefect(
+                relation=_REL_SHOT_TO_SCENE, owner_id=shot.shot_id,
+                target=shot.scene_id, kind=kind,
+                path=f"storyboard.shots[{index}].scene_id",
+            ))
 
     design_ids = [s.id for s in (state.scenes or [])]
     design_dups = _duplicates(design_ids)
@@ -380,11 +420,17 @@ def _reference_violations(state: ProjectState) -> set[tuple[str, str]]:
         for index, scene in enumerate(state.script.scenes):
             if not scene.scene_design_id:
                 continue
-            path = f"script.scenes[{index}].scene_design_id"
             if scene.scene_design_id in design_dups:
-                violations.add((path, "ambiguous"))
+                kind = "ambiguous"
             elif scene.scene_design_id not in set(design_ids):
-                violations.add((path, "dangling"))
+                kind = "dangling"
+            else:
+                continue
+            defects.append(ReferenceDefect(
+                relation=_REL_SCENE_TO_DESIGN, owner_id=scene.scene_id,
+                target=scene.scene_design_id, kind=kind,
+                path=f"script.scenes[{index}].scene_design_id",
+            ))
 
     shot_ids = [s.shot_id for s in state.storyboard.shots] if state.storyboard else []
     shot_dups = _duplicates(shot_ids)
@@ -392,27 +438,42 @@ def _reference_violations(state: ProjectState) -> set[tuple[str, str]]:
         for ref_index, ref in enumerate(highlight.related_shot_ids):
             if not ref:
                 continue
-            path = f"visual_highlights[{index}].related_shot_ids[{ref_index}]"
             if ref in shot_dups:
-                violations.add((path, "ambiguous"))
+                kind = "ambiguous"
             elif ref not in set(shot_ids):
-                violations.add((path, "dangling"))
+                kind = "dangling"
+            else:
+                continue
+            defects.append(ReferenceDefect(
+                relation=_REL_HIGHLIGHT_TO_SHOT, owner_id=highlight.id,
+                target=ref, kind=kind,
+                path=f"visual_highlights[{index}].related_shot_ids[{ref_index}]",
+            ))
 
-    return violations
+    return defects
 
 
 def validate_reference_integrity(before: ProjectState, after: ProjectState) -> None:
     """Reject references this modification newly breaks.
 
-    Pre-existing defects (already present in the before snapshot) do not
-    block unrelated edits — only violations the modification introduces
-    fail the request. The check is independent of the evidence diff's
+    Defects are compared by stable identity with local counting: a
+    pre-existing defect neither blocks unrelated edits nor pardons a new
+    one. Moving with its owner keeps it historical, while a rebuilt
+    target value, a defect on a different object (even at an index an old
+    defect used to occupy), or a second object hiding behind a duplicated
+    owner ID are all new. The check is independent of the evidence diff's
     ID/reference exclusions, IDs are never rewritten or guessed on the
     model's behalf, and no downstream artifact is dropped to "fix" a link.
     """
-    new_violations = _reference_violations(after) - _reference_violations(before)
-    if new_violations:
-        shown = ", ".join(f"{path}({kind})" for path, kind in sorted(new_violations)[:5])
+    before_counts = collections.Counter(d.identity for d in _reference_defects(before))
+    after_defects = _reference_defects(after)
+    after_counts = collections.Counter(d.identity for d in after_defects)
+    new_displays = [
+        f"{d.path}({d.kind})" for d in after_defects
+        if after_counts[d.identity] > before_counts.get(d.identity, 0)
+    ]
+    if new_displays:
+        shown = ", ".join(list(dict.fromkeys(new_displays))[:5])
         raise RefineConstraintFailed(f"修改破坏了引用完整性: {shown}，修改未应用")
 
 
