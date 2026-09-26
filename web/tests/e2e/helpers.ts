@@ -262,6 +262,90 @@ export async function sseDispatch(
   );
 }
 
+/** Write a full card-editing playground (ticket #16) via the store:
+ * two characters, two scenes, a one-scene script, `shotCount` shots of 2s
+ * each and one highlight. No model involved. Returns the stable ids.
+ */
+export async function seedCardsProject(
+  projectId: string,
+  shotCount = 2,
+): Promise<void> {
+  const { execFile } = await import("node:child_process");
+  const script = `
+import sys
+from pathlib import Path
+from script_weaver.core.project_store import ProjectStore
+from script_weaver.core.types import (
+    Character, SceneDesign, Script, ScriptScene, ScriptSceneHeading,
+    ScriptBlock, ScriptBlockType, Shot, Storyboard, VisualHighlight,
+    ProjectStatus,
+)
+pid, shot_count = sys.argv[1], int(sys.argv[2])
+store = ProjectStore(Path("/tmp/script-weaver-e2e-data/main-web/projects.sqlite3"))
+rec = store.get_required(pid)
+s = rec.state
+s.meta.status = ProjectStatus.COMPLETE
+s.characters = [
+    Character(id="char_e2e_01", name="阿芸", role="protagonist",
+              appearance="二十岁出头的守灯人", personality="倔强",
+              costume_description="深蓝色粗布衣", key_props=["马灯"],
+              motivation="让灯不灭", relationship_map={"陈叔": "师徒"},
+              image_prompt="portrait of a keeper"),
+    Character(id="char_e2e_02", name="陈叔", role="supporting",
+              motivation="帮阿芸"),
+]
+s.scenes = [
+    SceneDesign(id="scene_e2e_01", name="灯塔顶层", location_type="interior",
+                environment="狭窄的圆形灯室", time_of_day="深夜",
+                weather="暴雨", mood="紧张", lighting_description="一盏马灯",
+                color_palette=["#0B1020"], key_elements=["旋转灯组"],
+                image_prompt="lamp room interior"),
+    SceneDesign(id="scene_e2e_02", name="礁石滩", location_type="exterior"),
+]
+s.script = Script(
+    title="夜行灯塔",
+    scenes=[ScriptScene(
+        scene_id="sc_e2e_1",
+        heading=ScriptSceneHeading(location="灯塔顶层", time_of_day="夜"),
+        blocks=[ScriptBlock(block_type=ScriptBlockType.ACTION,
+                            content={"description": "阿芸握紧马灯。"})],
+    )],
+)
+s.storyboard = Storyboard(shots=[
+    Shot(shot_id=f"shot_e2e_{i:02d}", scene_id="sc_e2e_1", sequence_number=i,
+         shot_size="medium_shot", camera_angle="eye_level",
+         camera_movement="static", visual_description=f"第{i}个镜头画面",
+         duration_seconds=2, transition_to_next="cut",
+         video_prompt=f"镜头{i}的视频提示词")
+    for i in range(1, shot_count + 1)
+])
+s.storyboard.compute_totals()
+s.visual_highlights = [VisualHighlight(id="vh_e2e_1", title="灯不灭",
+                                       related_shot_ids=["shot_e2e_01"])]
+store.save_state(pid, s, rec.revision, source="manual", summary="e2e 卡片种子")
+store.close()
+`;
+  await new Promise<void>((resolve, reject) => {
+    execFile(
+      "../.venv/bin/python",
+      ["-c", script, projectId, String(shotCount)],
+      { cwd: process.cwd() },
+      (err) => (err ? reject(err) : resolve()),
+    );
+  });
+}
+
+/** Read the current persisted project state straight from the isolated
+ * backend (assertions stay in the spec). */
+export async function fetchProject(
+  request: APIRequestContext,
+  projectId: string,
+): Promise<any> {
+  const res = await request.get(`http://127.0.0.1:8310/api/projects/${projectId}`);
+  if (!res.ok()) throw new Error(`fetchProject failed: ${res.status()}`);
+  return res.json();
+}
+
 /**
  * Collect real page requests to model-bound endpoints. With the SSE stub
  * installed and refine calls gated, this must stay empty for every e2e

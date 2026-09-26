@@ -394,3 +394,232 @@
   border-color: var(--brand-primary);
   box-shadow: 0 0 0 3px var(--brand-soft);
 }
+
+/* ══ Ticket #16: single-card editing ══════════ */
+
+/* Card edit entry — small, keyboard-focusable, sits at the card's right edge */
+.card-edit-btn {
+  margin-left: 8px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 9px;
+  border-radius: 12px;
+  border: 1px solid var(--border-default);
+  background: var(--bg-surface);
+  color: var(--text-secondary);
+  font-size: 11px;
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: all 0.15s ease;
+}
+.card-edit-btn:hover {
+  border-color: var(--brand-primary);
+  color: var(--brand-primary);
+  background: var(--brand-soft);
+}
+.card-edit-btn:focus-visible {
+  outline: 2px solid var(--brand-primary);
+  outline-offset: 2px;
+}
+
+/* Review banner — conservative "needs review" facts after a card save */
+.review-banner {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 10px 14px;
+  margin-bottom: 14px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--warning);
+  background: rgba(227, 165, 63, 0.08);
+  color: var(--text-primary);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+/* Right-side edit drawer on a native <dialog> */
+dialog.card-edit-drawer {
+  position: fixed;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  height: 100vh;
+  max-height: 100vh;
+  width: min(480px, 100vw);
+  max-width: 100vw;
+  margin: 0;
+  padding: 0;
+  border: 1px solid var(--border-default);
+  border-right: none;
+  border-radius: 0;
+  background: var(--bg-surface);
+  color: var(--text-primary);
+  box-shadow: var(--shadow-lg);
+}
+dialog.card-edit-drawer::backdrop {
+  background: rgba(4, 8, 18, 0.55);
+}
+:root[data-theme="light"] dialog.card-edit-drawer::backdrop {
+  background: rgba(20, 28, 45, 0.30);
+}
+
+.ced-shell {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-width: 0;
+}
+.ced-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 16px 20px 12px;
+  border-bottom: 1px solid var(--border-default);
+  background: var(--bg-surface-2);
+  flex-shrink: 0;
+}
+.ced-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 16px 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.ced-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 12px 20px;
+  border-top: 1px solid var(--border-default);
+  background: var(--bg-surface-2);
+  flex-shrink: 0;
+}
+
+.ced-field { display: flex; flex-direction: column; }
+.ced-label {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-secondary);
+  margin-bottom: 4px;
+}
+.ced-input,
+.ced-select,
+.ced-textarea {
+  width: 100%;
+  padding: 8px 10px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-default);
+  background: var(--bg-surface-2);
+  color: var(--text-primary);
+  font-size: 13px;
+  font-family: inherit;
+  outline: none;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+.ced-textarea { resize: vertical; min-height: 56px; line-height: 1.5; }
+.ced-input:focus,
+.ced-select:focus,
+.ced-textarea:focus {
+  border-color: var(--brand-primary);
+  box-shadow: 0 0 0 3px var(--brand-soft);
+}
+.ced-input:disabled,
+.ced-select:disabled,
+.ced-textarea:disabled { opacity: 0.55; cursor: not-allowed; }
+
+.ced-list-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 6px;
+}
+.ced-icon-btn {
+  width: 28px;
+  height: 28px;
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--radius-sm);
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--text-tertiary);
+  cursor: pointer;
+}
+.ced-icon-btn:hover:not(:disabled) { color: var(--error); background: rgba(240, 106, 122, 0.10); }
+.ced-add-btn {
+  align-self: flex-start;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 10px;
+  font-size: 12px;
+  border-radius: var(--radius-sm);
+  border: 1px dashed var(--border-default);
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+.ced-add-btn:hover:not(:disabled) { border-color: var(--brand-primary); color: var(--brand-primary); }
+
+.ced-ro {
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  padding: 10px 12px;
+  background: var(--bg-surface-2);
+}
+.ced-ro-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  font-size: 12px;
+  padding: 3px 0;
+}
+.ced-ro-row span:first-child { color: var(--text-tertiary); flex-shrink: 0; }
+.ced-ro-row span:last-child { color: var(--text-secondary); font-family: monospace; }
+
+.ced-notice {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 10px 12px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border-default);
+  background: var(--bg-surface-3);
+  font-size: 13px;
+}
+.ced-notice-error {
+  border-color: var(--error);
+  background: rgba(240, 106, 122, 0.08);
+}
+.ced-notice-actions {
+  display: inline-flex;
+  gap: 6px;
+  align-items: center;
+  margin-left: auto;
+}
+
+.ced-confirm {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: rgba(4, 8, 18, 0.45);
+  z-index: 2;
+}
+.ced-confirm-card {
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-lg);
+  padding: 20px;
+  width: 100%;
+  max-width: 320px;
+  box-shadow: var(--shadow-md);
+}

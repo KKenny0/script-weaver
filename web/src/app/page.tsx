@@ -7,6 +7,11 @@ import ArtifactPanel from "./components/ArtifactPanel";
 import ProjectList, { ProjectSummary } from "./components/ProjectList";
 import { HistoryPanelState, VersionSnapshot } from "./components/VersionHistory";
 import { ArtifactData } from "./components/ArtifactContent";
+import CardEditDrawer, {
+  CardEditSession,
+  CardKind,
+  SaveCardResult,
+} from "./components/CardEditDrawer";
 
 const API = "/api";
 
@@ -46,6 +51,37 @@ function projectHasArtifacts(s: any): boolean {
   );
 }
 
+// ── Card editing (ticket #16) ────────────────────
+
+function findCard(
+  data: ArtifactData | any,
+  kind: CardKind,
+  id: string,
+): Record<string, any> | null {
+  if (kind === "characters")
+    return (data.characters || []).find((c: any) => c.id === id) ?? null;
+  if (kind === "scenes")
+    return (data.scenes || []).find((s: any) => s.id === id) ?? null;
+  return ((data.storyboard as any)?.shots || []).find((s: any) => s.shot_id === id) ?? null;
+}
+
+const REVIEW_ARTIFACT_LABELS: Record<string, string> = {
+  script: "剧本",
+  storyboard: "分镜",
+  visual_highlights: "影像亮点",
+};
+
+function buildReviewNotice(payload: any): string | null {
+  const flags: any[] = payload?.review?.review_flags || [];
+  const artifacts = [...new Set(flags.map((f) => REVIEW_ARTIFACT_LABELS[f.artifact] || f.artifact))];
+  const base = `已保存为 r${payload.revision}。`;
+  if (artifacts.length === 0) return base;
+  return (
+    `${base}因本次手工编辑，以下已有内容被保守标记为「待复核」：${artifacts.join("、")}` +
+    `（原因：上游内容被直接修改；是否沿用待后续确认，不自动重生成）。`
+  );
+}
+
 interface SessionNotice {
   epoch: number;
   text: string;
@@ -75,6 +111,11 @@ export default function HomePage() {
   // panel re-checks run state (keeping a live observation intact).
   const [projectOpenEpoch, setProjectOpenEpoch] = useState(0);
   const [historyPanel, setHistoryPanel] = useState<HistoryPanelState>(HISTORY_CLOSED);
+  // The revision of the content currently DISPLAYED — the basis every card
+  // edit session opens from.
+  const [projectRevision, setProjectRevision] = useState(0);
+  const [editSession, setEditSession] = useState<CardEditSession | null>(null);
+  const [reviewNotice, setReviewNotice] = useState<string | null>(null);
 
   // Late-response guard: async handlers compare against the project that is
   // open *now*, so a response for a previously selected project can never
@@ -90,6 +131,12 @@ export default function HomePage() {
   // Set by ChatPanel; closing the stream ends the subscription only (the
   // backend owns the task).
   const closeStreamRef = useRef<() => void>(() => {});
+  // Every editor open mints a fresh session id: a remounted drawer can never
+  // inherit a previous session's draft, basis or in-flight save.
+  const editOpenSeqRef = useRef(0);
+  // Newest-wins token for card saves: a late response may only ever write
+  // the UI of the save intent (and project session) it belongs to.
+  const cardSaveReqRef = useRef(0);
 
   useEffect(() => {
     projectRef.current = projectId;
@@ -128,7 +175,11 @@ export default function HomePage() {
     const token = ++contentReqRef.current;
     try {
       const fullState = await apiGet(`/projects/${id}`);
-      return token === contentReqRef.current ? fullState : null;
+      if (token !== contentReqRef.current) return null;
+      // Whatever renders from this read is exactly revision N's content —
+      // card edits opened on it use this as their CAS basis.
+      setProjectRevision(fullState.revision);
+      return fullState;
     } catch (err) {
       if (token !== contentReqRef.current) return null;
       throw err;
@@ -152,6 +203,9 @@ export default function HomePage() {
     setActiveTab("outline");
     setProjectStatus("idle");
     setHistoryPanel(HISTORY_CLOSED);
+    setProjectRevision(0);
+    setEditSession(null);
+    setReviewNotice(null);
     historyReqRef.current++; // in-flight history responses belong to the old project
     window.history.replaceState(null, "", `/?project=${encodeURIComponent(id)}`);
     nextNotice("📂 正在打开项目…");
@@ -193,6 +247,9 @@ export default function HomePage() {
     setActiveTab("outline");
     setProjectStatus("idle");
     setHistoryPanel(HISTORY_CLOSED);
+    setProjectRevision(0);
+    setEditSession(null);
+    setReviewNotice(null);
     historyReqRef.current++;
     window.history.replaceState(null, "", "/");
     nextNotice("🆕 已开始一个新项目，输入故事想法开始生成。");
@@ -309,6 +366,117 @@ export default function HomePage() {
     setHistoryPanel(HISTORY_CLOSED);
   }, []);
 
+  // ── Card editing (ticket #16) ────────────────────
+
+  const handleEditCard = useCallback((kind: CardKind, id: string) => {
+    const pid = projectRef.current;
+    if (!pid) return;
+    const card = findCard(artifactData, kind, id);
+    if (!card) return;
+    editOpenSeqRef.current += 1;
+    setReviewNotice(null);
+    setEditSession({
+      seq: editOpenSeqRef.current,
+      projectId: pid,
+      kind,
+      id,
+      // The draft's immutable basis: what the user sees is what they edit.
+      revision: projectRevision,
+      snapshot: card,
+    });
+  }, [artifactData, projectRevision]);
+
+  const handleSaveCard = useCallback(
+    async (
+      kind: CardKind,
+      id: string,
+      changes: Record<string, unknown>,
+      expectedRevision: number,
+    ): Promise<SaveCardResult> => {
+      const pid = projectRef.current;
+      if (!pid) return { type: "superseded" };
+      const token = ++cardSaveReqRef.current;
+      try {
+        const res = await fetch(
+          `${API}/projects/${pid}/artifacts/${kind}/${encodeURIComponent(id)}`,
+          {
+            method: "PATCH",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ changes, expected_revision: expectedRevision }),
+          },
+        );
+        // A→B→A guard: only the newest save of the CURRENT project session
+        // may react to a response — and only inside that session.
+        if (token !== cardSaveReqRef.current || projectRef.current !== pid) {
+          return { type: "superseded" };
+        }
+        const body = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          const message = extractError(body, `HTTP ${res.status}`);
+          const detail = body?.detail;
+          if (res.status === 409) {
+            return {
+              type: "conflict",
+              message,
+              currentRevision: typeof detail?.current_revision === "number"
+                ? detail.current_revision
+                : null,
+            };
+          }
+          if (res.status === 422) return { type: "invalid", message };
+          return { type: "error", message };
+        }
+        return { type: "saved", changed: !!body.changed, payload: body };
+      } catch (err: any) {
+        if (token !== cardSaveReqRef.current || projectRef.current !== pid) {
+          return { type: "superseded" };
+        }
+        return { type: "error", message: err?.message || "网络请求失败，修改未保存" };
+      }
+    },
+    [],
+  );
+
+  const handleCardSaved = useCallback((payload: any) => {
+    const pid = projectRef.current;
+    if (!pid || payload?.project_id !== pid) return;
+    // The server snapshot is the truth: adopt it wholesale and move the
+    // displayed revision so the next edit opens on the saved basis.
+    setArtifactData(pickArtifactData(payload));
+    setProjectRevision(payload.revision);
+    setReviewNotice(buildReviewNotice(payload));
+    setEditSession(null);
+    refreshProjects();
+    if (historyPanel.open) refreshHistory(pid);
+  }, [refreshProjects, historyPanel.open, refreshHistory]);
+
+  const handleReloadLatestCard = useCallback(async (kind: CardKind, id: string) => {
+    const pid = projectRef.current;
+    if (!pid) return;
+    try {
+      const fullState = await refreshProjectContent(pid);
+      if (!fullState || projectRef.current !== pid) return;
+      const card = findCard(fullState, kind, id);
+      if (!card) {
+        // The card vanished from the latest content — nothing to edit.
+        setEditSession(null);
+        nextNotice("该卡片在最新内容中已不存在，已关闭编辑面板。");
+        return;
+      }
+      editOpenSeqRef.current += 1;
+      setEditSession({
+        seq: editOpenSeqRef.current,
+        projectId: pid,
+        kind,
+        id,
+        revision: fullState.revision,
+        snapshot: card,
+      });
+    } catch (err: any) {
+      nextNotice(`❌ 载入最新内容失败: ${err.message}`);
+    }
+  }, [refreshProjectContent, nextNotice]);
+
   // On mount the URL decides which project is open, so a refresh restores it.
   useEffect(() => {
     if (typeof window !== "undefined" && window.innerWidth < 1280) {
@@ -393,6 +561,9 @@ export default function HomePage() {
         activeTab={activeTab}
         onTabChange={setActiveTab}
         onCollapse={collapseChat}
+        onEditCard={projectId ? handleEditCard : undefined}
+        reviewNotice={reviewNotice}
+        onDismissReviewNotice={() => setReviewNotice(null)}
         historyPanel={historyPanel}
         onOpenHistory={handleOpenHistory}
         onRefreshHistory={() => projectId && refreshHistory(projectId)}
@@ -400,6 +571,19 @@ export default function HomePage() {
         onBackToHistoryList={handleBackToHistoryList}
         onCloseHistory={handleCloseHistory}
       />
+
+      {/* Card edit drawer — keyed per open so a new session never inherits a
+          previous draft, basis or in-flight save. */}
+      {editSession && editSession.projectId === projectId && (
+        <CardEditDrawer
+          key={editSession.seq}
+          session={editSession}
+          onSave={handleSaveCard}
+          onSaved={handleCardSaved}
+          onDiscard={() => setEditSession(null)}
+          onReloadLatest={handleReloadLatestCard}
+        />
+      )}
     </div>
   );
 }
