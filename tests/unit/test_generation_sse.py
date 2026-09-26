@@ -1092,3 +1092,165 @@ async def test_progress_relay_persists_recoverable_last_progress(client):
         api._runtime.runs.unregister(run_id, queue)
     release.set()
     await await_terminal(api, run_id)
+
+
+# ── Review R3: the engine-initialization window (ticket #14) ──
+
+
+def _paused_engine(api, pipeline, engine_entered: asyncio.Event, release: asyncio.Event):
+    """Patch ``_get_engine`` with an engine whose initialization pauses on
+    ``release`` — the reviewer's window between admission and execution."""
+
+    async def paused_get_engine(pid, **kwargs):
+        record = api._runtime.store.get_required(pid)
+        engine = SimpleNamespace(run_full_pipeline=pipeline)
+        ctx = api._GenerationContext(
+            project_id=record.project_id,
+            revision=record.revision,
+            base_state_json=record.state_json,
+            state=record.state,
+            store=api._runtime.store,
+            auto_approve=record.auto_approve,
+            skill_bindings=record.skill_bindings,
+        )
+        engine_entered.set()
+        await release.wait()
+        return engine, ctx
+
+    api._get_engine = paused_get_engine
+
+
+async def test_stop_during_engine_initialization_never_runs_pipeline(client):
+    """Reviewer repro (absorbed): a stop that completes while the engine is
+    still being initialized must end the run for good — releasing the
+    initialization afterwards can never start the pipeline, the registry
+    stays clean, and a new intent on a fresh key still executes."""
+    api, c = client
+    p = await create_project(c, "初始化期停止故事")
+    engine_entered = asyncio.Event()
+    release = asyncio.Event()
+    called = asyncio.Event()
+
+    async def pipeline(**kwargs):  # pragma: no cover - must never run
+        called.set()
+        return state_with("初始化期停止故事", "大纲")
+
+    _paused_engine(api, pipeline, engine_entered, release)
+    submit_task = asyncio.create_task(
+        c.post(f"/api/projects/{p['project_id']}/generate", json={"request_key": "k"})
+    )
+    await engine_entered.wait()
+    run = api._runtime.store.latest_generation_run(p["project_id"])
+    assert run is not None and run.run_id
+
+    stop = await c.post(f"/api/projects/{p['project_id']}/runs/{run.run_id}/stop")
+    assert stop.status_code == 200
+    assert stop.json()["stopped"] is True
+    assert stop.json()["run"]["status"] == "cancelled"
+
+    # Release the paused initialization: nothing may start afterwards.
+    release.set()
+    submitted = await submit_task
+    assert submitted.status_code == 200
+    for _ in range(50):
+        if run.run_id not in api._runtime.runs._tasks:
+            break
+        await asyncio.sleep(0.02)
+    assert run.run_id not in api._runtime.runs._tasks
+    assert run.run_id not in api._runtime.runs._stop_events
+    assert not called.is_set()  # the pipeline/model was never entered
+    assert api._runtime.store.get_generation_run(run.run_id).status == "cancelled"
+
+    # A new intent on a fresh key executes normally afterwards.
+    release2 = asyncio.Event()
+
+    async def pipeline2(**kwargs):
+        await release2.wait()
+        return state_with("初始化期停止故事", "大纲")
+
+    scripted_engine(api, p["project_id"], pipeline2)
+    fresh = await c.post(
+        f"/api/projects/{p['project_id']}/generate", json={"request_key": "k2"}
+    )
+    assert fresh.status_code == 200 and fresh.json()["created"] is True
+    release2.set()
+    assert (await await_terminal(api, fresh.json()["run"]["run_id"]))["status"] == (
+        "succeeded"
+    )
+
+
+async def test_engine_initialization_failure_settles_failed_without_pipeline(client):
+    """Initialization failures (e.g. model not configured) are settled by
+    the run's own task: admission stays durable, the row lands failed with
+    the reason, the pipeline is never entered, and a resend stays
+    idempotent."""
+    api, c = client
+    p = await create_project(c, "初始化失败故事")
+
+    async def failing_engine(pid, **kwargs):
+        raise api.HTTPException(
+            400,
+            detail={"code": "model_not_configured", "message": "模型不可用: No API key"},
+        )
+
+    api._get_engine = failing_engine
+    submitted = await c.post(
+        f"/api/projects/{p['project_id']}/generate", json={"request_key": "k"}
+    )
+    assert submitted.status_code == 200  # admission is durable; the run reports the failure
+    assert submitted.json()["created"] is True
+    run_id = submitted.json()["run"]["run_id"]
+
+    outcome = await await_terminal(api, run_id)
+    assert outcome["status"] == "failed"
+    assert "生成无法启动" in outcome["error"]
+    assert "模型不可用" in outcome["error"]
+    assert not api._runtime.runs._tasks
+    assert api._runtime.store.active_generation_run(p["project_id"]) is None
+
+    # Resending the same request returns the failed run — no resurrection.
+    resend = await c.post(
+        f"/api/projects/{p['project_id']}/generate", json={"request_key": "k"}
+    )
+    assert resend.status_code == 200 and resend.json()["created"] is False
+    assert resend.json()["run"]["status"] == "failed"
+
+
+async def test_shutdown_during_engine_initialization_records_interrupted(api_factory):
+    """Shutting the service down while initialization is paused records the
+    run as interrupted — and releasing the pause afterwards still never
+    starts the pipeline."""
+    api = api_factory()
+    engine_entered = asyncio.Event()
+    release = asyncio.Event()
+    called = asyncio.Event()
+
+    async def pipeline(**kwargs):  # pragma: no cover - must never run
+        called.set()
+        return state_with("初始化期关机故事", "大纲")
+
+    _paused_engine(api, pipeline, engine_entered, release)
+    async with api.app.router.lifespan_context(api.app):
+        transport = httpx.ASGITransport(app=api.app, raise_app_exceptions=False)
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+            p = (await c.post("/api/projects", json={"user_input": "初始化期关机故事"})).json()
+            submit_task = asyncio.create_task(
+                c.post(
+                    f"/api/projects/{p['project_id']}/generate",
+                    json={"request_key": "k"},
+                )
+            )
+            await engine_entered.wait()
+            run = api._runtime.store.latest_generation_run(p["project_id"])
+            assert run is not None and run.run_id
+
+            await api._runtime.runs.shutdown()  # service shutdown mid-init
+            release.set()
+            submitted = await submit_task
+            assert submitted.status_code == 200
+
+            assert not api._runtime.runs._tasks
+            assert not called.is_set()
+            assert api._runtime.store.get_generation_run(run.run_id).status == (
+                "interrupted"
+            )

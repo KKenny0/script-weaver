@@ -318,14 +318,25 @@ async def test_generate_missing_model_returns_clear_error(client, monkeypatch):
 
     monkeypatch.setattr(api, "LLMClient", broken_llm)
 
+    # Ticket #14 review round: admission is durable and engine construction
+    # lives inside the run's server-owned task, so the submission itself
+    # succeeds and the unusable model fails the run immediately — a clear
+    # error through the run's own channel, never a silent active row.
     r = await c.post(f"/api/projects/{p['project_id']}/generate", json={})
-    assert r.status_code == 400
-    assert r.json()["detail"]["code"] == "model_not_configured"
+    assert r.status_code == 200
+    assert r.json()["created"] is True
+    run_id = r.json()["run"]["run_id"]
+    for _ in range(100):
+        run = api._runtime.store.latest_generation_run(p["project_id"])
+        assert run is not None
+        if run.status not in ("running", "stopping"):
+            break
+        await asyncio.sleep(0.02)
     # The admitted run can never start, so it settles failed immediately —
     # it never claims to be active and a resend of the same request cannot
     # resurrect it into a model call.
-    run = api._runtime.store.latest_generation_run(p["project_id"])
-    assert run is not None and run.status == "failed"
+    assert run.run_id == run_id
+    assert run.status == "failed"
     assert "模型不可用" in run.error
     assert api._runtime.store.active_generation_run(p["project_id"]) is None
     # The project itself remains openable without any model key.

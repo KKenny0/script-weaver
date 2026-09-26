@@ -141,9 +141,14 @@ export default function HomePage() {
     historyReqRef.current++; // in-flight history responses belong to the old project
     window.history.replaceState(null, "", `/?project=${encodeURIComponent(id)}`);
     nextNotice("📂 正在打开项目…");
+    // The session epoch captured right here is this open's identity: after
+    // an A→B→A round trip the project id matches again, but the FIRST open's
+    // late response belongs to a dead session and must not overwrite the
+    // second open's fresh content.
+    const epochAtStart = sessionEpochRef.current;
     try {
       const fullState = await apiGet(`/projects/${id}`);
-      if (projectRef.current !== id) return; // stale response, another project is open
+      if (projectRef.current !== id || !isSessionActive(epochAtStart)) return; // superseded open
       setArtifactData(pickArtifactData(fullState));
       // The backend reports "running" while a generation run is active for
       // the project — the run outlives any page view (ticket #14).
@@ -156,12 +161,12 @@ export default function HomePage() {
       );
       nextNotice(`📂 已打开项目「${fullState.meta?.title || id}」，可继续修改或导出。`);
     } catch (err: any) {
-      if (projectRef.current !== id) return;
+      if (projectRef.current !== id || !isSessionActive(epochAtStart)) return;
       setProjectStatus("error");
       nextNotice(`❌ 打开项目失败: ${err.message}`);
     }
     refreshProjects();
-  }, [nextNotice, refreshProjects]);
+  }, [nextNotice, refreshProjects, isSessionActive]);
 
   const startNewProject = useCallback(() => {
     closeStreamRef.current();

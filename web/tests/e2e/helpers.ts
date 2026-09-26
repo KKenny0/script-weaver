@@ -343,16 +343,16 @@ store.close()
 /** Seed a generation-run row directly (no model needed) and return its id.
  *
  * Status "running" makes the page resubscribe on open (ticket #14 restore);
- * terminal statuses surface as a one-shot notice instead.
+ * terminal statuses surface through the unified outcome-restore path.
  */
 export async function seedRun(
   projectId: string,
-  status: "running" | "failed" | "succeeded",
+  status: "running" | "failed" | "succeeded" | "cancelled" | "interrupted",
   progress?: { message: string; completedSteps?: string[] },
 ): Promise<string> {
   const { execFile } = await import("node:child_process");
   const script = `
-import json, sys
+import json, sys, uuid
 from pathlib import Path
 from script_weaver.core.project_store import ProjectStore
 pid, status = sys.argv[1], sys.argv[2]
@@ -360,7 +360,7 @@ progress = json.loads(sys.argv[3]) if len(sys.argv) > 3 and sys.argv[3] else Non
 store = ProjectStore(Path("/tmp/script-weaver-e2e-data/main-web/projects.sqlite3"))
 rec = store.get_required(pid)
 run = store.create_generation_run(
-    pid, kind="generate", request_key=f"seed-{status}-{pid[:6]}",
+    pid, kind="generate", request_key=f"seed-{status}-{uuid.uuid4().hex[:8]}",
     request={"user_input": rec.state.user_input, "auto_approve": True},
     base_revision=rec.revision, base_state_json=rec.state_json,
     checkpoint_json=rec.state_json)
@@ -384,6 +384,33 @@ store.close()
     );
   });
   return (JSON.parse(stdout) as { run_id: string }).run_id;
+}
+
+/** Move a seeded run to another status (e.g. it "finished" while the page
+ * was disconnected). No model call — a direct store write. */
+export async function updateRunStatus(
+  runId: string,
+  status: "succeeded" | "cancelled" | "failed" | "interrupted",
+  error?: string,
+): Promise<void> {
+  const { execFile } = await import("node:child_process");
+  const script = `
+import sys
+from pathlib import Path
+from script_weaver.core.project_store import ProjectStore
+run_id, status, error = sys.argv[1], sys.argv[2], (sys.argv[3] or None)
+store = ProjectStore(Path("/tmp/script-weaver-e2e-data/main-web/projects.sqlite3"))
+store.update_generation_run(run_id, status=status, error=error)
+store.close()
+`;
+  await new Promise<void>((resolve, reject) => {
+    execFile(
+      "../.venv/bin/python",
+      ["-c", script, runId, status, error ?? ""],
+      { cwd: process.cwd() },
+      (err) => (err ? reject(err) : resolve()),
+    );
+  });
 }
 
 /** Write script + storyboard (Chinese, one >200-char prompt) via the store.

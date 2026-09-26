@@ -49,6 +49,7 @@ from script_weaver.core.project_store import (
     DataDirLock,
     DataDirLockError,
     GenerationRun,
+    ProjectNotFoundError,
     ProjectRecord,
     ProjectStore,
     ProjectStoreError,
@@ -353,8 +354,12 @@ class _RunManager:
         runs in every status: same key + same snapshot returns the original
         run without ever building a model instance; same key + different
         snapshot is a conflict; any other active run makes the project busy.
-        Only a genuinely created run builds the engine (a 400 model answer
-        immediately fails that row — no second submission can resurrect it).
+        A genuinely created run registers its task INSIDE the same project
+        lock — from the moment the row exists, a cancellable task owns it
+        through initialization to the terminal state (engine construction
+        happens in the task, so a stop during it cancels the run for good).
+        The response is re-read after registration: it reports the run's
+        current state, never the admission-time snapshot.
         """
         try:
             record = await asyncio.to_thread(self.store.get_required, project_id)
@@ -398,25 +403,16 @@ class _RunManager:
                 ) from exc
             if not created:
                 return run, False
-            relay = _ProgressRelay(self)
-            relay.run_id = run.run_id
-            try:
-                engine, ctx = await _get_engine(project_id, progress_callback=relay)
-            except HTTPException as exc:
-                # The admitted run can never start: settle it failed so the
-                # row never claims to be active, then surface the reason.
-                detail = exc.detail
-                message = detail.get("message", str(detail)) if isinstance(detail, dict) else str(detail)
-                with suppress(ProjectStoreError):
-                    await asyncio.to_thread(
-                        self.store.settle_generation_run,
-                        run.run_id,
-                        status="failed",
-                        error=f"生成无法启动：{message}",
-                    )
-                raise
-            self._spawn(run.run_id, engine, ctx)
-            return run, True
+            # Registration joins admission under the project lock: a stop
+            # coordinates through the same lock, so there is no window in
+            # which a persisted run has no cancellable task behind it.
+            self._spawn(run.run_id)
+        # Report the run's CURRENT state: an immediate initialization
+        # failure or a racing stop may already have settled the row.
+        run = await asyncio.to_thread(
+            self.store.get_generation_run_required, run.run_id
+        )
+        return run, True
 
     @asynccontextmanager
     async def refine_slot(self, project_id: str):
@@ -449,10 +445,10 @@ class _RunManager:
 
     # ── Execution ──────────────────────────────────────
 
-    def _spawn(self, run_id: str, engine, ctx: _GenerationContext) -> None:
+    def _spawn(self, run_id: str) -> None:
         stop_event = asyncio.Event()
         self._stop_events[run_id] = stop_event
-        task = asyncio.create_task(self._execute(run_id, engine, ctx, stop_event))
+        task = asyncio.create_task(self._execute(run_id, stop_event))
         self._tasks[run_id] = task
 
         def _retrieve(t: asyncio.Task) -> None:
@@ -470,15 +466,73 @@ class _RunManager:
 
         task.add_done_callback(_retrieve)
 
+    async def _converge_revoked_run(self, run: GenerationRun) -> None:
+        """Finish a run that left ``running`` before its task could execute
+        (a stop or shutdown won the admission race): converge the row and
+        tell live subscribers — without ever building an engine."""
+        if run.status == "stopping":
+            run = await asyncio.to_thread(
+                self.store.settle_generation_run,
+                run.run_id,
+                status="cancelled",
+                last_progress={
+                    "stage": "stop",
+                    "message": "生成已停止；已完成阶段保留。",
+                },
+            )
+        self.broadcast(run.run_id, "done", _run_done_payload(run))
+
     async def _execute(
-        self, run_id: str, engine, ctx: _GenerationContext, stop_event: asyncio.Event
+        self, run_id: str, stop_event: asyncio.Event
     ) -> None:
         # The initial database read lives inside the try: a stop (or
         # shutdown) that lands during it still converges to a terminal row.
+        relay = _ProgressRelay(self)
+        relay.run_id = run_id
         try:
             run = await asyncio.to_thread(
                 self.store.get_generation_run_required, run_id
             )
+            if run.status != "running":
+                # The run ended before this task got its turn: converge
+                # without ever touching the model.
+                await self._converge_revoked_run(run)
+                return
+            # Engine initialization belongs to the server-owned task: from
+            # admission to the terminal state a cancellable task is
+            # responsible for the run — a stop during construction cancels
+            # it right here instead of racing a later _spawn.
+            try:
+                engine, ctx = await _get_engine(
+                    run.project_id, progress_callback=relay
+                )
+            except HTTPException as exc:
+                # The admitted run can never start (e.g. model not
+                # configured): settle it failed so the row never claims to
+                # be active, and report through the run's own channel.
+                detail = exc.detail
+                message = (
+                    detail.get("message", str(detail))
+                    if isinstance(detail, dict)
+                    else str(detail)
+                )
+                run = await asyncio.to_thread(
+                    self.store.settle_generation_run,
+                    run_id,
+                    status="failed",
+                    error=f"生成无法启动：{message}",
+                )
+                self.broadcast(run_id, "done", _run_done_payload(run))
+                return
+            # Initialization may have taken a while: re-read before
+            # executing, so a stop accepted during construction is never
+            # overridden by this task.
+            run = await asyncio.to_thread(
+                self.store.get_generation_run_required, run_id
+            )
+            if run.status != "running":
+                await self._converge_revoked_run(run)
+                return
             base_revision = run.base_revision
             base_state_json = run.base_state_json
             completed: list[str] = list(run.completed_steps)
@@ -628,25 +682,38 @@ class _RunManager:
     async def request_stop(self, run_id: str) -> tuple[GenerationRun, bool]:
         """User stop: no new stages, local waits cancelled. Idempotent.
 
-        The running→stopping transition is one atomic store operation, so a
-        repeated stop (or one racing completion) is decided by transition
-        order: terminal rows answer ``stopped=False`` untouched, an
-        already-stopping row is not cancelled again, and a success that
-        settles first simply wins.
+        The stopping transition, the stop flag and the task cancellation
+        run under the project lock — the same lock that joins a run's
+        admission with its task registration — so a stop always meets either
+        a registered task or a run that already ended; an admitted run can
+        never slip past a completed stop into execution. Waiting for the
+        cancelled task happens OUTSIDE the lock (its convergence may take
+        further store transactions) so the project never blocks behind it.
+        The running→stopping transition itself is one atomic store
+        operation, so a repeated stop (or one racing completion) is decided
+        by transition order: terminal rows answer ``stopped=False``
+        untouched, an already-stopping row is not cancelled again, and a
+        success that settles first simply wins.
         """
-        run, accepted = await asyncio.to_thread(
-            self.store.transition_generation_run_stopping, run_id
-        )
-        if not accepted:
-            return run, False
-        stop_event = self._stop_events.get(run_id)
-        if stop_event is not None:
-            stop_event.set()
-        task = self._tasks.get(run_id)
+        run = await asyncio.to_thread(self.store.get_generation_run, run_id)
+        if run is None:
+            raise ProjectNotFoundError(f"Run '{run_id}' not found")
+        task: asyncio.Task | None = None
+        async with self._project_lock(run.project_id):
+            run, accepted = await asyncio.to_thread(
+                self.store.transition_generation_run_stopping, run_id
+            )
+            if not accepted:
+                return run, False
+            stop_event = self._stop_events.get(run_id)
+            if stop_event is not None:
+                stop_event.set()
+            task = self._tasks.get(run_id)
+            if task is not None:
+                # Cancels local waits only; whether a remote provider
+                # request lands (and bills) is not claimed either way.
+                task.cancel()
         if task is not None:
-            # Cancels local waits only; whether a remote provider request
-            # lands (and bills) is not claimed either way.
-            task.cancel()
             with suppress(BaseException):
                 await task
         # The coroutine settles itself; if it never got to run (cancelled

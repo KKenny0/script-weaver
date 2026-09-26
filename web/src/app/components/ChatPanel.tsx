@@ -45,7 +45,9 @@ async function apiGet(path: string) {
   const res = await fetch(`${API}${path}`);
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
-    throw new Error(extractError(err, `HTTP ${res.status}`));
+    const e: any = new Error(extractError(err, `HTTP ${res.status}`));
+    e.code = err?.detail?.code; // e.g. "no_run": a fact, not a failure
+    throw e;
   }
   return res.json();
 }
@@ -102,6 +104,21 @@ export default function ChatPanel({
   // in the backend, so the subscription is only a view onto it.
   const activeRunIdRef = useRef<string | null>(null);
   const sessionEpochRef = useRef(0);
+  // Project-session sequence: bumped ONLY when the observed project really
+  // changes (a switch — including A→B→A — or a fresh generation creating
+  // its project), never for follow-up notices inside one open. Async
+  // continuations capture it and become stale the moment the panel moves to
+  // another project session, while the current session's own notices stay
+  // harmless.
+  const openSeqRef = useRef(0);
+  const lastProjectRef = useRef<string | null>(null);
+  // Monotonic token for project-content reads: overlapping refreshes (done
+  // follow-up, terminal recovery, manual retry) apply only the newest one —
+  // a slow OLD response can never overwrite what a newer one rendered.
+  const contentReqRef = useRef(0);
+  // Run ids whose outcome this panel already presented (live done or
+  // terminal recovery): re-clicks and re-opens never re-announce them.
+  const presentedRunsRef = useRef<Set<string>>(new Set());
   // False once this instance unmounts (chat collapse). Every async
   // continuation re-checks it: an unmounted instance no longer owns any UI,
   // so its late responses and events must never write state, open a
@@ -112,6 +129,12 @@ export default function ChatPanel({
 
   useEffect(() => { messagesEndRef.current?.scrollIntoView({ behavior: "smooth" }); }, [messages]);
   useEffect(() => { sessionEpochRef.current = sessionEpoch; }, [sessionEpoch]);
+  useEffect(() => {
+    if (lastProjectRef.current !== projectId) {
+      lastProjectRef.current = projectId;
+      openSeqRef.current += 1;
+    }
+  }, [projectId]);
 
   useEffect(() => { messagesEndRef.current?.scrollIntoView({ behavior: "smooth" }); }, [messages]);
 
@@ -180,6 +203,112 @@ export default function ChatPanel({
     });
   }, [onArtifactUpdate]);
 
+  // Every project-content read goes through one tokened helper: a request
+  // superseded by a newer one returns null and its caller writes nothing.
+  const refreshProjectContent = useCallback(async (pid: string) => {
+    const token = ++contentReqRef.current;
+    const fullState = await apiGet(`/projects/${pid}`);
+    if (token !== contentReqRef.current) return null; // a newer refresh owns the UI
+    return fullState;
+  }, []);
+
+  // ── Unified run-outcome presentation (review R3: one path, no drift) ──
+  //
+  // The live SSE ``done`` event and the terminal recovery of ``runs/latest``
+  // share this single path: status, message wording, artifact refresh and
+  // the refresh-failed retry entry can never diverge again. Every write is
+  // guarded by the session epoch captured at the start, the project id, the
+  // component's lifetime AND subscription ownership (a listener whose
+  // subscription was closed or replaced writes nothing — not even a
+  // message), plus the content token above.
+  const presentRunOutcome = useCallback(async (
+    pid: string,
+    outcome: { status?: string; error?: string | null },
+    source: "done" | "restore",
+    origin?: { seq: number; evtSource: EventSource | null },
+  ): Promise<boolean> => {
+    const started = origin ?? { seq: openSeqRef.current, evtSource: null };
+    // R6: done.status alone decides the run's outcome; the follow-up GET
+    // only decides whether the CONTENT view was refreshed.
+    const status: "succeeded" | "cancelled" | "failed" | "interrupted" =
+      outcome.status === "cancelled" || outcome.status === "failed" || outcome.status === "interrupted"
+        ? outcome.status
+        : "succeeded"; // legacy done {} = success
+    let fullState: any = null;
+    let refreshFailed = false;
+    let superseded = false;
+    try {
+      fullState = await refreshProjectContent(pid);
+      if (fullState === null) superseded = true; // a newer refresh owns the UI
+    } catch (fetchErr) {
+      console.error("Failed to fetch final state:", fetchErr);
+      refreshFailed = true;
+    }
+    if (superseded) return false;
+    const stillOwns = () =>
+      mountedRef.current &&
+      openSeqRef.current === started.seq &&
+      isProjectActive(pid) &&
+      !(started.evtSource && eventSourceRef.current && eventSourceRef.current !== started.evtSource);
+    if (!stillOwns()) return false; // async continuation returned into another session/view
+    if (fullState) {
+      applyFullState(fullState);
+      onProjectMutated();
+    }
+    const refreshFailNote = fullState ? "" : "\n（内容刷新失败，已保留当前显示；可点击「刷新内容」重试。）";
+
+    if (status === "succeeded") {
+      setProjectStatus("complete");
+      if (fullState) {
+        setMessages((prev) => [...prev, {
+          role: "assistant",
+          content: source === "done"
+            ? `🎉 全部生成完成！\n\n${formatResultSummary(fullState)}`
+            : `🔄 已恢复上次生成的结果：\n\n${formatResultSummary(fullState)}`,
+          timestamp: Date.now(),
+        }]);
+        if (source === "done") {
+          if (fullState.outline) onTabSwitch("outline");
+          else if (fullState.characters) onTabSwitch("characters");
+          else if (fullState.script) onTabSwitch("script");
+        }
+      } else {
+        setContentRefreshPending(true);
+        setMessages((prev) => [...prev, {
+          role: "assistant",
+          content: source === "done"
+            ? "✅ 生成已完成，但内容刷新失败。已保留当前显示的内容，可点击下方「刷新内容」重试。"
+            : "✅ 上次生成已完成，但内容刷新失败。已保留当前显示的内容，可点击下方「刷新内容」重试。",
+          timestamp: Date.now(),
+        }]);
+      }
+    } else if (status === "cancelled") {
+      setProjectStatus(fullState ? "complete" : "idle");
+      if (!fullState) setContentRefreshPending(true);
+      setMessages((prev) => [...prev, {
+        role: "assistant",
+        content: source === "done"
+          ? `🛑 生成已停止。已完成并保存的阶段保留在项目中，可继续修改或重新生成。${refreshFailNote}`
+          : `ℹ️ 上次生成已停止；已保存并同步完成的阶段。${refreshFailNote}`,
+        timestamp: Date.now(),
+      }]);
+    } else {
+      // failed / interrupted
+      setProjectStatus("error");
+      if (!fullState) setContentRefreshPending(true);
+      const reason = outcome.error
+        || (status === "interrupted" ? "服务在生成期间重启，运行已中断" : "生成失败");
+      setMessages((prev) => [...prev, {
+        role: "assistant",
+        content: source === "done"
+          ? `❌ 生成未完成：${reason}${fullState ? "\n已完成的阶段已保存，可重新提交生成。" : refreshFailNote}`
+          : `ℹ️ 上次生成未完成（${reason}）。已同步已保存的阶段，可重新提交生成。${refreshFailNote}`,
+        timestamp: Date.now(),
+      }]);
+    }
+    return true;
+  }, [isProjectActive, applyFullState, onProjectMutated, onTabSwitch, setProjectStatus]);
+
   // ── Background run subscription (ticket #14) ─────────
 
   // Observe a server-owned run. The EventSource is only a view: closing it
@@ -194,12 +323,14 @@ export default function ChatPanel({
     setIsGenerating(true);
 
     // The subscription belongs to (this instance, this session, this
-    // project). A listener that no longer matches must write nothing at
-    // all; the connection itself is closed by its owner, never by a stale
-    // listener.
+    // project) AND must still be the CURRENT subscription: a listener whose
+    // connection was closed or replaced writes nothing at all — not even a
+    // message. The connection itself is closed by its owner, never by a
+    // stale listener.
     const isStaleEvent = () =>
       !mountedRef.current ||
-      !isProjectActive(pid);
+      !isProjectActive(pid) ||
+      eventSourceRef.current !== evtSource;
 
     // One progress renderer for live events AND snapshot replays: the
     // latest assistant message is replaced (never duplicated), so repeated
@@ -236,62 +367,24 @@ export default function ChatPanel({
 
     evtSource.addEventListener("done", async (e: MessageEvent) => {
       if (isStaleEvent()) return;
+      const seqAtEvent = openSeqRef.current;
+      const doneData = JSON.parse(e.data);
+      // The view ends here; the run's outcome goes through the ONE shared
+      // presentation path (also used by terminal recovery), guarded by this
+      // subscription's identity so a closed or replaced connection can
+      // never write — not even its message.
       evtSource.close();
       eventSourceRef.current = null;
       activeRunIdRef.current = null;
       setActiveRunId(null);
       setIsGenerating(false);
 
-      const doneData = JSON.parse(e.data);
-      // R6: done.status alone decides the run's outcome; the follow-up GET
-      // only decides whether the CONTENT view was refreshed. A successful
-      // run never renders as failed just because its refresh failed.
-      const status: "succeeded" | "cancelled" | "failed" | "interrupted" =
-        doneData.status === "cancelled" || doneData.status === "failed" || doneData.status === "interrupted"
-          ? doneData.status
-          : "succeeded"; // legacy done {} = success
-      let fullState: any = null;
-      let refreshFailed = false;
-      try {
-        fullState = await apiGet(`/projects/${pid}`);
-        if (isStaleEvent()) return;
-        applyFullState(fullState);
-        onProjectMutated();
-      } catch (fetchErr) {
-        console.error("Failed to fetch final state:", fetchErr);
-        refreshFailed = true;
-      }
-      if (!mountedRef.current || !isProjectActive(pid)) return; // async refresh returned after a switch
-
-      if (status === "succeeded") {
-        setProjectStatus("complete");
-        if (fullState) {
-          setMessages((prev) => [...prev, { role: "assistant", content: `🎉 全部生成完成！\n\n${formatResultSummary(fullState)}`, timestamp: Date.now() }]);
-          if (fullState.outline) onTabSwitch("outline");
-          else if (fullState.characters) onTabSwitch("characters");
-          else if (fullState.script) onTabSwitch("script");
-        } else {
-          setContentRefreshPending(true);
-          setMessages((prev) => [...prev, { role: "assistant", content: "✅ 生成已完成，但内容刷新失败。已保留当前显示的内容，可点击下方「刷新内容」重试。", timestamp: Date.now() }]);
-        }
-      } else if (status === "cancelled") {
-        setProjectStatus(fullState ? "complete" : "idle");
-        if (!fullState) setContentRefreshPending(true);
-        setMessages((prev) => [...prev, {
-          role: "assistant",
-          content: `🛑 生成已停止。已完成并保存的阶段保留在项目中，可继续修改或重新生成。${fullState ? "" : "\n（内容刷新失败，已保留当前显示；可点击「刷新内容」重试。）"}`,
-          timestamp: Date.now(),
-        }]);
-      } else {
-        // failed / interrupted
-        setProjectStatus("error");
-        if (!fullState) setContentRefreshPending(true);
-        const reason = doneData.error || (status === "interrupted" ? "服务在生成期间重启，运行已中断" : "生成失败");
-        setMessages((prev) => [...prev, {
-          role: "assistant",
-          content: `❌ 生成未完成：${reason}${fullState ? "\n已完成的阶段已保存，可重新提交生成。" : "\n（内容刷新失败，已保留当前显示；可点击「刷新内容」重试。）"}`,
-          timestamp: Date.now(),
-        }]);
+      const presented = await presentRunOutcome(pid, doneData, "done", {
+        seq: seqAtEvent,
+        evtSource,
+      });
+      if (presented && doneData.run_id) {
+        presentedRunsRef.current.add(doneData.run_id);
       }
     });
 
@@ -321,55 +414,77 @@ export default function ChatPanel({
         });
       }
     };
-  }, [isProjectActive, applyFullState, onProjectMutated, onTabSwitch, setProjectStatus, setIsGenerating]);
+  }, [isProjectActive, presentRunOutcome, setIsGenerating]);
 
   // Opening a project finds its real progress: an active run is resubscribed
-  // (the page refresh / close / switch never cancelled it), and a previous
-  // failed or interrupted run is reported once so the user knows. Re-clicks
-  // on the CURRENT project re-run this check via projectOpenEpoch — a live
-  // observation is kept untouched, a lost view is recovered — while other
-  // switches go through the page's full reset path.
+  // (the page refresh / close / switch never cancelled it); a TERMINAL run —
+  // it finished while this page wasn't watching — restores its outcome AND
+  // content through the same presentation path the live done event uses.
+  // Re-clicks on the CURRENT project re-run this check via projectOpenEpoch
+  // — a live observation is kept untouched, a lost view is recovered — while
+  // other switches go through the page's full reset path.
   useEffect(() => {
     if (!projectId) return;
     if (eventSourceRef.current || activeRunIdRef.current) return; // already observing
+    const seqAtStart = openSeqRef.current;
     let cancelled = false;
     (async () => {
+      let run: any;
       try {
-        const run = await apiGet(`/projects/${projectId}/runs/latest`);
-        if (cancelled || !mountedRef.current || !isProjectActive(projectId)) return;
-        if (run.status === "running" || run.status === "stopping") {
-          setProjectStatus("running");
-          setMessages((prev) => [...prev, { role: "assistant", content: "🔄 该项目正在后台生成，已重新连接进度。", timestamp: Date.now() }]);
-          subscribeRun(projectId, run.run_id);
-          return;
-        }
-        if (run.status === "failed" || run.status === "interrupted") {
-          setMessages((prev) => [...prev, { role: "assistant", content: `ℹ️ 上次生成未完成（${run.error || run.status}）。已保存的阶段仍在，可重新提交生成。`, timestamp: Date.now() }]);
-        }
-      } catch {
-        // 404 no_run: the project simply has no generation history yet.
+        run = await apiGet(`/projects/${projectId}/runs/latest`);
+      } catch (err: any) {
+        if (cancelled || !mountedRef.current || !isProjectActive(projectId) || openSeqRef.current !== seqAtStart) return;
+        if (err?.code === "no_run") return; // no generation history yet — a fact, not a failure
+        // A real query failure must be visible and retryable (a re-click
+        // re-runs this check); it must not be mistaken for "no run".
+        setMessages((prev) => [...prev, { role: "assistant", content: `⚠️ 查询生成进度失败：${(err as Error).message}。重新点击当前项目可重试。`, timestamp: Date.now() }]);
+        return;
+      }
+      if (cancelled || !mountedRef.current || !isProjectActive(projectId) || openSeqRef.current !== seqAtStart) return;
+      if (run.status === "running" || run.status === "stopping") {
+        setProjectStatus("running");
+        setMessages((prev) => [...prev, { role: "assistant", content: "🔄 该项目正在后台生成，已重新连接进度。", timestamp: Date.now() }]);
+        subscribeRun(projectId, run.run_id);
+        return;
+      }
+      if (presentedRunsRef.current.has(run.run_id)) return; // already announced once
+      const presented = await presentRunOutcome(projectId, run, "restore");
+      if (presented && run.run_id) {
+        presentedRunsRef.current.add(run.run_id);
       }
     })();
     return () => { cancelled = true; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [projectId, projectOpenEpoch]);
 
+  // A pending content-refresh retry belongs to the session that produced
+  // it: switching sessions (a new epoch) clears it so a stale retry entry
+  // never leaks into the next project's chat. Re-clicking the CURRENT
+  // project keeps it (no epoch bump, nothing invalidated).
+  useEffect(() => {
+    setContentRefreshPending(false);
+  }, [sessionEpoch]);
+
   // R6: read-only content refresh — a finished run's outcome stands; this
-  // only re-reads the project (never submits another generation).
+  // only re-reads the project (never submits another generation). Guarded
+  // like every other async write: session epoch, project, mount state, and
+  // the newest-refresh token.
   const handleRefreshContent = useCallback(async () => {
     if (!projectId) return;
+    const seqAtStart = openSeqRef.current;
     try {
-      const fullState = await apiGet(`/projects/${projectId}`);
-      if (!mountedRef.current || !isProjectActive(projectId)) return;
+      const fullState = await refreshProjectContent(projectId);
+      if (fullState === null) return; // superseded by a newer refresh
+      if (!mountedRef.current || openSeqRef.current !== seqAtStart || !isProjectActive(projectId)) return;
       applyFullState(fullState);
       onProjectMutated();
       setContentRefreshPending(false);
       setMessages((prev) => [...prev, { role: "assistant", content: "🔄 项目内容已刷新。", timestamp: Date.now() }]);
     } catch (err) {
-      if (!mountedRef.current || !isProjectActive(projectId)) return;
+      if (!mountedRef.current || openSeqRef.current !== seqAtStart || !isProjectActive(projectId)) return;
       setMessages((prev) => [...prev, { role: "assistant", content: `⚠️ 刷新仍失败：${(err as Error).message}`, timestamp: Date.now() }]);
     }
-  }, [projectId, isProjectActive, applyFullState, onProjectMutated]);
+  }, [projectId, isProjectActive, refreshProjectContent, applyFullState, onProjectMutated]);
 
   const handleStop = useCallback(async () => {
     const runId = activeRunIdRef.current;
@@ -445,6 +560,7 @@ export default function ChatPanel({
 
     const refineText = inputValue.trim();
     const originalInput = inputValue;
+    const seqAtStart = openSeqRef.current;
     setMessages((prev) => [
       ...prev,
       { role: "user", content: `[修改] ${refineText}`, timestamp: Date.now() },
@@ -453,7 +569,7 @@ export default function ChatPanel({
 
     try {
       const body = await apiPost(`/projects/${projectId}/refine`, { message: refineText });
-      if (!mountedRef.current || !isProjectActive(projectId)) return;
+      if (!mountedRef.current || openSeqRef.current !== seqAtStart || !isProjectActive(projectId)) return;
       // The change is saved server-side from here on. Consume the submitted
       // instruction only if the composer still holds it; a draft typed while
       // the model was processing must survive.
@@ -462,7 +578,7 @@ export default function ChatPanel({
       let reloaded = false;
       try {
         const fullState = await apiGet(`/projects/${projectId}`);
-        if (!mountedRef.current || !isProjectActive(projectId)) return;
+        if (!mountedRef.current || openSeqRef.current !== seqAtStart || !isProjectActive(projectId)) return;
         applyFullState(fullState);
         onProjectMutated();
         reloaded = true;
@@ -474,10 +590,10 @@ export default function ChatPanel({
       }
       // Common exit after the refresh settled, success or failure: the
       // outcome message may only be written while this instance is still
-      // mounted AND the user has not moved to another project — otherwise a
+      // mounted AND the session/project are still current — otherwise a
       // late refresh failure would splice A's summary into B's chat and
-      // delete B's latest message.
-      if (!mountedRef.current || !isProjectActive(projectId)) return;
+      // delete B's latest message (an A→B→A round trip included).
+      if (!mountedRef.current || openSeqRef.current !== seqAtStart || !isProjectActive(projectId)) return;
 
       const summary = formatChangeSummary(body);
       const outcome = summary
@@ -488,13 +604,13 @@ export default function ChatPanel({
         : `✅ 修改已保存，但刷新项目显示失败；请手动刷新页面查看最新内容，无需重新提交。\n\n${summary}`;
       setMessages((prev) => [...prev.slice(0, -1), { role: "assistant", content, timestamp: Date.now() }]);
     } catch (err: any) {
-      if (!mountedRef.current || !isProjectActive(projectId)) return; // late failure
+      if (!mountedRef.current || openSeqRef.current !== seqAtStart || !isProjectActive(projectId)) return; // late failure
       // Keep inputValue so the user's text is not lost on failure.
       if (err?.code === "revision_conflict") {
         setMessages((prev) => [...prev.slice(0, -1), { role: "assistant", content: "⚠️ 项目已在其他窗口被修改，已为你重新加载最新内容。请基于最新内容重试修改。", timestamp: Date.now() }]);
         try {
           const fullState = await apiGet(`/projects/${projectId}`);
-          if (mountedRef.current && isProjectActive(projectId)) applyFullState(fullState);
+          if (mountedRef.current && openSeqRef.current === seqAtStart && isProjectActive(projectId)) applyFullState(fullState);
         } catch (fetchErr) {
           console.error("Failed to reload project:", fetchErr);
         }
