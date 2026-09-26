@@ -1,16 +1,21 @@
 """Offline checks for the SQLite project store (ticket #13)."""
 
+import json
 import sqlite3
 
 import pytest
 
 from script_weaver.core.project_store import (
+    ActiveRunConflictError,
     DataDirLock,
     DataDirLockError,
     ProjectStore,
     ProjectStoreError,
+    RequestKeyConflictError,
     RevisionConflictError,
+    RunStageRejectedError,
     UnsupportedDatabaseVersionError,
+    hash_run_request,
 )
 from script_weaver.core.types import BasicInfo, Outline, ProjectState
 
@@ -479,3 +484,184 @@ def test_version_one_database_migrates_to_runs_schema(tmp_path):
         assert version == 2
     finally:
         store.close()
+
+
+# ── Run admission, stop ordering, atomic stage commits (review round 1) ────
+
+
+def _admit(store: ProjectStore, project_id: str, key: str, *, request=None,
+           request_hash=None, status=None):
+    record = store.get_required(project_id)
+    request = request or {"user_input": "run story", "auto_approve": True}
+    run, created = store.admit_generation_run(
+        project_id, kind="generate", request_key=key, request=request,
+        request_hash=request_hash or hash_run_request(request),
+        base_revision=record.revision, base_state_json=record.state_json,
+        checkpoint_json=record.state_json,
+    )
+    if status is not None and created:
+        run = store.settle_generation_run(run.run_id, status=status)
+    return run, created
+
+
+def test_admit_idempotent_across_every_status_and_earliest_key_wins(store):
+    project = store.create_project(user_input="idem")
+    # One run per terminal status, each on its own key; every status must
+    # answer a resend with the original row instead of a new model run.
+    for status in ("succeeded", "failed", "cancelled", "interrupted"):
+        run, created = _admit(store, project.project_id, f"k-{status}", status=status)
+        assert created
+        again, created2 = _admit(store, project.project_id, f"k-{status}")
+        assert not created2 and again.run_id == run.run_id
+        assert again.status == status
+    # An active run is returned the same way, then settled so later rows
+    # can be created (an active run blocks NEW keys by design).
+    active, _ = _admit(store, project.project_id, "k-active")
+    same, created3 = _admit(store, project.project_id, "k-active")
+    assert not created3 and same.run_id == active.run_id and same.status == "running"
+    store.settle_generation_run(active.run_id, status="succeeded")
+    # A key keeps pointing at its ORIGINAL run even when later runs on other
+    # keys overshadow it in recency.
+    old, _ = _admit(store, project.project_id, "k-old", status="failed")
+    _admit(store, project.project_id, "k-newer", status="succeeded")
+    found, created4 = _admit(store, project.project_id, "k-old")
+    assert not created4 and found.run_id == old.run_id
+    # Same key, different input snapshot: conflict, no row created.
+    with pytest.raises(RequestKeyConflictError):
+        store.admit_generation_run(
+            project.project_id, kind="generate", request_key="k-old",
+            request={"user_input": "different", "auto_approve": True},
+            request_hash=hash_run_request({"user_input": "different"}),
+            base_revision=1, base_state_json="{}",
+            checkpoint_json=None,
+        )
+    # Any other active run blocks creation (the still-running one above was
+    # settled, so admit a fresh active run first).
+    blocker, _ = _admit(store, project.project_id, "k-blocker")
+    with pytest.raises(ActiveRunConflictError) as excinfo:
+        _admit(store, project.project_id, "k-fresh")
+    assert excinfo.value.run.run_id == blocker.run_id
+    # Input equality compares the STORED snapshot hash, never the project's
+    # current content: editing the project afterwards does not reinterpret
+    # the old request.
+    record = store.get_required(project.project_id)
+    edited = record.state.model_copy(deep=True)
+    edited.refined_idea = "user edited meanwhile"
+    store.save_state(project.project_id, edited, record.revision,
+                     source="manual", summary="edit")
+    still, created5 = _admit(store, project.project_id, "k-blocker")
+    assert not created5 and still.run_id == blocker.run_id
+
+
+def test_transition_and_settle_ordering_rules(store):
+    project = store.create_project(user_input="order")
+    run, _ = _admit(store, project.project_id, "k")
+
+    # First stop accepted, second is a no-op that never re-transitions.
+    first, accepted = store.transition_generation_run_stopping(run.run_id)
+    assert accepted and first.status == "stopping"
+    second, accepted2 = store.transition_generation_run_stopping(run.run_id)
+    assert not accepted2 and second.status == "stopping"
+
+    # A success settling after an accepted stop cannot land: cancelled wins.
+    settled = store.settle_generation_run(run.run_id, status="succeeded")
+    assert settled.status == "cancelled"
+
+    # Terminal states never regress and double finalization is safe.
+    again = store.settle_generation_run(run.run_id, status="failed", error="late")
+    assert again.status == "cancelled"
+    after_stop, accepted3 = store.transition_generation_run_stopping(run.run_id)
+    assert not accepted3 and after_stop.status == "cancelled"
+
+    # Success that lands FIRST simply makes a later stop a no-op.
+    run2, _ = _admit(store, project.project_id, "k2")
+    done = store.settle_generation_run(run2.run_id, status="succeeded")
+    assert done.status == "succeeded"
+    stale, accepted4 = store.transition_generation_run_stopping(run2.run_id)
+    assert not accepted4 and stale.status == "succeeded"
+
+    with pytest.raises(ValueError):
+        store.settle_generation_run(run2.run_id, status="running")
+
+
+def test_commit_generation_stage_atomic_success_and_rollback(store):
+    from script_weaver.core.types import BasicInfo, Outline, ProjectStatus
+
+    project = store.create_project(user_input="stages")
+    run, _ = _admit(store, project.project_id, "k")
+    record = store.get_required(project.project_id)
+
+    def stage_state(logline: str) -> ProjectState:
+        state = record.state.model_copy(deep=True)
+        state.outline = Outline(basic_info=BasicInfo(logline=logline))
+        state.meta.status = ProjectStatus.STRUCTURED
+        return state
+
+    # Success: one transaction writes project + version + run checkpoint and
+    # returns exactly the rows it wrote.
+    rec1, run1 = store.commit_generation_stage(
+        run.run_id, state=stage_state("第一段"), base_revision=record.revision,
+        base_state_json=record.state_json, step="idea_refiner",
+        summary="生成：概念精炼",
+        progress={"stage": "idea_refiner", "message": "阶段完成：概念精炼"},
+    )
+    assert rec1.revision == record.revision + 1
+    assert run1.base_revision == rec1.revision
+    assert run1.completed_steps == ["idea_refiner"]
+    assert run1.checkpoint_json == rec1.state_json
+    assert store.get_required(project.project_id).revision == rec1.revision
+
+    # A mid-transaction failure (the run's completed-steps blob corrupted so
+    # json parsing dies after the project write) rolls back EVERYTHING.
+    with store._write_tx() as conn:
+        conn.execute(
+            "UPDATE generation_runs SET completed_steps_json = '{broken'"
+            " WHERE id = ?", (run.run_id,),
+        )
+    with pytest.raises(json.JSONDecodeError):
+        store.commit_generation_stage(
+            run.run_id, state=stage_state("不会落库的第二段"),
+            base_revision=rec1.revision, base_state_json=rec1.state_json,
+            step="structurer", summary="生成：故事大纲", progress={},
+        )
+    after = store.get_required(project.project_id)
+    assert after.revision == rec1.revision  # no new version, no snapshot bump
+    assert after.state.outline.basic_info.logline == "第一段"
+    versions = store.list_versions(project.project_id)
+    assert [v.revision for v in versions] == [rec1.revision, record.revision]
+
+    # Repair the injection device so the row is readable again (the
+    # rollback left the corrupted blob in place — it predates the tx).
+    with store._write_tx() as conn:
+        conn.execute(
+            "UPDATE generation_runs SET completed_steps_json = ? WHERE id = ?",
+            ('["idea_refiner"]', run.run_id),
+        )
+
+    # A run that already left `running` rejects new stages without writes.
+    store.transition_generation_run_stopping(run.run_id)
+    with pytest.raises(RunStageRejectedError):
+        store.commit_generation_stage(
+            run.run_id, state=stage_state("停止后的越界提交"),
+            base_revision=rec1.revision, base_state_json=rec1.state_json,
+            step="scriptwriter", summary="生成：剧本", progress={},
+        )
+    assert store.get_required(project.project_id).revision == rec1.revision
+    store.settle_generation_run(run.run_id, status="cancelled")
+
+    # A concurrent user edit makes the CAS refuse while keeping the user's
+    # content — and the manager records the result as unapplied elsewhere.
+    run2, _ = _admit(store, project.project_id, "k2")
+    record2 = store.get_required(project.project_id)
+    user_state = record2.state.model_copy(deep=True)
+    user_state.refined_idea = "用户手改"
+    store.save_state(project.project_id, user_state, record2.revision,
+                     source="manual", summary="用户编辑")
+    with pytest.raises(RevisionConflictError):
+        store.commit_generation_stage(
+            run2.run_id, state=stage_state("冲突阶段"),
+            base_revision=record2.revision, base_state_json=record2.state_json,
+            step="idea_refiner", summary="生成：概念精炼", progress={},
+        )
+    kept = store.get_required(project.project_id)
+    assert kept.state.refined_idea == "用户手改"

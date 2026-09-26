@@ -61,6 +61,9 @@ interface ChatPanelProps {
   onCollapse: () => void;
   sessionNotice: SessionNotice | null;
   sessionEpoch: number;
+  /** Bumped when the user re-clicks the already-open project: re-check run
+   * state without resetting a live observation. */
+  projectOpenEpoch: number;
   isSessionActive: (epoch: number) => boolean;
   isProjectActive: (id: string) => boolean;
   closeStreamRef: React.MutableRefObject<() => void>;
@@ -76,6 +79,7 @@ export default function ChatPanel({
   onCollapse,
   sessionNotice,
   sessionEpoch,
+  projectOpenEpoch,
   isSessionActive,
   isProjectActive,
   closeStreamRef,
@@ -89,6 +93,8 @@ export default function ChatPanel({
   const [activeSkillIds, setActiveSkillIds] = useState<Set<string>>(new Set());
   const [activeRunId, setActiveRunId] = useState<string | null>(null);
   const [stopRequested, setStopRequested] = useState(false);
+  // A finished run whose content refresh failed: offer a GET-only retry.
+  const [contentRefreshPending, setContentRefreshPending] = useState(false);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const eventSourceRef = useRef<EventSource | null>(null);
@@ -195,16 +201,37 @@ export default function ChatPanel({
       !mountedRef.current ||
       !isProjectActive(pid);
 
-    evtSource.addEventListener("progress", (e: MessageEvent) => {
-      if (isStaleEvent()) return;
-      const data = JSON.parse(e.data);
+    // One progress renderer for live events AND snapshot replays: the
+    // latest assistant message is replaced (never duplicated), so repeated
+    // snapshots after a reconnect never stack up messages.
+    const renderProgress = (text: string) => {
       setMessages((prev) => {
         const last = prev[prev.length - 1];
         if (last?.role === "assistant") {
-          return [...prev.slice(0, -1), { ...last, content: data.message || (data.result_summary ? `✅ ${data.result_summary.details.join(" | ")}` : last.content), timestamp: Date.now() }];
+          return [...prev.slice(0, -1), { ...last, content: text, timestamp: Date.now() }];
         }
-        return prev;
+        return [...prev, { role: "assistant", content: text, timestamp: Date.now() }];
       });
+    };
+
+    // R7: the first event on every (re)connect is the run's snapshot —
+    // show where the run is right now instead of waiting for the next
+    // progress event. Terminal snapshots are handled by the done event.
+    evtSource.addEventListener("status", (e: MessageEvent) => {
+      if (isStaleEvent()) return;
+      const data = JSON.parse(e.data);
+      if (data.status !== "running" && data.status !== "stopping") return;
+      const steps = Array.isArray(data.completed_steps) ? data.completed_steps.length : 0;
+      const text =
+        data.last_progress?.message ||
+        (steps > 0 ? `生成进行中，已完成 ${steps} 个阶段…` : "生成正在后台进行…");
+      renderProgress(text);
+    });
+
+    evtSource.addEventListener("progress", (e: MessageEvent) => {
+      if (isStaleEvent()) return;
+      const data = JSON.parse(e.data);
+      renderProgress(data.message || (data.result_summary ? `✅ ${data.result_summary.details.join(" | ")}` : ""));
     });
 
     evtSource.addEventListener("done", async (e: MessageEvent) => {
@@ -216,36 +243,55 @@ export default function ChatPanel({
       setIsGenerating(false);
 
       const doneData = JSON.parse(e.data);
-      // Refresh whatever the run managed to save (every finished stage was
-      // checkpointed), then report the outcome honestly.
-      let reloaded = false;
+      // R6: done.status alone decides the run's outcome; the follow-up GET
+      // only decides whether the CONTENT view was refreshed. A successful
+      // run never renders as failed just because its refresh failed.
+      const status: "succeeded" | "cancelled" | "failed" | "interrupted" =
+        doneData.status === "cancelled" || doneData.status === "failed" || doneData.status === "interrupted"
+          ? doneData.status
+          : "succeeded"; // legacy done {} = success
+      let fullState: any = null;
+      let refreshFailed = false;
       try {
-        const fullState = await apiGet(`/projects/${pid}`);
+        fullState = await apiGet(`/projects/${pid}`);
         if (isStaleEvent()) return;
         applyFullState(fullState);
         onProjectMutated();
-        reloaded = true;
-        if (doneData.status === "succeeded") {
-          setProjectStatus("complete");
+      } catch (fetchErr) {
+        console.error("Failed to fetch final state:", fetchErr);
+        refreshFailed = true;
+      }
+      if (!mountedRef.current || !isProjectActive(pid)) return; // async refresh returned after a switch
+
+      if (status === "succeeded") {
+        setProjectStatus("complete");
+        if (fullState) {
           setMessages((prev) => [...prev, { role: "assistant", content: `🎉 全部生成完成！\n\n${formatResultSummary(fullState)}`, timestamp: Date.now() }]);
           if (fullState.outline) onTabSwitch("outline");
           else if (fullState.characters) onTabSwitch("characters");
           else if (fullState.script) onTabSwitch("script");
-          return;
+        } else {
+          setContentRefreshPending(true);
+          setMessages((prev) => [...prev, { role: "assistant", content: "✅ 生成已完成，但内容刷新失败。已保留当前显示的内容，可点击下方「刷新内容」重试。", timestamp: Date.now() }]);
         }
-      } catch (fetchErr) {
-        console.error("Failed to fetch final state:", fetchErr);
-      }
-      if (!mountedRef.current || !isProjectActive(pid)) return;
-
-      if (doneData.status === "cancelled") {
-        setProjectStatus(reloaded ? "complete" : "idle");
-        setMessages((prev) => [...prev, { role: "assistant", content: "🛑 生成已停止。已完成并保存的阶段保留在项目中，可继续修改或重新生成。", timestamp: Date.now() }]);
+      } else if (status === "cancelled") {
+        setProjectStatus(fullState ? "complete" : "idle");
+        if (!fullState) setContentRefreshPending(true);
+        setMessages((prev) => [...prev, {
+          role: "assistant",
+          content: `🛑 生成已停止。已完成并保存的阶段保留在项目中，可继续修改或重新生成。${fullState ? "" : "\n（内容刷新失败，已保留当前显示；可点击「刷新内容」重试。）"}`,
+          timestamp: Date.now(),
+        }]);
       } else {
-        // failed / interrupted / (legacy) done-with-error
+        // failed / interrupted
         setProjectStatus("error");
-        const reason = doneData.error || (doneData.status === "interrupted" ? "服务在生成期间重启，运行已中断" : "生成失败");
-        setMessages((prev) => [...prev, { role: "assistant", content: `❌ 生成未完成：${reason}${reloaded ? "\n已完成的阶段已保存，可重新提交生成。" : ""}`, timestamp: Date.now() }]);
+        if (!fullState) setContentRefreshPending(true);
+        const reason = doneData.error || (status === "interrupted" ? "服务在生成期间重启，运行已中断" : "生成失败");
+        setMessages((prev) => [...prev, {
+          role: "assistant",
+          content: `❌ 生成未完成：${reason}${fullState ? "\n已完成的阶段已保存，可重新提交生成。" : "\n（内容刷新失败，已保留当前显示；可点击「刷新内容」重试。）"}`,
+          timestamp: Date.now(),
+        }]);
       }
     });
 
@@ -254,11 +300,15 @@ export default function ChatPanel({
       if (evtSource.readyState === EventSource.CLOSED) {
         // The stream ended without a done event and will not retry. That is
         // a LOST VIEW, not a failed run: generation keeps running in the
-        // backend, and reopening the project resubscribes to real progress.
+        // backend. Clear the observation markers so re-opening the project
+        // (or the panel's restore path) can re-query and resubscribe.
         evtSource.close();
         eventSourceRef.current = null;
+        activeRunIdRef.current = null;
+        setActiveRunId(null);
+        setStopRequested(false);
         setIsGenerating(false);
-        setMessages((prev) => [...prev, { role: "assistant", content: "⚠️ 与生成进度的连接已断开。生成仍在后台进行，不会因此取消；刷新页面或重新打开项目可查看最新进度。", timestamp: Date.now() }]);
+        setMessages((prev) => [...prev, { role: "assistant", content: "⚠️ 与生成进度的连接已断开。生成仍在后台进行，不会因此取消；重新点击当前项目或刷新页面可重新连接进度。", timestamp: Date.now() }]);
       } else {
         // Transient drop: the browser reconnects on its own and the server
         // replays the current snapshot on reopen — show it, keep waiting.
@@ -275,7 +325,10 @@ export default function ChatPanel({
 
   // Opening a project finds its real progress: an active run is resubscribed
   // (the page refresh / close / switch never cancelled it), and a previous
-  // failed or interrupted run is reported once so the user knows.
+  // failed or interrupted run is reported once so the user knows. Re-clicks
+  // on the CURRENT project re-run this check via projectOpenEpoch — a live
+  // observation is kept untouched, a lost view is recovered — while other
+  // switches go through the page's full reset path.
   useEffect(() => {
     if (!projectId) return;
     if (eventSourceRef.current || activeRunIdRef.current) return; // already observing
@@ -299,7 +352,24 @@ export default function ChatPanel({
     })();
     return () => { cancelled = true; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [projectId]);
+  }, [projectId, projectOpenEpoch]);
+
+  // R6: read-only content refresh — a finished run's outcome stands; this
+  // only re-reads the project (never submits another generation).
+  const handleRefreshContent = useCallback(async () => {
+    if (!projectId) return;
+    try {
+      const fullState = await apiGet(`/projects/${projectId}`);
+      if (!mountedRef.current || !isProjectActive(projectId)) return;
+      applyFullState(fullState);
+      onProjectMutated();
+      setContentRefreshPending(false);
+      setMessages((prev) => [...prev, { role: "assistant", content: "🔄 项目内容已刷新。", timestamp: Date.now() }]);
+    } catch (err) {
+      if (!mountedRef.current || !isProjectActive(projectId)) return;
+      setMessages((prev) => [...prev, { role: "assistant", content: `⚠️ 刷新仍失败：${(err as Error).message}`, timestamp: Date.now() }]);
+    }
+  }, [projectId, isProjectActive, applyFullState, onProjectMutated]);
 
   const handleStop = useCallback(async () => {
     const runId = activeRunIdRef.current;
@@ -549,6 +619,24 @@ export default function ChatPanel({
                 <Square size={10} />停止
               </button>
             )}
+          </div>
+        )}
+
+        {contentRefreshPending && (
+          <div style={{ alignSelf: "flex-start", padding: "2px 6px" }}>
+            <button
+              onClick={handleRefreshContent}
+              className="btn-ghost"
+              style={{
+                display: "inline-flex", alignItems: "center", gap: 4,
+                padding: "4px 12px", borderRadius: 12, fontSize: 12,
+                border: "1px solid var(--border-default)", cursor: "pointer",
+              }}
+              title="仅重新读取项目内容，不会重新生成"
+              aria-label="刷新内容"
+            >
+              🔄 刷新内容
+            </button>
           </div>
         )}
       </div>

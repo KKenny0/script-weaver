@@ -10,6 +10,7 @@ below runs offline against the real store via a scripted engine.
 
 import asyncio
 import json
+import threading
 from types import SimpleNamespace
 
 import httpx
@@ -301,7 +302,9 @@ async def test_explicit_stop_prevents_further_stages_and_is_idempotent(client):
     stop = await c.post(f"/api/projects/{p['project_id']}/runs/{run_id}/stop")
     assert stop.status_code == 200
     assert stop.json()["stopped"] is True
-    assert stop.json()["run"]["status"] == "stopping"
+    # request_stop converges the run before answering: the atomic
+    # running→stopping transition plus the settled terminal state.
+    assert stop.json()["run"]["status"] == "cancelled"
 
     terminal = await await_terminal(api, run_id)
     assert terminal["status"] == "cancelled"
@@ -428,10 +431,10 @@ async def test_store_failure_mid_run_aborts_without_continuing(client, monkeypat
     api, c = client
     p = await create_project(c, "存储失败故事")
     stages_seen = []
-    original = api._runtime.store.replace_state
+    original = api._runtime.store.commit_generation_stage
     calls = {"n": 0}
 
-    def flaky_replace(*args, **kwargs):
+    def flaky_stage_commit(*args, **kwargs):
         calls["n"] += 1
         if calls["n"] == 2:
             raise ProjectStoreError("disk I/O error")
@@ -446,7 +449,7 @@ async def test_store_failure_mid_run_aborts_without_continuing(client, monkeypat
         return state_with("存储失败故事", "存不下来的大纲")
 
     scripted_engine(api, p["project_id"], pipeline)
-    monkeypatch.setattr(api._runtime.store, "replace_state", flaky_replace)
+    monkeypatch.setattr(api._runtime.store, "commit_generation_stage", flaky_stage_commit)
     submitted = await c.post(
         f"/api/projects/{p['project_id']}/generate", json={"request_key": "k"}
     )
@@ -454,6 +457,9 @@ async def test_store_failure_mid_run_aborts_without_continuing(client, monkeypat
     assert terminal["status"] == "failed"
     assert "保存" in terminal["error"]
     assert stages_seen == ["idea_refiner"]  # aborted before any new stage
+    # The first stage stayed committed (atomic per-stage commits).
+    project = (await c.get(f"/api/projects/{p['project_id']}")).json()
+    assert project["refined_idea"] == "概念"
 
 
 # ── Refine participates in the one-active-run rule ────
@@ -616,3 +622,473 @@ async def test_startup_marks_stale_active_runs_interrupted_without_model_calls(
             events = [event async for event in response.body_iterator]
             assert events[-1]["event"] == "done"
             assert json.loads(events[-1]["data"])["status"] == "interrupted"
+
+
+# ── Review round 1: durable idempotency, refine mutex, stop ordering ──────
+
+
+def _seed_run_row(api, project_id: str, key: str, *, status: str | None = None):
+    """Admit a run row directly (no engine, no task) like a previous run."""
+    import hashlib
+    import json as _json
+
+    record = api._runtime.store.get_required(project_id)
+    request = {
+        "user_input": record.state.user_input,
+        "auto_approve": bool(record.auto_approve),
+        "skill_bindings": record.skill_bindings or {},
+    }
+    request_hash = hashlib.sha256(
+        _json.dumps(request, ensure_ascii=False, sort_keys=True).encode()
+    ).hexdigest()[:16]
+    run, _ = api._runtime.store.admit_generation_run(
+        project_id, kind="generate", request_key=key, request=request,
+        request_hash=request_hash,
+        base_revision=record.revision, base_state_json=record.state_json,
+        checkpoint_json=record.state_json,
+    )
+    if status is not None:
+        run = api._runtime.store.settle_generation_run(run.run_id, status=status)
+    return run
+
+
+async def test_resend_after_any_terminal_status_returns_original_without_engine(client):
+    """A key keeps pointing at its original run across every terminal
+    status — a resend never builds a model instance, never adds a row, and
+    cannot be overshadowed by later runs on other keys."""
+    api, c = client
+    calls = []
+
+    async def idle_pipeline(**kwargs):  # pragma: no cover - must not run
+        calls.append("engine")
+        return state_with("x", "y")
+
+    for status in ("failed", "cancelled", "interrupted"):
+        p = await create_project(c, f"终态重发故事{status}")
+        scripted_engine(api, p["project_id"], idle_pipeline, engine_calls=calls)
+        seeded = _seed_run_row(api, p["project_id"], f"k-{status}", status=status)
+
+        resent = await c.post(
+            f"/api/projects/{p['project_id']}/generate",
+            json={"request_key": f"k-{status}"},
+        )
+        assert resent.status_code == 200, resent.text
+        body = resent.json()
+        assert body["created"] is False
+        assert body["run"]["run_id"] == seeded.run_id
+        assert body["run"]["status"] == status
+        latest = api._runtime.store.latest_generation_run(p["project_id"])
+        assert latest.run_id == seeded.run_id  # no second row appeared
+
+    # Overshadowed key: an older failed run is still what its key answers
+    # with, even after a newer successful run on another key.
+    p = await create_project(c, "遮蔽重发故事")
+    scripted_engine(api, p["project_id"], idle_pipeline, engine_calls=calls)
+    old = _seed_run_row(api, p["project_id"], "k-old", status="failed")
+    _seed_run_row(api, p["project_id"], "k-new", status="succeeded")
+    found = await c.post(
+        f"/api/projects/{p['project_id']}/generate", json={"request_key": "k-old"}
+    )
+    assert found.json()["run"]["run_id"] == old.run_id
+    assert calls == []  # the engine was never even built
+
+
+async def test_concurrent_duplicate_submits_admit_exactly_one_run(client):
+    api, c = client
+    p = await create_project(c, "并发重发故事")
+    calls = []
+    release = asyncio.Event()
+
+    async def pipeline(**kwargs):
+        await release.wait()
+        return state_with("并发重发故事", "大纲")
+
+    scripted_engine(api, p["project_id"], pipeline, engine_calls=calls)
+
+    first, second = await asyncio.gather(
+        c.post(f"/api/projects/{p['project_id']}/generate", json={"request_key": "k"}),
+        c.post(f"/api/projects/{p['project_id']}/generate", json={"request_key": "k"}),
+    )
+    assert first.status_code == 200 and second.status_code == 200
+    created = [first.json()["created"], second.json()["created"]]
+    assert sorted(created) == [False, True]  # exactly one admission
+    assert first.json()["run"]["run_id"] == second.json()["run"]["run_id"]
+    assert len(calls) == 1  # one engine, one task, one eventual model call
+    release.set()
+    run_id = first.json()["run"]["run_id"]
+    assert (await await_terminal(api, run_id))["status"] == "succeeded"
+
+
+async def test_two_concurrent_refines_admit_one_and_survive_failure(client):
+    api, c = client
+    p = await create_project(c, "互斥并发修改故事")
+    model_entered = asyncio.Event()
+    release = asyncio.Event()
+    refine_calls = {"n": 0}
+
+    async def fake_refine(state, message):
+        refine_calls["n"] += 1
+        if refine_calls["n"] == 1:
+            model_entered.set()
+            await release.wait()
+            raise api.RefinementError("unapplied")  # nothing saved
+        model_entered.set()
+        await release.wait()
+        raise api.RefinementError("unapplied")
+
+    async def idle_pipeline(**kwargs):  # pragma: no cover
+        return state_with("互斥并发修改故事", "大纲")
+
+    async def refine_engine(pid, **kwargs):
+        record = api._runtime.store.get_required(pid)
+        engine = SimpleNamespace(run_full_pipeline=idle_pipeline, refine=fake_refine)
+        return engine, api._GenerationContext(
+            project_id=record.project_id, revision=record.revision,
+            base_state_json=record.state_json, state=record.state,
+            store=api._runtime.store, auto_approve=record.auto_approve,
+            skill_bindings=record.skill_bindings,
+        )
+
+    api._get_engine = refine_engine
+    first_refine = asyncio.create_task(
+        c.post(f"/api/projects/{p['project_id']}/refine", json={"message": "慢修改"})
+    )
+    await asyncio.wait_for(model_entered.wait(), timeout=5)
+
+    # The second refine is rejected while the first holds the slot.
+    second = await c.post(
+        f"/api/projects/{p['project_id']}/refine", json={"message": "并发修改"}
+    )
+    assert second.status_code == 409
+    assert second.json()["detail"]["code"] == "run_active"
+
+    release.set()
+    first = await first_refine
+    assert first.status_code == 422  # failure released the slot
+
+    # The slot survives an exception: a new refine reaches the model again.
+    release = asyncio.Event()
+    third = asyncio.create_task(
+        c.post(f"/api/projects/{p['project_id']}/refine", json={"message": "再次修改"})
+    )
+    await asyncio.wait_for(model_entered.wait(), timeout=5)
+    release.set()
+    await third
+    assert refine_calls["n"] == 2
+
+    # Another project is fully independent.
+    other = await create_project(c, "独立项目")
+    blocked = await c.post(f"/api/projects/{other['project_id']}/refine",
+                           json={"message": "修改"})
+    assert blocked.status_code in (200, 422)  # admission succeeded either way
+
+
+async def test_generation_rejected_while_refine_is_saving(client, monkeypatch):
+    api, c = client
+    p = await create_project(c, "保存期互斥故事")
+    model_done = asyncio.Event()
+    save_entered = threading.Event()
+    save_release = threading.Event()
+
+    async def fake_refine(state, message):
+        model_done.set()
+        updated = state.model_copy(deep=True)
+        updated.refined_idea = "refined"
+        return updated
+
+    async def idle_pipeline(**kwargs):  # pragma: no cover
+        return state_with("保存期互斥故事", "大纲")
+
+    async def refine_engine(pid, **kwargs):
+        record = api._runtime.store.get_required(pid)
+        engine = SimpleNamespace(run_full_pipeline=idle_pipeline, refine=fake_refine)
+        ctx = api._GenerationContext(
+            project_id=record.project_id, revision=record.revision,
+            base_state_json=record.state_json, state=record.state,
+            store=api._runtime.store, auto_approve=record.auto_approve,
+            skill_bindings=record.skill_bindings,
+        )
+        return engine, ctx
+
+    original_save = api._runtime.store.save_state
+
+    def blocked_save(*args, **kwargs):
+        save_entered.set()
+        save_release.wait(5)
+        return original_save(*args, **kwargs)
+
+    monkeypatch.setattr(api._runtime.store, "save_state", blocked_save)
+    api._get_engine = refine_engine
+
+    calls = []
+    scripted = None
+
+    async def generation_pipeline(**kwargs):  # pragma: no cover
+        calls.append("engine")
+        return state_with("保存期互斥故事", "大纲")
+
+    refine_task = asyncio.create_task(
+        c.post(f"/api/projects/{p['project_id']}/refine", json={"message": "修改"})
+    )
+    await asyncio.wait_for(model_done.wait(), timeout=5)
+    await asyncio.to_thread(save_entered.wait, 5)
+
+    # While the refine result is being CAS-saved, generation is refused.
+    async def generation_engine(pid, **kwargs):
+        record = api._runtime.store.get_required(pid)
+        calls.append("engine")
+        engine = SimpleNamespace(run_full_pipeline=generation_pipeline)
+        ctx = api._GenerationContext(
+            project_id=record.project_id, revision=record.revision,
+            base_state_json=record.state_json, state=record.state,
+            store=api._runtime.store, auto_approve=record.auto_approve,
+            skill_bindings=record.skill_bindings,
+        )
+        return engine, ctx
+
+    api._get_engine = generation_engine
+    scripted = generation_engine
+    blocked = await c.post(f"/api/projects/{p['project_id']}/generate", json={})
+    assert blocked.status_code == 409
+    assert blocked.json()["detail"]["code"] == "run_active"
+
+    save_release.set()
+    refined = await refine_task
+    assert refined.status_code == 200, refined.text
+    assert calls == []  # the refused generation never built an engine
+    assert scripted is generation_engine
+
+
+async def test_stop_during_first_db_read_and_before_first_step_converge(
+    client, monkeypatch
+):
+    api, c = client
+    p = await create_project(c, "读期停止故事")
+    entered = threading.Event()
+    release = threading.Event()
+    original_get = api._runtime.store.get_generation_run_required
+
+    def blocked_get(run_id):
+        entered.set()
+        release.wait(5)
+        return original_get(run_id)
+
+    async def pipeline(**kwargs):  # pragma: no cover - never reached
+        return state_with("读期停止故事", "大纲")
+
+    scripted_engine(api, p["project_id"], pipeline)
+    monkeypatch.setattr(
+        api._runtime.store, "get_generation_run_required", blocked_get
+    )
+
+    submitted = await c.post(
+        f"/api/projects/{p['project_id']}/generate", json={"request_key": "k"}
+    )
+    run_id = submitted.json()["run"]["run_id"]
+    await asyncio.to_thread(entered.wait, 5)
+    assert run_id in api._runtime.runs._tasks
+
+    stop_task = asyncio.create_task(
+        c.post(f"/api/projects/{p['project_id']}/runs/{run_id}/stop")
+    )
+    # The stop converges the task (cancelled at its first read) even while
+    # the read thread is still held; request_stop's own follow-up read then
+    # waits on the same blocker, so release before awaiting the response.
+    for _ in range(100):
+        row = api._runtime.store.get_generation_run(run_id)
+        if row.status in ("cancelled", "interrupted"):
+            break
+        await asyncio.sleep(0.02)
+    release.set()
+    stop = await stop_task
+    assert stop.status_code == 200
+    assert stop.json()["stopped"] is True
+    row = api._runtime.store.get_generation_run(run_id)
+    assert row.status == "cancelled"  # terminal, not stranded as stopping
+    assert run_id not in api._runtime.runs._tasks  # registry cleaned
+
+
+async def test_stop_before_the_coroutine_body_ever_runs(client, monkeypatch):
+    api, c = client
+    p = await create_project(c, "未启停止故事")
+    entered = asyncio.Event()
+
+    original_execute = api._RunManager._execute
+
+    async def frozen_execute(*args, **kwargs):
+        entered.set()
+        await asyncio.Event().wait()  # never proceeds; only cancel ends it
+
+    monkeypatch.setattr(api._RunManager, "_execute", frozen_execute)
+
+    async def pipeline(**kwargs):  # pragma: no cover
+        return state_with("未启停止故事", "大纲")
+
+    scripted_engine(api, p["project_id"], pipeline)
+    submitted = await c.post(
+        f"/api/projects/{p['project_id']}/generate", json={"request_key": "k"}
+    )
+    run_id = submitted.json()["run"]["run_id"]
+    await entered.wait()
+
+    stop = await c.post(f"/api/projects/{p['project_id']}/runs/{run_id}/stop")
+    assert stop.status_code == 200 and stop.json()["stopped"] is True
+    assert stop.json()["run"]["status"] == "cancelled"
+    assert api._runtime.store.get_generation_run(run_id).status == "cancelled"
+    assert run_id not in api._runtime.runs._tasks
+
+    # A fresh submission on a new key is admitted afterwards.
+    monkeypatch.setattr(api._RunManager, "_execute", original_execute)
+    release = asyncio.Event()
+
+    async def pipeline2(**kwargs):
+        await release.wait()
+        return state_with("未启停止故事", "大纲")
+
+    scripted_engine(api, p["project_id"], pipeline2)
+    fresh = await c.post(
+        f"/api/projects/{p['project_id']}/generate", json={"request_key": "k2"}
+    )
+    assert fresh.status_code == 200 and fresh.json()["created"] is True
+    release.set()
+    assert (
+        await await_terminal(api, fresh.json()["run"]["run_id"])
+    )["status"] == "succeeded"
+
+
+async def test_success_versus_stop_race_order_decides_outcome(client, monkeypatch):
+    api, c = client
+
+    # (a) Success settles first: a late stop is a no-op on a terminal row.
+    p1 = await create_project(c, "先成功故事")
+
+    async def pipeline1(**kwargs):
+        on_stage = kwargs["on_stage_complete"]
+        await on_stage("idea_refiner", state_with("先成功故事", "概念"))
+        return state_with("先成功故事", "概念")
+
+    scripted_engine(api, p1["project_id"], pipeline1)
+    done1 = await c.post(f"/api/projects/{p1['project_id']}/generate", json={})
+    run1 = done1.json()["run"]["run_id"]
+    assert (await await_terminal(api, run1))["status"] == "succeeded"
+    late_stop = await c.post(
+        f"/api/projects/{p1['project_id']}/runs/{run1}/stop"
+    )
+    assert late_stop.json()["stopped"] is False
+    assert late_stop.json()["run"]["status"] == "succeeded"  # success kept
+
+    # (b) Stop accepted first: the success settle cannot land, the run ends
+    # cancelled even though the pipeline finished. The settle is held just
+    # before its transaction so the stop's transition commits first.
+    p2 = await create_project(c, "先停止故事")
+    settle_entered = threading.Event()
+    settle_release = threading.Event()
+    original_settle = api._runtime.store.settle_generation_run
+
+    def held_settle(*args, **kwargs):
+        if kwargs.get("status") == "succeeded":
+            settle_entered.set()
+            settle_release.wait(5)
+        return original_settle(*args, **kwargs)
+
+    monkeypatch.setattr(api._runtime.store, "settle_generation_run", held_settle)
+
+    async def pipeline2(**kwargs):
+        return state_with("先停止故事", "大纲")
+
+    scripted_engine(api, p2["project_id"], pipeline2)
+    submitted = await c.post(f"/api/projects/{p2['project_id']}/generate", json={})
+    run2 = submitted.json()["run"]["run_id"]
+    await asyncio.to_thread(settle_entered.wait, 5)
+
+    stop = await c.post(f"/api/projects/{p2['project_id']}/runs/{run2}/stop")
+    assert stop.status_code == 200 and stop.json()["stopped"] is True
+    assert stop.json()["run"]["status"] == "cancelled"
+    settle_release.set()
+    final = api._runtime.store.get_generation_run(run2)
+    assert final.status == "cancelled"  # the held success never overwrote it
+
+
+async def test_cancelled_stage_commit_await_is_not_treated_as_done(
+    client, monkeypatch
+):
+    """A stop that cancels the task during an in-flight stage commit must
+    not assume the database work ended: the orphan commit either recorded a
+    full stage before the stop's transition (kept), or — arriving after the
+    run settled — is rejected and rolled back with no phantom writes."""
+    api, c = client
+    p = await create_project(c, "取消提交交错故事")
+    commit_entered = threading.Event()
+    commit_release = threading.Event()
+    original_commit = api._runtime.store.commit_generation_stage
+    first = {"done": False}
+
+    def held_commit(*args, **kwargs):
+        if not first["done"]:
+            first["done"] = True
+            commit_entered.set()
+            commit_release.wait(5)
+        return original_commit(*args, **kwargs)
+
+    async def pipeline(**kwargs):
+        on_stage = kwargs["on_stage_complete"]
+        await on_stage("idea_refiner", state_with("取消提交交错故事", "概念"))
+        return state_with("取消提交交错故事", "概念")
+
+    scripted_engine(api, p["project_id"], pipeline)
+    monkeypatch.setattr(
+        api._runtime.store, "commit_generation_stage", held_commit
+    )
+
+    submitted = await c.post(f"/api/projects/{p['project_id']}/generate", json={})
+    run_id = submitted.json()["run"]["run_id"]
+    await asyncio.to_thread(commit_entered.wait, 5)
+    revision_before = api._runtime.store.get_required(p["project_id"]).revision
+
+    stop = await c.post(f"/api/projects/{p['project_id']}/runs/{run_id}/stop")
+    assert stop.status_code == 200 and stop.json()["stopped"] is True
+    assert stop.json()["run"]["status"] == "cancelled"
+
+    # Now release the orphan commit: the run is terminal, so it must be
+    # rejected wholesale — no phantom version, no checkpoint update.
+    commit_release.set()
+    await asyncio.sleep(0.05)
+    store = api._runtime.store
+    assert store.get_required(p["project_id"]).revision == revision_before
+    row = store.get_generation_run(run_id)
+    assert row.completed_steps == []  # the cancelled stage never recorded
+    versions = (await c.get(f"/api/projects/{p['project_id']}/versions")).json()
+    assert all(v["source"] != "pipeline" for v in versions["versions"])
+
+
+async def test_progress_relay_persists_recoverable_last_progress(client):
+    """Each pipeline notification becomes the run's durable last_progress
+    (stage granularity) and a live broadcast — reconnects resume from it."""
+    api, c = client
+    p = await create_project(c, "进度持久故事")
+    release = asyncio.Event()
+
+    async def pipeline(**kwargs):
+        await release.wait()
+        return state_with("进度持久故事", "大纲")
+
+    scripted_engine(api, p["project_id"], pipeline)
+    submitted = await c.post(f"/api/projects/{p['project_id']}/generate", json={})
+    run_id = submitted.json()["run"]["run_id"]
+
+    relay = api._ProgressRelay(api._runtime.runs)
+    relay.run_id = run_id
+    queue = api._runtime.runs.register(run_id)
+    try:
+        relay("idea_refiner", "Starting idea_refiner...")
+        row = api._runtime.store.get_generation_run(run_id)
+        assert row.last_progress == {
+            "stage": "idea_refiner", "message": "Starting idea_refiner..."
+        }
+        live = queue.get_nowait()
+        assert live["event"] == "progress"
+        assert "Starting idea_refiner" in live["data"]
+    finally:
+        api._runtime.runs.unregister(run_id, queue)
+    release.set()
+    await await_terminal(api, run_id)

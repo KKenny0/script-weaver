@@ -141,6 +141,11 @@ export async function seedSecondRevision(
 export async function installSSEStub(page: Page) {
   await page.addInitScript(() => {
     class MockEventSource {
+      // Real EventSource constants, so page code comparing against
+      // EventSource.CLOSED / CONNECTING behaves identically under the stub.
+      static CONNECTING = 0;
+      static OPEN = 1;
+      static CLOSED = 2;
       url: string;
       readyState = 1; // OPEN
       onopen: ((e?: unknown) => void) | null = null;
@@ -166,6 +171,14 @@ export async function installSSEStub(page: Page) {
       close() {
         this.closed = true;
         this.readyState = 2; // CLOSED
+      }
+
+      // Test driver: transition to CLOSED without close() (a lost view the
+      // browser will not retry) and fire onerror, like a real terminal
+      // transport failure.
+      __forceClose() {
+        this.readyState = 2;
+        if (this.onerror) this.onerror({ data: "" });
       }
 
       // Test driver: deliver an event the way the browser would. Like a
@@ -209,6 +222,20 @@ export async function sseClosed(page: Page, urlFragment: string): Promise<boolea
       if (list[i].url.includes(frag)) return list[i].closed;
     }
     return null;
+  }, urlFragment);
+}
+
+/** Force the latest matching connection into the CLOSED lost-view state. */
+export async function sseForceClose(page: Page, urlFragment: string): Promise<boolean> {
+  return page.evaluate((frag) => {
+    const list = (window as any).__mockSSE as any[];
+    for (let i = list.length - 1; i >= 0; i--) {
+      if (list[i].url.includes(frag)) {
+        list[i].__forceClose();
+        return true;
+      }
+    }
+    return false;
   }, urlFragment);
 }
 
@@ -321,6 +348,7 @@ store.close()
 export async function seedRun(
   projectId: string,
   status: "running" | "failed" | "succeeded",
+  progress?: { message: string; completedSteps?: string[] },
 ): Promise<string> {
   const { execFile } = await import("node:child_process");
   const script = `
@@ -328,16 +356,21 @@ import json, sys
 from pathlib import Path
 from script_weaver.core.project_store import ProjectStore
 pid, status = sys.argv[1], sys.argv[2]
+progress = json.loads(sys.argv[3]) if len(sys.argv) > 3 and sys.argv[3] else None
 store = ProjectStore(Path("/tmp/script-weaver-e2e-data/main-web/projects.sqlite3"))
 rec = store.get_required(pid)
 run = store.create_generation_run(
-    pid, kind="generate", request_key=f"seed-{status}",
+    pid, kind="generate", request_key=f"seed-{status}-{pid[:6]}",
     request={"user_input": rec.state.user_input, "auto_approve": True},
     base_revision=rec.revision, base_state_json=rec.state_json,
     checkpoint_json=rec.state_json)
 if status != "running":
     store.update_generation_run(run.run_id, status=status,
                                 error="种子运行预先写好的失败原因" if status == "failed" else None)
+if progress:
+    store.update_generation_run(run.run_id,
+        last_progress={"stage": "seed", "message": progress["message"]},
+        completed_steps=progress.get("completedSteps") or [])
 run = store.get_generation_run(run.run_id)
 print(json.dumps({"run_id": run.run_id, "status": run.status}))
 store.close()
@@ -345,7 +378,7 @@ store.close()
   const { stdout } = await new Promise<{ stdout: string }>((resolve, reject) => {
     execFile(
       "../.venv/bin/python",
-      ["-c", script, projectId, status],
+      ["-c", script, projectId, status, progress ? JSON.stringify(progress) : ""],
       { cwd: process.cwd() },
       (err, stdout) => (err ? reject(new Error(`${err}\n${stdout}`)) : resolve({ stdout })),
     );

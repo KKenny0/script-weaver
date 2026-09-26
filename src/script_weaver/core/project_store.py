@@ -41,6 +41,8 @@ RUN_ACTIVE_STATUSES = ("running", "stopping")
 RUN_STATUSES = (
     "running", "stopping", "succeeded", "failed", "cancelled", "interrupted",
 )
+# Statuses a run can never leave once entered.
+RUN_TERMINAL_STATUSES = ("succeeded", "failed", "cancelled", "interrupted")
 
 _SCHEMA_STATEMENTS = (
     """
@@ -119,6 +121,30 @@ class UnsupportedDatabaseVersionError(ProjectStoreError):
 
 class DataDirLockError(ProjectStoreError):
     """Another process already owns the web data directory."""
+
+
+class RunAdmissionError(ProjectStoreError):
+    """A generation run cannot be admitted for this project."""
+
+
+class RequestKeyConflictError(RunAdmissionError):
+    """The request_key already exists with a different input snapshot."""
+
+    def __init__(self, message: str, run: GenerationRun):
+        super().__init__(message)
+        self.run = run
+
+
+class ActiveRunConflictError(RunAdmissionError):
+    """Another active model run already owns the project."""
+
+    def __init__(self, message: str, run: GenerationRun):
+        super().__init__(message)
+        self.run = run
+
+
+class RunStageRejectedError(ProjectStoreError):
+    """A stage commit was refused because the run left the running state."""
 
 
 def _utcnow() -> str:
@@ -277,6 +303,20 @@ def _content_signature(state_json: str) -> str:
         meta.pop("title", None)
         meta.pop("updated_at", None)
     return json.dumps(data, sort_keys=True, ensure_ascii=False)
+
+
+# Run field name → column, shared by every run-field update path.
+_RUN_UPDATE_COLUMNS = {
+    "status": "status",
+    "base_revision": "base_revision",
+    "base_state_json": "base_state_json",
+    "completed_steps": "completed_steps_json",
+    "checkpoint_json": "checkpoint_json",
+    "unapplied_json": "unapplied_json",
+    "last_progress": "last_progress_json",
+    "error": "error",
+    "result_summary": "result_summary_json",
+}
 
 
 class ProjectStore:
@@ -616,6 +656,234 @@ class ProjectStore:
             )
         return self.get_generation_run_required(run_id)
 
+    def admit_generation_run(
+        self,
+        project_id: str,
+        *,
+        kind: str,
+        request_key: str,
+        request: dict[str, Any],
+        request_hash: str,
+        base_revision: int,
+        base_state_json: str,
+        checkpoint_json: str | None,
+    ) -> tuple[GenerationRun, bool]:
+        """Idempotently admit a run; lookup and insert share one transaction.
+
+        The ``(project_id, request_key)`` lookup covers runs in **every**
+        status, earliest record first — a key keeps pointing at its original
+        request even when later runs (other keys) overshadow it, and input
+        equality is judged against the stored snapshot's hash, never by
+        re-interpreting the project's current content. Same key + same input
+        returns the original run (``created=False``); same key + different
+        input raises :class:`RequestKeyConflictError`; another active run
+        raises :class:`ActiveRunConflictError`; otherwise the row is created
+        ``running`` in this same transaction.
+        """
+        run_id = uuid.uuid4().hex[:12]
+        now = _utcnow()
+        with self._write_tx() as conn:
+            existing = conn.execute(
+                f"SELECT {self._RUN_COLUMNS} FROM generation_runs"
+                " WHERE project_id = ? AND request_key = ?"
+                " ORDER BY created_at ASC, rowid ASC LIMIT 1",
+                (project_id, request_key),
+            ).fetchone()
+            if existing is not None:
+                run = self._row_to_run(existing)
+                if run.request_hash != request_hash:
+                    raise RequestKeyConflictError(
+                        "同一 request_key 已绑定其他输入，提交被拒绝。", run=run
+                    )
+                return run, False
+            active = conn.execute(
+                f"SELECT {self._RUN_COLUMNS} FROM generation_runs"
+                f" WHERE project_id = ? AND status IN ({','.join('?' * len(RUN_ACTIVE_STATUSES))})"
+                " ORDER BY created_at ASC, rowid ASC LIMIT 1",
+                (project_id, *RUN_ACTIVE_STATUSES),
+            ).fetchone()
+            if active is not None:
+                raise ActiveRunConflictError(
+                    "该项目已有生成运行进行中。", run=self._row_to_run(active)
+                )
+            conn.execute(
+                "INSERT INTO generation_runs (id, project_id, kind, request_key,"
+                " request_hash, status, base_revision, base_state_json,"
+                " request_json, completed_steps_json, checkpoint_json,"
+                " created_at, updated_at)"
+                " VALUES (?, ?, ?, ?, ?, 'running', ?, ?, ?, '[]', ?, ?, ?)",
+                (
+                    run_id, project_id, kind, request_key, request_hash,
+                    base_revision, base_state_json,
+                    json.dumps(request, ensure_ascii=False), checkpoint_json,
+                    now, now,
+                ),
+            )
+            row = conn.execute(
+                f"SELECT {self._RUN_COLUMNS} FROM generation_runs WHERE id = ?",
+                (run_id,),
+            ).fetchone()
+            return self._row_to_run(row), True
+
+    def transition_generation_run_stopping(self, run_id: str) -> tuple[GenerationRun, bool]:
+        """Atomically move a ``running`` run to ``stopping``.
+
+        Returns ``(run, accepted)``: ``accepted`` is True only when this call
+        performed the running→stopping transition. Already-stopping or
+        terminal runs return their current state untouched — terminal states
+        never regress, and a repeated stop must not re-cancel a task that is
+        already winding down.
+        """
+        with self._write_tx() as conn:
+            row = conn.execute(
+                f"SELECT {self._RUN_COLUMNS} FROM generation_runs WHERE id = ?",
+                (run_id,),
+            ).fetchone()
+            if row is None:
+                raise ProjectNotFoundError(f"Run '{run_id}' not found")
+            if row["status"] != "running":
+                return self._row_to_run(row), False
+            conn.execute(
+                "UPDATE generation_runs SET status = 'stopping',"
+                " last_progress_json = ?, updated_at = ?"
+                " WHERE id = ? AND status = 'running'",
+                (
+                    json.dumps(
+                        {"stage": "stop", "message": "正在停止生成…"},
+                        ensure_ascii=False,
+                    ),
+                    _utcnow(),
+                    run_id,
+                ),
+            )
+            updated = conn.execute(
+                f"SELECT {self._RUN_COLUMNS} FROM generation_runs WHERE id = ?",
+                (run_id,),
+            ).fetchone()
+            return self._row_to_run(updated), True
+
+    def settle_generation_run(self, run_id: str, *, status: str, **updates: Any) -> GenerationRun:
+        """Write a run's terminal state with atomic stop-vs-success ordering.
+
+        Terminal rows are returned unchanged (double finalization is safe).
+        A ``succeeded`` settle on a ``stopping`` row is refused as success —
+        the accepted stop wins and the row settles ``cancelled`` — while a
+        success that committed first simply makes a later stop a no-op. The
+        database transition order is the single source of truth.
+        """
+        if status not in RUN_TERMINAL_STATUSES:
+            raise ValueError(f"Not a terminal run status: {status!r}")
+        with self._write_tx() as conn:
+            row = conn.execute(
+                f"SELECT {self._RUN_COLUMNS} FROM generation_runs WHERE id = ?",
+                (run_id,),
+            ).fetchone()
+            if row is None:
+                raise ProjectNotFoundError(f"Run '{run_id}' not found")
+            if row["status"] in RUN_TERMINAL_STATUSES:
+                return self._row_to_run(row)
+            effective = status
+            if row["status"] == "stopping" and status == "succeeded":
+                effective = "cancelled"
+            assignments = ["status = ?", "updated_at = ?"]
+            params: list[Any] = [effective, _utcnow()]
+            for attr, column, value in self._run_update_fields(updates):
+                assignments.append(f"{column} = ?")
+                params.append(value)
+            params.append(run_id)
+            conn.execute(
+                f"UPDATE generation_runs SET {', '.join(assignments)} WHERE id = ?",
+                params,
+            )
+            updated = conn.execute(
+                f"SELECT {self._RUN_COLUMNS} FROM generation_runs WHERE id = ?",
+                (run_id,),
+            ).fetchone()
+            return self._row_to_run(updated)
+
+    def commit_generation_stage(
+        self,
+        run_id: str,
+        *,
+        state: ProjectState,
+        base_revision: int,
+        base_state_json: str,
+        step: str,
+        summary: str,
+        progress: dict[str, Any],
+    ) -> tuple[ProjectRecord, GenerationRun]:
+        """Commit one pipeline stage atomically: project + version + run.
+
+        A single SQLite transaction performs the revision CAS, the project
+        snapshot update, the immutable version insert and the run's
+        base-revision/completed-steps/checkpoint/last-progress update. Any
+        failure rolls the whole stage back; the returned record and run are
+        the exact rows this transaction wrote (never a later re-read). A run
+        that already left ``running`` (e.g. an accepted stop) rejects the
+        stage instead of recording it.
+        """
+        with self._write_tx() as conn:
+            run_row = conn.execute(
+                f"SELECT {self._RUN_COLUMNS} FROM generation_runs WHERE id = ?",
+                (run_id,),
+            ).fetchone()
+            if run_row is None:
+                raise ProjectNotFoundError(f"Run '{run_id}' not found")
+            if run_row["status"] != "running":
+                raise RunStageRejectedError(
+                    f"运行已进入 {run_row['status']}，拒绝提交阶段「{step}」"
+                )
+            project_id = run_row["project_id"]
+            proj = conn.execute(
+                "SELECT revision, title, state_json, review_json, auto_approve,"
+                " skill_bindings_json, created_at FROM projects WHERE id = ?",
+                (project_id,),
+            ).fetchone()
+            if proj is None:
+                raise ProjectNotFoundError(f"Project '{project_id}' not found")
+            if proj["revision"] != base_revision and _content_signature(
+                proj["state_json"]
+            ) != _content_signature(base_state_json):
+                raise RevisionConflictError(
+                    "项目内容在生成期间已被修改，生成结果未覆盖当前内容",
+                    current_revision=proj["revision"],
+                )
+            new_revision, new_state_json, updated_at = self._write_new_state(
+                conn, project_id, state, proj["revision"], proj["title"],
+                proj["review_json"], "pipeline", summary,
+            )
+            completed = json.loads(run_row["completed_steps_json"] or "[]")
+            completed.append(step)
+            conn.execute(
+                "UPDATE generation_runs SET base_revision = ?, base_state_json = ?,"
+                " completed_steps_json = ?, checkpoint_json = ?,"
+                " last_progress_json = ?, updated_at = ? WHERE id = ?",
+                (
+                    new_revision, new_state_json,
+                    json.dumps(completed, ensure_ascii=False),
+                    new_state_json,
+                    json.dumps(progress, ensure_ascii=False),
+                    _utcnow(), run_id,
+                ),
+            )
+            record = ProjectRecord(
+                project_id=project_id,
+                title=proj["title"],
+                revision=new_revision,
+                state=state,
+                state_json=new_state_json,
+                review=json.loads(proj["review_json"] or "{}"),
+                auto_approve=bool(proj["auto_approve"]),
+                skill_bindings=json.loads(proj["skill_bindings_json"] or "{}"),
+                created_at=proj["created_at"],
+                updated_at=updated_at,
+            )
+            updated_run = conn.execute(
+                f"SELECT {self._RUN_COLUMNS} FROM generation_runs WHERE id = ?",
+                (run_id,),
+            ).fetchone()
+            return record, self._row_to_run(updated_run)
+
     def get_generation_run(self, run_id: str) -> GenerationRun | None:
         with self._lock:
             row = self._conn.execute(
@@ -652,23 +920,14 @@ class ProjectStore:
             ).fetchone()
         return self._row_to_run(row) if row else None
 
-    def update_generation_run(
-        self, run_id: str, **updates: Any
-    ) -> GenerationRun:
-        """Persist run progress fields; unknown fields are a programming error."""
-        column_map = {
-            "status": "status",
-            "base_revision": "base_revision",
-            "base_state_json": "base_state_json",
-            "completed_steps": "completed_steps_json",
-            "checkpoint_json": "checkpoint_json",
-            "unapplied_json": "unapplied_json",
-            "last_progress": "last_progress_json",
-            "error": "error",
-            "result_summary": "result_summary_json",
-        }
-        assignments, params = [], []
-        for attr, column in column_map.items():
+
+    @staticmethod
+    def _run_update_fields(
+        updates: dict[str, Any]
+    ) -> list[tuple[str, str, Any]]:
+        """Validate/serialize run field updates into (attr, column, value)."""
+        fields: list[tuple[str, str, Any]] = []
+        for attr, column in _RUN_UPDATE_COLUMNS.items():
             if attr not in updates:
                 continue
             value = updates.pop(attr)
@@ -677,12 +936,20 @@ class ProjectStore:
                     json.dumps(value, ensure_ascii=False)
                     if value is not None else None
                 )
-            assignments.append(f"{column} = ?")
-            params.append(value)
+            fields.append((attr, column, value))
         if updates:
             raise TypeError(f"Unknown generation-run fields: {sorted(updates)}")
-        if not assignments:
+        return fields
+
+    def update_generation_run(
+        self, run_id: str, **updates: Any
+    ) -> GenerationRun:
+        """Persist run progress fields; unknown fields are a programming error."""
+        fields = self._run_update_fields(updates)
+        if not fields:
             return self.get_generation_run_required(run_id)
+        assignments = [f"{column} = ?" for _, column, _ in fields]
+        params = [value for _, _, value in fields]
         assignments.append("updated_at = ?")
         params.extend([_utcnow(), run_id])
         with self._write_tx() as conn:
@@ -762,11 +1029,13 @@ class ProjectStore:
         review_json: str,
         source: str,
         summary: str,
-    ) -> None:
+    ) -> tuple[int, str, str]:
         """Append the next version and refresh the current snapshot.
 
         Must run inside a write transaction. The service project ID always
-        wins over any meta.id carried by the state.
+        wins over any meta.id carried by the state. Returns the exact
+        ``(revision, state_json, updated_at)`` this transaction wrote, so
+        callers never have to re-read the project as their new base.
         """
         state.meta.id = project_id
         state.meta.title = title
@@ -785,3 +1054,4 @@ class ProjectStore:
             (project_id, new_revision, title, state_json, review_json,
              source, summary, now),
         )
+        return new_revision, state_json, now

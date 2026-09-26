@@ -10,6 +10,7 @@ import {
   seedProject,
   seedRun,
   sseClosed,
+  sseForceClose,
   sseCount,
   sseDispatch,
   waitForHeld,
@@ -68,6 +69,17 @@ test("the e2e backend itself is model-less: POST /generate is refused without ke
   // Structural guarantee: even a machine whose root .env holds real keys
   // cannot arm this backend — admission fails fast instead of egressing.
   const seeded = await seedProject(request, "无模型探针项目P");
+  // The read-only GET alias never starts anything: without a run it answers
+  // a clear submit-first hint. (Checked first — the refused POST below now
+  // leaves an immediately-failed run row behind, and the alias would then
+  // subscribe to it instead of answering no_run.)
+  const alias = await request.get(
+    `http://127.0.0.1:8310/api/projects/${seeded.project_id}/generate`,
+    { timeout: 5_000 },
+  );
+  expect(alias.status()).toBe(404);
+  expect((await alias.json()).detail.code).toBe("no_run");
+
   const res = await request.post(
     `http://127.0.0.1:8310/api/projects/${seeded.project_id}/generate`,
     { data: {}, timeout: 5_000 },
@@ -75,14 +87,14 @@ test("the e2e backend itself is model-less: POST /generate is refused without ke
   expect(res.status()).toBe(400);
   const body = await res.json();
   expect(body.detail.code).toBe("model_not_configured");
-  // And the read-only GET alias never starts anything: without a run it
-  // answers a clear submit-first hint.
-  const alias = await request.get(
-    `http://127.0.0.1:8310/api/projects/${seeded.project_id}/generate`,
+  // The refused submission settles its admitted row failed immediately —
+  // it never claims to be active.
+  const latest = await request.get(
+    `http://127.0.0.1:8310/api/projects/${seeded.project_id}/runs/latest`,
     { timeout: 5_000 },
   );
-  expect(alias.status()).toBe(404);
-  expect((await alias.json()).detail.code).toBe("no_run");
+  expect(latest.status()).toBe(200);
+  expect((await latest.json()).status).toBe("failed");
 });
 
 test("stubbed run: progress + succeeded done complete the project without any model call", async ({ page }) => {
@@ -190,6 +202,116 @@ test("reopening a project with a previously failed run shows a one-shot notice",
   await expect(page.getByText("正在生成...")).toHaveCount(0);
   // No subscription is opened for a terminal run.
   expect(await sseCount(page)).toBe(0);
+});
+
+test("R5: re-clicking the running project keeps the observation; a lost view recovers", async ({ page, request }) => {
+  const seeded = await seedProject(request, "找回与保留项目K");
+  await seedRun(seeded.project_id, "running");
+  await openApp(page, `/?project=${seeded.project_id}`);
+  await expect(page.getByText(/已重新连接进度/)).toBeVisible();
+  await expect(page.getByRole("button", { name: "停止生成" })).toBeVisible();
+
+  // Re-click the CURRENT project: the live observation stays (connection
+  // not closed, stop button intact), progress keeps flowing.
+  await page.getByRole("button", { name: new RegExp(`^${seeded.title}`) }).click();
+  await expect(page.getByRole("button", { name: "停止生成" })).toBeVisible();
+  expect(await sseClosed(page, RUN_EVENTS)).toBe(false);
+  expect(await sseDispatch(page, RUN_EVENTS, "progress", { message: "正在写剧本…" })).toBe(true);
+  await expect(page.getByText("正在写剧本…")).toBeVisible();
+
+  // A truly lost view (CLOSED, no auto-retry) reports the drop; re-clicking
+  // the project re-queries and resubscribes without a page refresh. (The
+  // first reconnect notice was legitimately replaced in-place by the live
+  // progress message above, so count the new subscription, not messages.)
+  expect(await sseForceClose(page, RUN_EVENTS)).toBe(true);
+  await expect(page.getByText(/与生成进度的连接已断开/)).toBeVisible();
+  await page.getByRole("button", { name: new RegExp(`^${seeded.title}`) }).click();
+  await expect(page.getByText(/已重新连接进度/)).toBeVisible();
+  expect(await sseCount(page)).toBe(2); // a fresh subscription opened
+  expect(await sseDispatch(page, RUN_EVENTS, "progress", { message: "恢复后的进度" })).toBe(true);
+  await expect(page.getByText("恢复后的进度")).toBeVisible();
+});
+
+test("R6: succeeded run whose content refresh fails is not a failed run", async ({ page }) => {
+  await submitStubbedGeneration(page, "刷新失败成功故事V");
+  await expect(page).toHaveURL(/project=/);
+  const pid = new URL(page.url()).searchParams.get("project")!;
+
+  // The outcome GET fails (backend hiccup) — the run itself succeeded.
+  await page.route(`**/api/projects/${pid}`, (route) =>
+    route.fulfill({ status: 500, contentType: "application/json", body: "{}" }),
+  );
+  expect(await sseDispatch(page, RUN_EVENTS, "done", { status: "succeeded" })).toBe(true);
+  await expect(page.getByText(/生成已完成，但内容刷新失败/)).toBeVisible();
+  await expect(page.getByText(/生成未完成/)).toHaveCount(0);
+  await expect(page.getByText("已完成", { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "刷新内容" })).toBeVisible();
+
+  // The refresh entry only re-reads: unblock the GET, click, content loads.
+  await page.unroute(`**/api/projects/${pid}`);
+  await page.getByRole("button", { name: "刷新内容" }).click();
+  await expect(page.getByText(/项目内容已刷新/)).toBeVisible();
+  await expect(page.getByRole("button", { name: "刷新内容" })).toHaveCount(0);
+});
+
+test("R6: a failed run with a failing refresh stays a failure with a retry entry", async ({ page }) => {
+  await submitStubbedGeneration(page, "失败刷新失败故事W");
+  await expect(page).toHaveURL(/project=/);
+  const pid = new URL(page.url()).searchParams.get("project")!;
+  await page.route(`**/api/projects/${pid}`, (route) =>
+    route.fulfill({ status: 500, contentType: "application/json", body: "{}" }),
+  );
+
+  expect(await sseDispatch(page, RUN_EVENTS, "done", { status: "failed", error: "模拟失败" })).toBe(true);
+  await expect(page.getByText(/❌ 生成未完成：模拟失败/)).toBeVisible();
+  await expect(page.getByText(/内容刷新失败/)).toBeVisible();
+  await expect(page.getByText(/生成已完成/)).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "刷新内容" })).toBeVisible();
+});
+
+test("R6: a cancelled run with a failing refresh reports the stop, not a failure", async ({ page }) => {
+  await submitStubbedGeneration(page, "停止刷新失败故事U");
+  await expect(page).toHaveURL(/project=/);
+  const pid = new URL(page.url()).searchParams.get("project")!;
+  await page.route(`**/api/projects/${pid}`, (route) =>
+    route.fulfill({ status: 500, contentType: "application/json", body: "{}" }),
+  );
+
+  expect(await sseDispatch(page, RUN_EVENTS, "done", { status: "cancelled" })).toBe(true);
+  await expect(page.getByText(/🛑 生成已停止/)).toBeVisible();
+  await expect(page.getByText(/内容刷新失败/)).toBeVisible();
+  await expect(page.getByText(/生成未完成/)).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "刷新内容" })).toBeVisible();
+});
+
+test("R7: the status snapshot shows current progress without waiting for new events", async ({ page, request }) => {
+  const seeded = await seedProject(request, "快照进度项目Z");
+  await seedRun(seeded.project_id, "running", {
+    message: "正在撰写第三场剧本…",
+    completedSteps: ["idea_refiner", "structurer"],
+  });
+  await openApp(page, `/?project=${seeded.project_id}`);
+  await expect(page.getByText(/已重新连接进度/)).toBeVisible();
+
+  // The server's first event on subscribe is the snapshot: display it
+  // immediately — no progress event needed.
+  expect(await sseDispatch(page, RUN_EVENTS, "status", {
+    status: "running",
+    last_progress: { stage: "scriptwriter", message: "正在撰写第三场剧本…" },
+    completed_steps: ["idea_refiner", "structurer"],
+  })).toBe(true);
+  await expect(page.getByText("正在撰写第三场剧本…")).toBeVisible();
+
+  // A repeated snapshot (reconnect) replaces the message — no stacking.
+  expect(await sseDispatch(page, RUN_EVENTS, "status", {
+    status: "running",
+    last_progress: { stage: "scriptwriter", message: "正在撰写第三场剧本…" },
+    completed_steps: ["idea_refiner", "structurer"],
+  })).toBe(true);
+  await expect(page.getByText("正在撰写第三场剧本…")).toHaveCount(1);
+
+  expect(await sseDispatch(page, RUN_EVENTS, "done", { status: "succeeded" })).toBe(true);
+  await expect(page.getByText(/🎉 全部生成完成/)).toBeVisible();
 });
 
 test("switching projects mid-generation closes the view; late events cannot touch B", async ({ page, request }) => {

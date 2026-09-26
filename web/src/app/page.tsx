@@ -71,6 +71,9 @@ export default function HomePage() {
   const [leftPanelCollapsed, setLeftPanelCollapsed] = useState(false);
   const [projectListOpen, setProjectListOpen] = useState(true);
   const [sessionNotice, setSessionNotice] = useState<SessionNotice | null>(null);
+  // Bumped when the user re-clicks the already-open project: the chat
+  // panel re-checks run state (keeping a live observation intact).
+  const [projectOpenEpoch, setProjectOpenEpoch] = useState(0);
   const [historyPanel, setHistoryPanel] = useState<HistoryPanelState>(HISTORY_CLOSED);
 
   // Late-response guard: async handlers compare against the project that is
@@ -119,6 +122,14 @@ export default function HomePage() {
   }, []);
 
   const openProject = useCallback(async (id: string) => {
+    if (projectRef.current === id) {
+      // R5: clicking the CURRENT project keeps a live run observation
+      // (SSE + artifacts untouched); a lost view is recovered by the
+      // panel's epoch-keyed re-check below. Only a real switch resets.
+      setProjectOpenEpoch((e) => e + 1);
+      refreshProjects();
+      return;
+    }
     closeStreamRef.current();
     setIsGenerating(false);
     setProjectId(id);
@@ -314,6 +325,7 @@ export default function HomePage() {
           onCollapse={collapseChat}
           sessionNotice={sessionNotice}
           sessionEpoch={sessionNotice?.epoch ?? 0}
+          projectOpenEpoch={projectOpenEpoch}
           isSessionActive={isSessionActive}
           isProjectActive={isProjectActive}
           closeStreamRef={closeStreamRef}

@@ -321,8 +321,13 @@ async def test_generate_missing_model_returns_clear_error(client, monkeypatch):
     r = await c.post(f"/api/projects/{p['project_id']}/generate", json={})
     assert r.status_code == 400
     assert r.json()["detail"]["code"] == "model_not_configured"
-    # No run row was created by the refused submission.
-    assert api._runtime.store.latest_generation_run(p["project_id"]) is None
+    # The admitted run can never start, so it settles failed immediately —
+    # it never claims to be active and a resend of the same request cannot
+    # resurrect it into a model call.
+    run = api._runtime.store.latest_generation_run(p["project_id"])
+    assert run is not None and run.status == "failed"
+    assert "模型不可用" in run.error
+    assert api._runtime.store.active_generation_run(p["project_id"]) is None
     # The project itself remains openable without any model key.
     got = await c.get(f"/api/projects/{p['project_id']}")
     assert got.status_code == 200
