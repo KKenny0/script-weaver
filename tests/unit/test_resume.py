@@ -326,7 +326,7 @@ async def test_resume_rejected_before_any_model_call_on_drift():
         user_input="A spy returns",
         completed_steps=["idea_refiner", "structurer"],
         state=state_through_scriptwriter(),
-        fingerprint={"model": "another-model"},
+        fingerprint={**await current_fingerprint(auto_approve=True), "model": "another-model"},
     )
     with pytest.raises(ResumeRejected) as excinfo:
         await engine.run_full_pipeline(resume_from=checkpoint)
@@ -682,8 +682,11 @@ def test_cli_full_run_then_resume_only_runs_missing_stages(cli_env):
 
     # A completed checkpoint + --resume only re-exports: no engine at all.
     built.clear()
+    config.get_settings().llm_model = "changed-after-completion"
+    config.get_settings().llm_provider = "ollama"
+    config.get_settings().llm_temperature = 0.123
     again = runner.invoke(
-        cli.main, ["generate", "--resume", "--format", "fountain", "-o", str(out_dir)]
+        cli.main, ["generate", "--resume", "--no-auto-approve", "--format", "fountain", "-o", str(out_dir)]
     )
     assert again.exit_code == 0, again.output
     assert built == []  # zero model clients constructed
@@ -803,3 +806,33 @@ async def test_web_and_cli_refuse_the_same_checkpoint_identically(api_factory):
                 )
             assert cli_exc.value.code == web_detail["code"]
             assert cli_exc.value.message == web_detail["message"]
+
+
+@pytest.mark.parametrize("missing", ["provider", "model", "temperature", "max_tokens", "endpoint", "auto_approve", "skill_bindings", "skills"])
+def test_cli_missing_execution_basis_never_builds_engine(cli_env, missing):
+    runner, out_dir, built, _, cli = cli_env
+    fp = asyncio.run(current_fingerprint())
+    del fp[missing]
+    out_dir.mkdir()
+    write_checkpoint_atomic(out_dir / "checkpoint.json", build_checkpoint(user_input="idea", fingerprint=fp))
+    result = runner.invoke(cli.main, ["generate", "--resume", "-o", str(out_dir)])
+    assert result.exit_code != 0
+    assert "缺少有效的执行依据" in result.output
+    assert built == []
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+def test_cli_inherits_omitted_gate_and_refuses_explicit_change(cli_env, monkeypatch, explicit):
+    from unittest.mock import Mock
+    runner, out_dir, _, _, cli = cli_env
+    fp = asyncio.run(current_fingerprint(auto_approve=False))
+    out_dir.mkdir()
+    write_checkpoint_atomic(out_dir / "checkpoint.json", build_checkpoint(user_input="idea", fingerprint=fp))
+    create = Mock(side_effect=RuntimeError("controlled stop before model"))
+    monkeypatch.setattr(cli, "_create_engine", create)
+    result = runner.invoke(cli.main, ["generate", "--resume", "-o", str(out_dir)] + (["--auto-approve"] if explicit else []))
+    if explicit:
+        create.assert_not_called()
+        assert "gate" in result.output
+    else:
+        create.assert_called_once_with(auto_approve=False)

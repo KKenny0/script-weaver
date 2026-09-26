@@ -483,18 +483,29 @@ class _RunManager:
 
         Every eligibility check and the new run's admission coordinate
         under the SAME project lock as submit/refine, so the validated
-        basis can never go stale between check and row creation. The
+        store admission also checks the content basis atomically against manual edits. The
         original run row is never resurrected: a new run record is created
         that inherits the checkpointed success prefix, and the original
         (failed/cancelled/interrupted) row plus its checkpoint stay intact
         for history. All refusals raise :class:`RunSubmitConflict` with a
         stable code — none of them builds a model instance.
         """
-        try:
-            record = await asyncio.to_thread(self.store.get_required, project_id)
-        except ProjectStoreError as exc:
-            raise _store_error(exc) from exc
         async with self._project_lock(project_id):
+            try:
+                record = await asyncio.to_thread(self.store.get_required, project_id)
+            except ProjectStoreError as exc:
+                raise _store_error(exc) from exc
+            key = request_key or f"auto-resume-{run_id}"
+            existing = await asyncio.to_thread(
+                self.store.generation_run_for_key, project_id, key
+            )
+            if existing is not None:
+                if existing.request.get("resume_of") != run_id:
+                    raise RunSubmitConflict(
+                        "request_conflict", "同一 request_key 已绑定其他恢复目标或输入。",
+                        run=existing,
+                    )
+                return existing, False
             if project_id in self._refine_projects:
                 raise RunSubmitConflict(
                     "run_active", "该项目正在处理修改请求，请稍后再恢复生成。"
@@ -585,7 +596,6 @@ class _RunManager:
                 "resume_of": original.run_id,
             }
             request_hash = hash_run_request(request)
-            key = request_key or f"auto-resume-{run_id[:8]}-{request_hash}"
             resumed_checkpoint = checkpoint.model_copy(deep=True)
             resumed_checkpoint.user_input = request["user_input"]
             resumed_checkpoint.growth_status = "pending"
@@ -607,6 +617,8 @@ class _RunManager:
                     checkpoint_json=encode_checkpoint(resumed_checkpoint),
                     completed_steps=list(original.completed_steps),
                 )
+            except RevisionConflictError as exc:
+                raise RunSubmitConflict("project_changed", "项目内容在恢复校验后已被修改，拒绝恢复。", run=original) from exc
             except RequestKeyConflictError as exc:
                 raise RunSubmitConflict(
                     "request_conflict",
@@ -1091,6 +1103,14 @@ async def _run_event_stream(manager: _RunManager, run_id: str):
         manager.unregister(run_id, queue)
 
 
+def _growth_outcome(run: GenerationRun) -> dict:
+    try:
+        checkpoint = decode_checkpoint(run.checkpoint_json)
+    except ResumeRejected:
+        return {"growth_status": None, "growth_error": None}
+    return {"growth_status": checkpoint.growth_status, "growth_error": checkpoint.growth_error}
+
+
 def _serialize_run(run: GenerationRun) -> dict:
     """API shape of a run — progress facts only, no bulky state blobs.
 
@@ -1118,6 +1138,7 @@ def _serialize_run(run: GenerationRun) -> dict:
         "last_progress": run.last_progress,
         "error": run.error,
         "result_summary": run.result_summary,
+        **_growth_outcome(run),
         "created_at": run.created_at,
         "updated_at": run.updated_at,
     }
@@ -1141,6 +1162,7 @@ def _run_done_payload(run: GenerationRun) -> dict:
         ),
         "content_complete": "finalize" in completed,
         "result_summary": run.result_summary,
+        **_growth_outcome(run),
     }
 
 

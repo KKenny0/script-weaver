@@ -194,6 +194,8 @@ def generate(
     remaining stages call the model. A finished checkpoint re-exports the
     requested formats without contacting any model or replaying growth.
     """
+    if resume_ and click.get_current_context().get_parameter_source("auto_approve") == click.core.ParameterSource.DEFAULT:
+        auto_approve = None
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_path = out_dir / "checkpoint.json"
@@ -239,6 +241,7 @@ def _generate_locked(
             _export_results(state, out_dir, output_formats)
             _print_summary(state)
             return
+        auto_approve = checkpoint.fingerprint["auto_approve"]
         idea = checkpoint.user_input
         recorded_title = str(checkpoint.basis.get("title") or "")
         # The recorded title is the generation basis; a --title that only
@@ -365,7 +368,7 @@ def _checkpoint_complete(path: Path) -> bool:
 
 
 def _load_resume_checkpoint(
-    path: Path, *, idea: str | None, title: str, auto_approve: bool
+    path: Path, *, idea: str | None, title: str, auto_approve: bool | None
 ) -> ResumeCheckpoint:
     """Load + fully validate a resume checkpoint; refuse before any model.
 
@@ -423,7 +426,11 @@ def _load_resume_checkpoint(
             err=True,
         )
         sys.exit(1)
+    if checkpoint.content_complete:
+        return checkpoint
     recorded_auto = checkpoint.fingerprint.get("auto_approve")
+    if auto_approve is None:
+        auto_approve = recorded_auto
     if recorded_auto is not None and bool(recorded_auto) != auto_approve:
         click.echo(
             f"无法恢复：--auto-approve（{auto_approve}）与 checkpoint 记录"

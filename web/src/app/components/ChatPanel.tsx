@@ -143,6 +143,7 @@ export default function ChatPanel({
       // second time and must NOT clear it (the known epoch trap), so the
       // clear keys on this bump, not on sessionEpoch.
       setResumeOffer(null);
+      setResumeBusy(false);
     }
   }, [projectId]);
 
@@ -232,6 +233,8 @@ export default function ChatPanel({
       completed_step_labels?: string[];
       next_step_label?: string | null;
       content_complete?: boolean;
+      growth_status?: string | null;
+      growth_error?: string | null;
     },
     source: "done" | "restore",
     origin?: { seq: number; evtSource: EventSource | null },
@@ -320,6 +323,13 @@ export default function ChatPanel({
         content: source === "done"
           ? `❌ 生成未完成：${reason}${resumeNote}${fullState ? "\n已完成的阶段已保存，可从中断处继续或重新生成。" : refreshFailNote}`
           : `ℹ️ 上次生成未完成（${reason}）。已同步已保存的阶段。${resumeNote}${refreshFailNote}`,
+        timestamp: Date.now(),
+      }]);
+    }
+    if (outcome.growth_status === "failed" || outcome.growth_status === "interrupted") {
+      setMessages((prev) => [...prev, {
+        role: "assistant",
+        content: `⚠️ 成长任务${outcome.growth_status === "failed" ? "失败" : "中断"}：${outcome.growth_error || "画像或 Skill 更新未完成"}。已生成内容不受影响；不会自动重放。`,
         timestamp: Date.now(),
       }]);
     }
@@ -561,7 +571,7 @@ export default function ChatPanel({
       // 从头生成 is the explicit fallback.
       setMessages((prev) => [...prev.slice(0, -1), { role: "assistant", content: `⚠️ 无法恢复：${err.message}\n可选择「从头生成」重新开始（历史版本会保留）。`, timestamp: Date.now() }]);
     } finally {
-      if (mountedRef.current) setResumeBusy(false);
+      if (mountedRef.current && openSeqRef.current === seqAtStart && isProjectActive(projectId)) setResumeBusy(false);
     }
   }, [projectId, resumeOffer, isGenerating, resumeBusy, isProjectActive, subscribeRun]);
 
@@ -570,6 +580,7 @@ export default function ChatPanel({
   const handleRegenerate = useCallback(async () => {
     if (!projectId || isGenerating || resumeBusy) return;
     const seqAtStart = openSeqRef.current;
+    if (!window.confirm("将从头生成：当前生成产物将被替换，已完成的阶段不会复用；项目历史版本会保留。是否继续？")) return;
     setResumeOffer(null);
     setMessages((prev) => [...prev, { role: "assistant", content: "正在为当前项目从头生成：已完成的阶段不会复用，当前产物将被替换（历史版本会保留）。", timestamp: Date.now() }]);
     setIsGenerating(true);

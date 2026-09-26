@@ -423,6 +423,19 @@ def assert_fingerprint_match(
     expected: dict[str, Any], actual: dict[str, Any]
 ) -> None:
     """Refuse to resume when the execution basis drifted (zero model calls)."""
+    required = {
+        "provider": str, "model": str, "temperature": (int, float),
+        "max_tokens": int, "endpoint": str, "auto_approve": bool,
+        "skill_bindings": dict, "skills": dict,
+    }
+    for fingerprint in (expected, actual):
+        if any(
+            key not in fingerprint or not isinstance(fingerprint[key], kind)
+            or (key in ("temperature", "max_tokens") and isinstance(fingerprint[key], bool))
+            for key, kind in required.items()
+        ) or any(not isinstance(k, str) or not isinstance(v, str)
+                 for k, v in fingerprint.get("skills", {}).items()):
+            raise ResumeRejected("resume_basis_missing", "checkpoint 缺少有效的执行依据，拒绝恢复（未调用模型）。")
     diffs = fingerprint_diffs(expected, actual)
     if diffs:
         raise ResumeRejected(

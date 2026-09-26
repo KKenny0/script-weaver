@@ -10,6 +10,7 @@ import {
   seedProject,
   seedRun,
   sseFind,
+  sseDispatch,
   waitForHeld,
 } from "./helpers";
 
@@ -156,3 +157,60 @@ test("A→B→A round trip: the offer follows the project, not the page", async 
   await expect(page.getByRole("button", { name: "从中断处继续生成" })).toBeVisible();
   await expect(page.getByText(/上次生成未完成/)).toHaveCount(0);
 });
+
+test('restart must permit cancellation before POST', async ({page, request}) => {
+ const p = await seedProject(request, 'review restart confirm');
+ await seedRun(p.project_id, 'failed', {message:'seed',completedSteps:['idea_refiner']});
+ await openApp(page, `/?project=${p.project_id}`);
+ await gate(page, 'POST /generate');
+ let dialogs=0;
+ page.removeAllListeners('dialog');
+ page.on('dialog', async d => { dialogs++; await d.dismiss(); });
+ await page.getByRole('button',{name:'从头生成',exact:true}).click();
+ expect(dialogs).toBe(1);
+ expect(await page.evaluate(() => (window as any).__gatePending.get('POST /generate')?.length ?? 0)).toBe(0);
+});
+
+test('pending resume of A must not disable B resume', async ({page, request}) => {
+ const a = await seedProject(request, 'review pending A');
+ const b = await seedProject(request, 'review pending B');
+ await seedRun(a.project_id, 'failed', {message:'seed',completedSteps:['idea_refiner']});
+ await seedRun(b.project_id, 'failed', {message:'seed',completedSteps:['idea_refiner']});
+ await openApp(page, `/?project=${a.project_id}`);
+ await gate(page, 'POST /resume');
+ page.removeAllListeners('dialog');
+ page.on('dialog', d => d.accept());
+ await page.getByRole('button',{name:'从中断处继续生成'}).click();
+ await waitForHeld(page,'POST /resume');
+ await page.getByRole('button',{name:new RegExp(`^${b.title}`)}).click();
+ await expect(page.getByRole('button',{name:'从中断处继续生成'})).toBeVisible();
+ await expect(page.getByRole('button',{name:'从中断处继续生成'})).toBeEnabled({timeout:1500});
+ await gateRespond(page, 'POST /resume', 409, {detail:{code:'project_changed',message:'old request rejected'}});
+ await page.getByRole('button',{name:'从中断处继续生成'}).click();
+ await expect.poll(() => page.evaluate(() => (window as any).__gatePending.get('POST /resume')?.length)).toBe(2);
+ await release(page, 'POST /resume');
+ await expect(page.getByRole('button',{name:'从中断处继续生成'})).toBeDisabled();
+ await release(page, 'POST /resume');
+ await expect(page.getByText(/无法恢复：old request rejected/)).toBeVisible();
+ await expect(page.getByRole('button',{name:'从中断处继续生成'})).toBeEnabled();
+});
+
+
+for (const source of ["done", "restore"] as const) {
+  test(`growth warning survives ${source} without failing content`, async ({ page, request }) => {
+    const p = await seedProject(request, `growth warning ${source}`);
+    const outcome = {run_id: "growth-warning", status: "succeeded", content_complete: true,
+      growth_status: "failed", growth_error: "growth disk full"};
+    await page.route(`**/api/projects/${p.project_id}/runs/latest`, route => route.fulfill({
+      json: source === "restore" ? outcome : {run_id: outcome.run_id, status: "running"},
+    }));
+    await openApp(page, `/?project=${p.project_id}`);
+    if (source === "done") {
+      await expect.poll(() => sseFind(page, outcome.run_id)).toBeGreaterThanOrEqual(0);
+      await sseDispatch(page, outcome.run_id, "done", outcome);
+    }
+    await expect(page.getByText(/成长任务失败：growth disk full/)).toBeVisible();
+    await expect(page.getByText(/已生成内容不受影响；不会自动重放/)).toBeVisible();
+    await expect(page.getByRole("button", {name: "从中断处继续生成"})).toHaveCount(0);
+  });
+}

@@ -1819,3 +1819,113 @@ async def test_startup_sweep_converges_midflight_growth_to_interrupted(client):
     )
     assert refused.status_code == 409
     assert refused.json()["detail"]["code"] == "content_complete"
+
+
+async def test_replay_after_progress(client):
+    (api, c) = client
+    p = await create_project(c, 'story')
+    pid = p['project_id']
+    old = await _resumable_run(api, pid, ['idea_refiner'])
+
+    async def pipeline(**kw):
+        state = state_with('story', 'new outline')
+        await kw['on_stage_complete']('structurer', state)
+        raise RuntimeError('offline')
+    scripted_engine(api, pid, pipeline)
+    url = f'/api/projects/{pid}/runs/{old}/resume'
+    first = await c.post(url, json={'request_key': 'same'})
+    assert first.status_code == 200, first.text
+    await await_terminal(api, first.json()['run']['run_id'])
+    replay = await c.post(url, json={'request_key': 'same'})
+    assert replay.status_code == 200, replay.text
+    assert replay.json()['run']['run_id'] == first.json()['run']['run_id']
+    assert replay.json()['created'] is False
+    api.get_settings().llm_model = 'changed-after-admission'
+    replay = await c.post(url, json={'request_key': 'same'})
+    assert replay.status_code == 200, replay.text
+    other = await _resumable_run(api, pid, ['idea_refiner'])
+    conflict = await c.post(f'/api/projects/{pid}/runs/{other}/resume', json={'request_key': 'same'})
+    assert conflict.status_code == 409
+    assert conflict.json()['detail']['code'] == 'request_conflict'
+
+async def test_stale_prelock_basis(client, monkeypatch):
+    import asyncio, threading
+    (api, c) = client
+    p = await create_project(c, 'story')
+    pid = p['project_id']
+    old = await _resumable_run(api, pid, ['idea_refiner'])
+    manager = api._runtime.runs
+    store = api._runtime.store
+    seen = threading.Event()
+    original_get = store.get_required
+
+    def get(pid):
+        value = original_get(pid)
+        seen.set()
+        return value
+    monkeypatch.setattr(store, 'get_required', get)
+    calls = []
+
+    async def pipeline(**kw):
+        calls.append(1)
+        raise RuntimeError('offline')
+    scripted_engine(api, pid, pipeline)
+    lock = manager._project_lock(pid)
+    await lock.acquire()
+    task = asyncio.create_task(c.post(f'/api/projects/{pid}/runs/{old}/resume', json={'request_key': 'new'}))
+    await asyncio.to_thread(seen.wait, 2)
+    record = original_get(pid)
+    edited = record.state.model_copy(deep=True)
+    edited.refined_idea = 'USER NEW CONTENT'
+    store.save_state(pid, edited, record.revision, source='manual', summary='edit')
+    lock.release()
+    response = await task
+    if response.status_code == 200:
+        await await_terminal(api, response.json()['run']['run_id'])
+    assert response.status_code == 409, (response.text, calls)
+    assert calls == []
+
+async def test_growth_warning_remains_visible_in_latest_run(client):
+    (api, c) = client
+    p = await create_project(c, 'review growth')
+
+    async def pipeline(**kwargs):
+        state = state_with('review growth', 'complete outline')
+        await kwargs['on_stage_complete']('idea_refiner', state)
+        await kwargs['on_growth_event']('running', None)
+        await kwargs['on_growth_event']('failed', 'growth disk full')
+        return state
+    scripted_engine(api, p['project_id'], pipeline)
+    r = await c.post(f"/api/projects/{p['project_id']}/generate", json={'request_key': 'growth'})
+    await await_terminal(api, r.json()['run']['run_id'])
+    latest = await c.get(f"/api/projects/{p['project_id']}/runs/latest")
+    assert 'growth disk full' in latest.text, latest.text
+    done = api._run_done_payload(api._runtime.store.get_generation_run(r.json()['run']['run_id']))
+    assert done['growth_status'] == 'failed'
+    assert done['growth_error'] == 'growth disk full'
+    assert done['status'] == 'succeeded'
+
+async def test_resume_rejects_edit_during_admission_transaction(client, monkeypatch):
+    (api, c) = client
+    project = await create_project(c, 'story')
+    pid = project['project_id']
+    old = await _resumable_run(api, pid, ['idea_refiner'])
+    store = api._runtime.store
+    original_admit = store.admit_generation_run
+    calls = []
+
+    async def pipeline(**kwargs):
+        calls.append(1)
+    scripted_engine(api, pid, pipeline)
+
+    def admit(*args, **kwargs):
+        record = store.get_required(pid)
+        state = record.state
+        state.refined_idea = 'manual edit during admission'
+        store.save_state(pid, state, record.revision, source='manual', summary='edit')
+        return original_admit(*args, **kwargs)
+    monkeypatch.setattr(store, 'admit_generation_run', admit)
+    response = await c.post(f'/api/projects/{pid}/runs/{old}/resume', json={'request_key': 'race'})
+    assert response.status_code == 409, response.text
+    assert response.json()['detail']['code'] == 'project_changed'
+    assert calls == []

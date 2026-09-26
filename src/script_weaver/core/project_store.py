@@ -679,8 +679,10 @@ class ProjectStore:
         The ``(project_id, request_key)`` lookup covers runs in **every**
         status, earliest record first — a key keeps pointing at its original
         request even when later runs (other keys) overshadow it, and input
-        equality is judged against the stored snapshot's hash, never by
-        re-interpreting the project's current content. Same key + same input
+        equality is judged against the stored snapshot's hash for fresh runs.
+        Resume requests instead use the immutable resume_of target: progress
+        and later configuration changes cannot invalidate an admitted intent.
+        Same key + same input
         returns the original run (``created=False``); same key + different
         input raises :class:`RequestKeyConflictError`; another active run
         raises :class:`ActiveRunConflictError`; otherwise the row is created
@@ -699,11 +701,22 @@ class ProjectStore:
             ).fetchone()
             if existing is not None:
                 run = self._row_to_run(existing)
-                if run.request_hash != request_hash:
+                same_resume = request.get("resume_of") is not None and request.get("resume_of") == run.request.get("resume_of")
+                if not same_resume and run.request_hash != request_hash:
                     raise RequestKeyConflictError(
                         "同一 request_key 已绑定其他输入，提交被拒绝。", run=run
                     )
                 return run, False
+            if request.get("resume_of") is not None:
+                project = conn.execute(
+                    "SELECT revision, state_json FROM projects WHERE id = ?", (project_id,)
+                ).fetchone()
+                if project is None:
+                    raise ProjectNotFoundError(f"Project '{project_id}' not found")
+                if content_signature(project["state_json"]) != content_signature(base_state_json):
+                    raise RevisionConflictError(
+                        "项目内容在恢复校验后已被修改。", current_revision=project["revision"]
+                    )
             active = conn.execute(
                 f"SELECT {self._RUN_COLUMNS} FROM generation_runs"
                 f" WHERE project_id = ? AND status IN ({','.join('?' * len(RUN_ACTIVE_STATUSES))})"
@@ -908,6 +921,16 @@ class ProjectStore:
             row = self._conn.execute(
                 f"SELECT {self._RUN_COLUMNS} FROM generation_runs WHERE id = ?",
                 (run_id,),
+            ).fetchone()
+        return self._row_to_run(row) if row else None
+
+    def generation_run_for_key(self, project_id: str, request_key: str) -> GenerationRun | None:
+        with self._lock:
+            row = self._conn.execute(
+                f"SELECT {self._RUN_COLUMNS} FROM generation_runs"
+                " WHERE project_id = ? AND request_key = ?"
+                " ORDER BY created_at ASC, rowid ASC LIMIT 1",
+                (project_id, request_key),
             ).fetchone()
         return self._row_to_run(row) if row else None
 
