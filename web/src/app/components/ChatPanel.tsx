@@ -59,6 +59,7 @@ interface ChatPanelProps {
   projectStatus: "idle" | "running" | "complete" | "error";
   setProjectStatus: (s: "idle" | "running" | "complete" | "error") => void;
   onArtifactUpdate: (data: Record<string, any>) => void;
+  refreshProjectContent: (id: string) => Promise<Record<string, any> | null>;
   onTabSwitch: (tab: string) => void;
   onCollapse: () => void;
   sessionNotice: SessionNotice | null;
@@ -78,6 +79,7 @@ export default function ChatPanel({
   isGenerating, setIsGenerating,
   projectStatus, setProjectStatus,
   onArtifactUpdate, onTabSwitch,
+  refreshProjectContent,
   onCollapse,
   sessionNotice,
   sessionEpoch,
@@ -112,10 +114,6 @@ export default function ChatPanel({
   // harmless.
   const openSeqRef = useRef(0);
   const lastProjectRef = useRef<string | null>(null);
-  // Monotonic token for project-content reads: overlapping refreshes (done
-  // follow-up, terminal recovery, manual retry) apply only the newest one —
-  // a slow OLD response can never overwrite what a newer one rendered.
-  const contentReqRef = useRef(0);
   // Run ids whose outcome this panel already presented (live done or
   // terminal recovery): re-clicks and re-opens never re-announce them.
   const presentedRunsRef = useRef<Set<string>>(new Set());
@@ -203,15 +201,6 @@ export default function ChatPanel({
     });
   }, [onArtifactUpdate]);
 
-  // Every project-content read goes through one tokened helper: a request
-  // superseded by a newer one returns null and its caller writes nothing.
-  const refreshProjectContent = useCallback(async (pid: string) => {
-    const token = ++contentReqRef.current;
-    const fullState = await apiGet(`/projects/${pid}`);
-    if (token !== contentReqRef.current) return null; // a newer refresh owns the UI
-    return fullState;
-  }, []);
-
   // ── Unified run-outcome presentation (review R3: one path, no drift) ──
   //
   // The live SSE ``done`` event and the terminal recovery of ``runs/latest``
@@ -234,31 +223,32 @@ export default function ChatPanel({
       outcome.status === "cancelled" || outcome.status === "failed" || outcome.status === "interrupted"
         ? outcome.status
         : "succeeded"; // legacy done {} = success
+    const stillOwns = () =>
+      mountedRef.current &&
+      openSeqRef.current === started.seq &&
+      isProjectActive(pid) &&
+      !(started.evtSource && eventSourceRef.current && eventSourceRef.current !== started.evtSource);
+    if (!stillOwns()) return false;
+    // The run has ended even if a newer content read supersedes this one.
+    setProjectStatus(status === "succeeded" ? "complete" : status === "cancelled" ? "idle" : "error");
     let fullState: any = null;
-    let refreshFailed = false;
     let superseded = false;
     try {
       fullState = await refreshProjectContent(pid);
       if (fullState === null) superseded = true; // a newer refresh owns the UI
     } catch (fetchErr) {
       console.error("Failed to fetch final state:", fetchErr);
-      refreshFailed = true;
     }
     if (superseded) return false;
-    const stillOwns = () =>
-      mountedRef.current &&
-      openSeqRef.current === started.seq &&
-      isProjectActive(pid) &&
-      !(started.evtSource && eventSourceRef.current && eventSourceRef.current !== started.evtSource);
     if (!stillOwns()) return false; // async continuation returned into another session/view
     if (fullState) {
       applyFullState(fullState);
       onProjectMutated();
+      setContentRefreshPending(false);
     }
     const refreshFailNote = fullState ? "" : "\n（内容刷新失败，已保留当前显示；可点击「刷新内容」重试。）";
 
     if (status === "succeeded") {
-      setProjectStatus("complete");
       if (fullState) {
         setMessages((prev) => [...prev, {
           role: "assistant",
@@ -294,7 +284,6 @@ export default function ChatPanel({
       }]);
     } else {
       // failed / interrupted
-      setProjectStatus("error");
       if (!fullState) setContentRefreshPending(true);
       const reason = outcome.error
         || (status === "interrupted" ? "服务在生成期间重启，运行已中断" : "生成失败");
@@ -307,7 +296,7 @@ export default function ChatPanel({
       }]);
     }
     return true;
-  }, [isProjectActive, applyFullState, onProjectMutated, onTabSwitch, setProjectStatus]);
+  }, [isProjectActive, refreshProjectContent, applyFullState, onProjectMutated, onTabSwitch, setProjectStatus]);
 
   // ── Background run subscription (ticket #14) ─────────
 
@@ -577,7 +566,8 @@ export default function ChatPanel({
 
       let reloaded = false;
       try {
-        const fullState = await apiGet(`/projects/${projectId}`);
+        const fullState = await refreshProjectContent(projectId);
+        if (fullState === null) return;
         if (!mountedRef.current || openSeqRef.current !== seqAtStart || !isProjectActive(projectId)) return;
         applyFullState(fullState);
         onProjectMutated();
@@ -609,7 +599,8 @@ export default function ChatPanel({
       if (err?.code === "revision_conflict") {
         setMessages((prev) => [...prev.slice(0, -1), { role: "assistant", content: "⚠️ 项目已在其他窗口被修改，已为你重新加载最新内容。请基于最新内容重试修改。", timestamp: Date.now() }]);
         try {
-          const fullState = await apiGet(`/projects/${projectId}`);
+          const fullState = await refreshProjectContent(projectId);
+          if (fullState === null) return;
           if (mountedRef.current && openSeqRef.current === seqAtStart && isProjectActive(projectId)) applyFullState(fullState);
         } catch (fetchErr) {
           console.error("Failed to reload project:", fetchErr);
@@ -623,7 +614,7 @@ export default function ChatPanel({
         setMessages((prev) => [...prev.slice(0, -1), { role: "assistant", content: `❌ 修改失败: ${err.message}`, timestamp: Date.now() }]);
       }
     }
-  }, [projectId, inputValue, isGenerating, isProjectActive, applyFullState, onProjectMutated]);
+  }, [projectId, inputValue, isGenerating, isProjectActive, refreshProjectContent, applyFullState, onProjectMutated]);
 
   const toggleSkill = (skillId: string) => {
     setActiveSkillIds((prev) => {

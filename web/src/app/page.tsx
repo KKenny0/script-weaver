@@ -86,6 +86,7 @@ export default function HomePage() {
   // one, so a late history response can only ever update the view session
   // it belongs to.
   const historyReqRef = useRef(0);
+  const contentReqRef = useRef(0);
   // Set by ChatPanel; closing the stream ends the subscription only (the
   // backend owns the task).
   const closeStreamRef = useRef<() => void>(() => {});
@@ -121,6 +122,19 @@ export default function HomePage() {
     }
   }, []);
 
+  // Page opens and chat refreshes share ownership, including failed reads.
+  // A superseded response returns null; only the newest read can write UI.
+  const refreshProjectContent = useCallback(async (id: string) => {
+    const token = ++contentReqRef.current;
+    try {
+      const fullState = await apiGet(`/projects/${id}`);
+      return token === contentReqRef.current ? fullState : null;
+    } catch (err) {
+      if (token !== contentReqRef.current) return null;
+      throw err;
+    }
+  }, []);
+
   const openProject = useCallback(async (id: string) => {
     if (projectRef.current === id) {
       // R5: clicking the CURRENT project keeps a live run observation
@@ -147,7 +161,8 @@ export default function HomePage() {
     // second open's fresh content.
     const epochAtStart = sessionEpochRef.current;
     try {
-      const fullState = await apiGet(`/projects/${id}`);
+      const fullState = await refreshProjectContent(id);
+      if (fullState === null) return;
       if (projectRef.current !== id || !isSessionActive(epochAtStart)) return; // superseded open
       setArtifactData(pickArtifactData(fullState));
       // The backend reports "running" while a generation run is active for
@@ -166,13 +181,14 @@ export default function HomePage() {
       nextNotice(`❌ 打开项目失败: ${err.message}`);
     }
     refreshProjects();
-  }, [nextNotice, refreshProjects, isSessionActive]);
+  }, [nextNotice, refreshProjects, isSessionActive, refreshProjectContent]);
 
   const startNewProject = useCallback(() => {
     closeStreamRef.current();
     setIsGenerating(false);
     setProjectId("");
     projectRef.current = "";
+    contentReqRef.current++;
     setArtifactData({});
     setActiveTab("outline");
     setProjectStatus("idle");
@@ -185,6 +201,7 @@ export default function HomePage() {
   // A generation that just created its project keeps the current chat
   // session; only the URL and the project list change.
   const handleProjectCreated = useCallback((id: string) => {
+    contentReqRef.current++;
     setProjectId(id);
     projectRef.current = id;
     window.history.replaceState(null, "", `/?project=${encodeURIComponent(id)}`);
@@ -326,6 +343,7 @@ export default function HomePage() {
           projectStatus={projectStatus}
           setProjectStatus={setProjectStatus}
           onArtifactUpdate={setArtifactData}
+          refreshProjectContent={refreshProjectContent}
           onTabSwitch={setActiveTab}
           onCollapse={collapseChat}
           sessionNotice={sessionNotice}

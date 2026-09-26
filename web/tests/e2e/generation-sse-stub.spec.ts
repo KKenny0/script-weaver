@@ -544,7 +544,8 @@ test("P2-3: reconnecting the SAME project invalidates the old subscription's don
   await expect(page.getByText("重连后的进度")).toBeVisible();
 });
 
-test("P2-3: two overlapping content refreshes returning out of order — only the newest applies", async ({ page, request }) => {
+for (const staleStatus of [200, 500]) {
+test(`P2-3: overlapping content refreshes ignore stale ${staleStatus} after newer success`, async ({ page, request }) => {
   const a = await seedProject(request, "倒序刷新项目O");
   await seedOutline(a.project_id, "最初的旧大纲");
   await seedRun(a.project_id, "succeeded");
@@ -577,14 +578,17 @@ test("P2-3: two overlapping content refreshes returning out of order — only th
   // The succeeded run's restore opens the first refresh (held). Give it a
   // bounded window, then make a NEWER finished run and re-click: a second
   // restore runs and its refresh answers immediately.
-  await Promise.race([held, new Promise((r) => setTimeout(r, 3_000))]);
+  await Promise.race([held, new Promise((_, reject) => setTimeout(() => reject(new Error("restore GET was not intercepted")), 5_000))]);
   await seedRun(a.project_id, "succeeded");
   await page.getByRole("button", { name: new RegExp(`^${a.title}`) }).click();
   await expect(page.getByText("第二次恢复的新快照", { exact: true })).toBeVisible();
 
   // The OLDER refresh returns last: it must not win.
-  if (heldRoute) {
-    await heldRoute.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(withLogline("第一次恢复的旧快照")) });
+  expect(heldRoute).toBeTruthy();
+  {
+    const response = page.waitForResponse((r) => r.url().endsWith(`/api/projects/${a.project_id}`) && r.status() === staleStatus);
+    await heldRoute.fulfill({ status: staleStatus, contentType: "application/json", body: JSON.stringify(staleStatus === 200 ? withLogline("第一次恢复的旧快照") : { detail: "stale refresh failure" }) });
+    await (await response).finished();
     await page.evaluate(
       () =>
         new Promise<void>((resolve) =>
@@ -594,7 +598,11 @@ test("P2-3: two overlapping content refreshes returning out of order — only th
   }
   await expect(page.getByText("第二次恢复的新快照", { exact: true })).toBeVisible();
   await expect(page.getByText("第一次恢复的旧快照", { exact: true })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "刷新内容" })).toHaveCount(0);
+  await expect(page.getByText(/但内容刷新失败/)).toHaveCount(0);
 });
+
+}
 
 test("P2-3: switching projects clears the previous session's pending refresh-retry entry", async ({ page, request }) => {
   const b = await seedProject(request, "清理重试目标项目M");
@@ -647,4 +655,76 @@ test("P2-3: the page's own open-project response cannot overwrite a reopened pro
   );
   await expect(page.getByText("页级新大纲", { exact: true })).toBeVisible();
   await expect(page.getByText("页级旧大纲", { exact: true })).toHaveCount(0);
+});
+
+test("P2-3: late initial project GET cannot replace newer terminal recovery", async ({page, request}) => {
+  const a = await seedProject(request, "页级恢复竞争");
+  await seedOutline(a.project_id, "初次读取旧快照");
+  await seedRun(a.project_id, "succeeded");
+  const old = await (await request.get(`http://127.0.0.1:8310/api/projects/${a.project_id}`)).json();
+  let heldRoute: any;
+  let markHeld!: () => void;
+  const held = new Promise<void>(resolve => {markHeld = resolve;});
+  let n = 0;
+  await page.route(`**/api/projects/${a.project_id}`, async route => {
+    n++;
+    if(n === 1) {heldRoute = route; markHeld(); return;}
+    await route.continue();
+  });
+  // Start on another project so the project-open GET and ChatPanel restore
+  // are allowed to settle independently.
+  const b = await seedProject(request, "页级恢复来源");
+  await openApp(page, `/?project=${b.project_id}`);
+  await page.getByRole("button", {name: new RegExp(`^${a.title}`)}).click();
+  await Promise.race([held, new Promise((_,reject)=>setTimeout(()=>reject(new Error("open GET not held")),5000))]);
+  await seedOutline(a.project_id, "终态恢复新快照");
+  // First recovery may have read before the seed, so explicitly re-open
+  // observation with a NEW terminal run to force a current read.
+  await seedRun(a.project_id, "succeeded");
+  await page.getByRole("button", {name: new RegExp(`^${a.title}`)}).click();
+  await expect(page.getByText("终态恢复新快照", {exact:true})).toBeVisible();
+  const response = page.waitForResponse(r=>r.url().endsWith(`/api/projects/${a.project_id}`));
+  await heldRoute.fulfill({status:200,contentType:"application/json",body:JSON.stringify(old)});
+  await (await response).finished();
+  await page.evaluate(()=>new Promise<void>(resolve=>requestAnimationFrame(()=>setTimeout(()=>requestAnimationFrame(()=>resolve()),0))));
+  await expect(page.getByText("终态恢复新快照", {exact:true})).toBeVisible();
+  await expect(page.getByText("初次读取旧快照", {exact:true})).toHaveCount(0);
+});
+
+
+test("P2-3: refine supersedes terminal recovery content without losing the run outcome", async ({ page, request }) => {
+  const a = await seedProject(request, "恢复与修改竞争");
+  await seedOutline(a.project_id, "修改前大纲");
+  const old = await (await request.get(`http://127.0.0.1:8310/api/projects/${a.project_id}`)).json();
+  await openApp(page, `/?project=${a.project_id}`);
+  await expect(page.getByText("修改前大纲", { exact: true })).toBeVisible();
+  await seedRun(a.project_id, "failed");
+
+  let heldRoute: any;
+  let markHeld!: () => void;
+  const held = new Promise<void>((resolve) => { markHeld = resolve; });
+  await page.route(`**/api/projects/${a.project_id}`, async (route) => {
+    if (!heldRoute) { heldRoute = route; markHeld(); return; }
+    await route.continue();
+  });
+  await page.getByRole("button", { name: new RegExp(`^${a.title}`) }).click();
+  await Promise.race([held, new Promise((_, reject) => setTimeout(() => reject(new Error("recovery GET was not intercepted")), 5_000))]);
+  await expect(page.getByText("出错了", { exact: true })).toBeVisible();
+
+  await seedOutline(a.project_id, "修改后的新大纲");
+  await gateRespond(page, "POST /refine", 200, {
+    changes: [{ path: "outline", before: "修改前大纲", after: "修改后的新大纲" }], total_changes: 1,
+  });
+  await page.getByPlaceholder("输入修改指令，按 Enter 发送...").fill("调整大纲");
+  await page.locator("textarea ~ button").click();
+  await release(page, "POST /refine");
+  await expect(page.getByText("修改后的新大纲", { exact: true })).toBeVisible();
+
+  const response = page.waitForResponse((r) => r.url().endsWith(`/api/projects/${a.project_id}`));
+  await heldRoute.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(old) });
+  await (await response).finished();
+  await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => setTimeout(() => requestAnimationFrame(() => resolve()), 0))));
+  await expect(page.getByText("修改后的新大纲", { exact: true })).toBeVisible();
+  await expect(page.getByText("出错了", { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "刷新内容" })).toHaveCount(0);
 });
