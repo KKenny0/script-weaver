@@ -99,6 +99,12 @@ export default function ChatPanel({
   const [stopRequested, setStopRequested] = useState(false);
   // A finished run whose content refresh failed: offer a GET-only retry.
   const [contentRefreshPending, setContentRefreshPending] = useState(false);
+  // A terminal failed/cancelled/interrupted run whose content is NOT
+  // complete: offer to resume it from its checkpoint (ticket #15). The
+  // POST /resume does the authoritative eligibility check — a refusal
+  // shows its reason here and 从头生成 stays available.
+  const [resumeOffer, setResumeOffer] = useState<{ runId: string } | null>(null);
+  const [resumeBusy, setResumeBusy] = useState(false);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const eventSourceRef = useRef<EventSource | null>(null);
@@ -131,6 +137,12 @@ export default function ChatPanel({
     if (lastProjectRef.current !== projectId) {
       lastProjectRef.current = projectId;
       openSeqRef.current += 1;
+      // A REAL project change (switch or fresh open — including an
+      // A→B→A round trip) ends any resume offer from the previous
+      // project. Follow-up notices inside one open bump sessionEpoch a
+      // second time and must NOT clear it (the known epoch trap), so the
+      // clear keys on this bump, not on sessionEpoch.
+      setResumeOffer(null);
     }
   }, [projectId]);
 
@@ -212,7 +224,15 @@ export default function ChatPanel({
   // message), plus the content token above.
   const presentRunOutcome = useCallback(async (
     pid: string,
-    outcome: { status?: string; error?: string | null },
+    outcome: {
+      status?: string;
+      error?: string | null;
+      run_id?: string;
+      completed_steps?: string[];
+      completed_step_labels?: string[];
+      next_step_label?: string | null;
+      content_complete?: boolean;
+    },
     source: "done" | "restore",
     origin?: { seq: number; evtSource: EventSource | null },
   ): Promise<boolean> => {
@@ -247,8 +267,14 @@ export default function ChatPanel({
       setContentRefreshPending(false);
     }
     const refreshFailNote = fullState ? "" : "\n（内容刷新失败，已保留当前显示；可点击「刷新内容」重试。）";
+    // Ticket #15: which stages survived and where a resume would continue.
+    const resumeNote = formatResumeProgress(outcome);
+    // Offer the resume entry only for unfinished content on a terminal
+    // run — the POST /resume re-checks eligibility server-side.
+    const resumable = isResumableOutcome(outcome);
 
     if (status === "succeeded") {
+      setResumeOffer(null);
       if (fullState) {
         setMessages((prev) => [...prev, {
           role: "assistant",
@@ -275,23 +301,25 @@ export default function ChatPanel({
     } else if (status === "cancelled") {
       setProjectStatus(fullState ? "complete" : "idle");
       if (!fullState) setContentRefreshPending(true);
+      setResumeOffer(resumable ? { runId: outcome.run_id! } : null);
       setMessages((prev) => [...prev, {
         role: "assistant",
         content: source === "done"
-          ? `🛑 生成已停止。已完成并保存的阶段保留在项目中，可继续修改或重新生成。${refreshFailNote}`
-          : `ℹ️ 上次生成已停止；已保存并同步完成的阶段。${refreshFailNote}`,
+          ? `🛑 生成已停止。已完成并保存的阶段保留在项目中，可继续修改或重新生成。${resumeNote}${refreshFailNote}`
+          : `ℹ️ 上次生成已停止；已保存并同步完成的阶段。${resumeNote}${refreshFailNote}`,
         timestamp: Date.now(),
       }]);
     } else {
       // failed / interrupted
       if (!fullState) setContentRefreshPending(true);
+      setResumeOffer(resumable ? { runId: outcome.run_id! } : null);
       const reason = outcome.error
         || (status === "interrupted" ? "服务在生成期间重启，运行已中断" : "生成失败");
       setMessages((prev) => [...prev, {
         role: "assistant",
         content: source === "done"
-          ? `❌ 生成未完成：${reason}${fullState ? "\n已完成的阶段已保存，可重新提交生成。" : refreshFailNote}`
-          : `ℹ️ 上次生成未完成（${reason}）。已同步已保存的阶段，可重新提交生成。${refreshFailNote}`,
+          ? `❌ 生成未完成：${reason}${resumeNote}${fullState ? "\n已完成的阶段已保存，可从中断处继续或重新生成。" : refreshFailNote}`
+          : `ℹ️ 上次生成未完成（${reason}）。已同步已保存的阶段。${resumeNote}${refreshFailNote}`,
         timestamp: Date.now(),
       }]);
     }
@@ -310,6 +338,8 @@ export default function ChatPanel({
     setActiveRunId(runId);
     setStopRequested(false);
     setIsGenerating(true);
+    // A live run supersedes any resume offer from an earlier terminal run.
+    setResumeOffer(null);
 
     // The subscription belongs to (this instance, this session, this
     // project) AND must still be the CURRENT subscription: a listener whose
@@ -436,7 +466,13 @@ export default function ChatPanel({
         subscribeRun(projectId, run.run_id);
         return;
       }
-      if (presentedRunsRef.current.has(run.run_id)) return; // already announced once
+      if (presentedRunsRef.current.has(run.run_id)) {
+        // Already announced once (re-open, A→B→A): never re-announce, but
+        // DO re-offer the resume entry — the offer belongs to the project
+        // and was cleared when the session moved away.
+        if (isResumableOutcome(run)) setResumeOffer({ runId: run.run_id });
+        return;
+      }
       const presented = await presentRunOutcome(projectId, run, "restore");
       if (presented && run.run_id) {
         presentedRunsRef.current.add(run.run_id);
@@ -489,6 +525,69 @@ export default function ChatPanel({
       setMessages((prev) => [...prev, { role: "assistant", content: `⚠️ 停止请求失败：${err.message}。生成仍在进行。`, timestamp: Date.now() }]);
     }
   }, [projectId, isProjectActive]);
+
+  // ── Ticket #15: resume an unfinished run from its checkpoint ──
+  //
+  // The confirm wording states the real effects: continuing replaces the
+  // current generated artifacts as the pipeline re-runs from the first
+  // unfinished stage, while every saved version stays in the project's
+  // history. A server refusal shows its specific reason (config changed,
+  // project edited, missing basis…) and the explicit 从头生成 remains.
+  const handleResume = useCallback(async () => {
+    if (!projectId || !resumeOffer || isGenerating || resumeBusy) return;
+    const seqAtStart = openSeqRef.current;
+    const confirmed = window.confirm(
+      "将继续上次未完成的生成：已成功的阶段会被复用，未完成的阶段将重新生成；当前生成产物将被替换，项目历史版本会保留。是否继续？",
+    );
+    if (!confirmed) return;
+    setResumeBusy(true);
+    setMessages((prev) => [...prev, { role: "assistant", content: "正在从检查点恢复生成…", timestamp: Date.now() }]);
+    try {
+      const submitted = await apiPost(`/projects/${projectId}/runs/${resumeOffer.runId}/resume`, {
+        request_key: crypto.randomUUID(),
+      });
+      if (!mountedRef.current || openSeqRef.current !== seqAtStart || !isProjectActive(projectId)) return;
+      if (submitted.created) {
+        setResumeOffer(null);
+        setMessages((prev) => [...prev.slice(0, -1), { role: "assistant", content: "恢复已提交：已复用之前完成的阶段，正在继续生成。", timestamp: Date.now() }]);
+      } else {
+        setMessages((prev) => [...prev.slice(0, -1), { role: "assistant", content: "该恢复请求已在处理中，已连接其进度。", timestamp: Date.now() }]);
+      }
+      subscribeRun(projectId, submitted.run.run_id);
+    } catch (err: any) {
+      if (!mountedRef.current || openSeqRef.current !== seqAtStart || !isProjectActive(projectId)) return;
+      // Keep the failed-run message and the resume row: the refusal reason
+      // is actionable (fix config / accept that the project changed) and
+      // 从头生成 is the explicit fallback.
+      setMessages((prev) => [...prev.slice(0, -1), { role: "assistant", content: `⚠️ 无法恢复：${err.message}\n可选择「从头生成」重新开始（历史版本会保留）。`, timestamp: Date.now() }]);
+    } finally {
+      if (mountedRef.current) setResumeBusy(false);
+    }
+  }, [projectId, resumeOffer, isGenerating, resumeBusy, isProjectActive, subscribeRun]);
+
+  // Explicit regeneration for THIS project: a full fresh run that replaces
+  // the current artifacts (versions keep the history).
+  const handleRegenerate = useCallback(async () => {
+    if (!projectId || isGenerating || resumeBusy) return;
+    const seqAtStart = openSeqRef.current;
+    setResumeOffer(null);
+    setMessages((prev) => [...prev, { role: "assistant", content: "正在为当前项目从头生成：已完成的阶段不会复用，当前产物将被替换（历史版本会保留）。", timestamp: Date.now() }]);
+    setIsGenerating(true);
+    setProjectStatus("running");
+    try {
+      const submitted = await apiPost(`/projects/${projectId}/generate`, {
+        request_key: crypto.randomUUID(),
+      });
+      if (!mountedRef.current || openSeqRef.current !== seqAtStart || !isProjectActive(projectId)) return;
+      setMessages((prev) => [...prev, { role: "assistant", content: "从头生成已提交，正在后台运行。", timestamp: Date.now() }]);
+      subscribeRun(projectId, submitted.run.run_id);
+    } catch (err: any) {
+      if (!mountedRef.current || openSeqRef.current !== seqAtStart || !isProjectActive(projectId)) return;
+      setIsGenerating(false);
+      setProjectStatus("error");
+      setMessages((prev) => [...prev, { role: "assistant", content: `❌ 从头生成提交失败: ${err.message}`, timestamp: Date.now() }]);
+    }
+  }, [projectId, isGenerating, resumeBusy, isProjectActive, subscribeRun, setIsGenerating, setProjectStatus]);
 
 
   const handleGenerate = useCallback(async () => {
@@ -746,6 +845,41 @@ export default function ChatPanel({
             </button>
           </div>
         )}
+
+        {resumeOffer && !isGenerating && (
+          <div style={{ alignSelf: "flex-start", padding: "2px 6px", display: "flex", gap: 8 }}>
+            <button
+              onClick={handleResume}
+              disabled={resumeBusy}
+              className="btn-primary"
+              style={{
+                display: "inline-flex", alignItems: "center", gap: 4,
+                padding: "4px 12px", borderRadius: 12, fontSize: 12,
+                cursor: resumeBusy ? "default" : "pointer",
+                opacity: resumeBusy ? 0.6 : 1,
+              }}
+              title="从上次未完成的阶段继续生成（复用已成功的阶段）"
+              aria-label="从中断处继续生成"
+            >
+              ▶ 从中断处继续
+            </button>
+            <button
+              onClick={handleRegenerate}
+              disabled={resumeBusy}
+              className="btn-ghost"
+              style={{
+                display: "inline-flex", alignItems: "center", gap: 4,
+                padding: "4px 12px", borderRadius: 12, fontSize: 12,
+                border: "1px solid var(--border-default)",
+                cursor: resumeBusy ? "default" : "pointer",
+              }}
+              title="丢弃未完成的进度，为当前项目重新完整生成（历史版本保留）"
+              aria-label="从头生成"
+            >
+              🆕 从头生成
+            </button>
+          </div>
+        )}
       </div>
 
       {/* Input area — Composer per Design Spec */}
@@ -790,6 +924,40 @@ const REFINE_UNAPPLIED_CODES = new Set([
   "refine_not_executable",
   "refine_target_not_found",
 ]);
+
+/** Ticket #15: a terminal unfinished-content run is resumable — the POST
+ * /resume does the authoritative check; this only gates the entry point. */
+function isResumableOutcome(outcome: {
+  status?: string;
+  run_id?: string;
+  content_complete?: boolean;
+}): boolean {
+  return (
+    (outcome.status === "failed" ||
+      outcome.status === "cancelled" ||
+      outcome.status === "interrupted") &&
+    !!outcome.run_id &&
+    outcome.content_complete !== true
+  );
+}
+
+/** Ticket #15: what a terminal unfinished run's outcome reveals about
+ * resumability — the stages that survived and where a resume continues
+ * from. Pure formatting of facts the backend already reported. */
+function formatResumeProgress(outcome: {
+  completed_steps?: string[];
+  completed_step_labels?: string[];
+  next_step_label?: string | null;
+}): string {
+  const labels = Array.isArray(outcome.completed_step_labels) && outcome.completed_step_labels.length
+    ? outcome.completed_step_labels
+    : (outcome.completed_steps ?? []);
+  if (!labels.length) return "";
+  const next = outcome.next_step_label
+    ? `\n恢复将从「${outcome.next_step_label}」继续。`
+    : "";
+  return `\n已完成阶段：${labels.join("、")}。${next}`;
+}
 
 /** Render the backend's real diff (computed from the before/after
  * snapshots) as chat text: field path plus before/after preview, with the

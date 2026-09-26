@@ -1254,3 +1254,568 @@ async def test_shutdown_during_engine_initialization_records_interrupted(api_fac
             assert api._runtime.store.get_generation_run(run.run_id).status == (
                 "interrupted"
             )
+
+
+# ── Ticket #15: resuming terminal runs from their checkpoint ─────────
+
+
+def _staged_state(user_input: str, upto: str) -> ProjectState:
+    """A snapshot whose artifacts cover every step up to ``upto`` (incl.)."""
+    from script_weaver.core.types import ArtStyle, BasicInfo, ProjectStatus, Storyboard
+    from script_weaver.core.types import Outline as OutlineModel
+
+    state = state_with(user_input, "已保存大纲")
+    from script_weaver.core.pipeline import GENERATION_STEPS
+
+    depth = list(GENERATION_STEPS).index(upto) + 1 if upto in GENERATION_STEPS else 1
+    if depth >= 2:
+        state.outline = OutlineModel(
+            basic_info=BasicInfo(logline="已保存大纲"),
+            plot_outline=[{"sequence_number": "1", "title": "起", "synopsis": "承"}],
+        )
+    if depth >= 3:
+        from script_weaver.core.types import Character
+        state.characters = [Character.model_validate({"name": "主角"})]
+    if depth >= 4:
+        from script_weaver.core.types import SceneDesign
+        state.scenes = [SceneDesign.model_validate({"name": "车站", "location_type": "外景"})]
+    if depth >= 5:
+        state.art_style = ArtStyle.model_validate({"overall_style": "黑色电影"})
+    if depth >= 6:
+        from script_weaver.core.types import Script as ScriptModel
+        state.script = ScriptModel.model_validate({"scenes": [{"blocks": [
+            {"block_type": "dialogue", "content": {"character_name": "主角", "dialogue": "007"}},
+        ]}]})
+    if depth >= 7:
+        state.storyboard = Storyboard(shots=[{
+            "shot_id": "shot_1", "scene_id": "sc_1",
+            "visual_description": "门口", "duration_seconds": 5,
+        }])
+        state.storyboard.compute_totals()
+    if depth >= 8:
+        state.meta.status = ProjectStatus.COMPLETE
+    return state
+
+
+async def _fail_run_at(c, api, project_id: str, steps: list[str], error="boom"):
+    """Submit a run whose scripted pipeline commits ``steps`` then fails."""
+    user_input = api._runtime.store.get_required(project_id).state.user_input
+
+    async def pipeline(**kwargs):
+        on_stage = kwargs.get("on_stage_complete")
+        state = _staged_state(user_input, steps[-1] if steps else "idea_refiner")
+        for step in steps:
+            if on_stage is not None:
+                await on_stage(step, state)
+        raise RuntimeError(error)
+
+    scripted_engine(api, project_id, pipeline)
+    submitted = await c.post(
+        f"/api/projects/{project_id}/generate", json={"request_key": "fail-seed"}
+    )
+    assert submitted.status_code == 200, submitted.text
+    run_id = submitted.json()["run"]["run_id"]
+    terminal = await await_terminal(api, run_id)
+    assert terminal["status"] == "failed", terminal
+    return run_id
+
+
+async def _resumable_run(
+    api, project_id: str, steps: list[str], *, upto: str | None = None,
+    state: ProjectState | None = None,
+) -> str:
+    """Seed a failed run with a valid envelope checkpoint (no engine).
+
+    Mirrors reality: when a run fails after committing stages, the project
+    content equals the checkpoint snapshot — so the seeded project state is
+    advanced to the snapshot first, exactly like stage commits would have.
+    """
+    from script_weaver.core.resume import (
+        build_checkpoint,
+        current_fingerprint,
+        encode_checkpoint,
+    )
+
+    store = api._runtime.store
+    record = store.get_required(project_id)
+    if state is None:
+        state = (
+            _staged_state(record.state.user_input, upto or steps[-1])
+            if (steps or upto) else None
+        )
+    if steps:
+        store.save_state(project_id, state, record.revision,
+                         source="manual", summary="seed committed stages")
+        record = store.get_required(project_id)
+    fingerprint = await current_fingerprint(
+        skill_bindings={
+            k: v.model_dump(mode="json")
+            for k, v in (record.state.skill_bindings or {}).items()
+        },
+        auto_approve=record.auto_approve,
+    )
+    checkpoint = build_checkpoint(
+        user_input=record.state.user_input,
+        completed_steps=steps,
+        state=state if steps else None,
+        fingerprint=fingerprint,
+        basis={"revision": record.revision},
+    )
+    run = store.create_generation_run(
+        project_id, kind="generate",
+        request_key=f"seed-{record.project_id}-{len(steps)}",
+        request={"user_input": record.state.user_input, "auto_approve": True},
+        base_revision=record.revision, base_state_json=record.state_json,
+        checkpoint_json=encode_checkpoint(checkpoint),
+        completed_steps=steps,
+    )
+    store.settle_generation_run(run.run_id, status="failed")
+    return run.run_id
+
+
+async def test_resume_creates_new_run_reusing_the_success_prefix(client):
+    api, c = client
+    p = await create_project(c, "恢复故事")
+    failed_run = await _fail_run_at(
+        c, api, p["project_id"], ["idea_refiner", "structurer"]
+    )
+    original = api._runtime.store.get_generation_run(failed_run)
+
+    seen_kwargs = {}
+
+    async def pipeline(**kwargs):
+        seen_kwargs.update(kwargs)
+        on_stage = kwargs.get("on_stage_complete")
+        state = state_with("恢复故事", "完整大纲")
+        for step in ("character_designer", "scene_designer", "art_director",
+                     "scriptwriter", "storyboard_artist", "finalize"):
+            if on_stage is not None:
+                await on_stage(step, state)
+        return state
+
+    scripted_engine(api, p["project_id"], pipeline)
+
+    resumed = await c.post(
+        f"/api/projects/{p['project_id']}/runs/{failed_run}/resume",
+        json={"request_key": "rk-1"},
+    )
+    assert resumed.status_code == 200, resumed.text
+    body = resumed.json()
+    assert body["created"] is True
+    new_run_id = body["run"]["run_id"]
+    assert new_run_id != failed_run
+    # The new run inherits the prefix from the moment it exists, and the
+    # eligibility facts ride the serialized run.
+    assert body["run"]["completed_steps"] == ["idea_refiner", "structurer"]
+    assert body["run"]["next_step"] == "character_designer"
+    assert body["run"]["content_complete"] is False
+
+    terminal = await await_terminal(api, new_run_id)
+    assert terminal["status"] == "succeeded"
+    # Execution received the checkpoint basis: prefix + resume envelope.
+    assert seen_kwargs["completed_steps"] == ["idea_refiner", "structurer"]
+    assert seen_kwargs["resume_from"] is not None
+    assert seen_kwargs["initial_state"].outline is not None
+
+    # The original failed row is preserved untouched.
+    kept = api._runtime.store.get_generation_run(failed_run)
+    assert kept.status == "failed"
+    assert kept.checkpoint_json == original.checkpoint_json
+
+
+async def test_resume_running_run_refused_and_content_complete_refused(client):
+    api, c = client
+    p = await create_project(c, "状态拒绝故事")
+    release = asyncio.Event()
+
+    async def pipeline(**kwargs):
+        await release.wait()
+        return state_with("状态拒绝故事", "x")
+
+    scripted_engine(api, p["project_id"], pipeline)
+    first = await c.post(
+        f"/api/projects/{p['project_id']}/generate", json={"request_key": "k1"}
+    )
+    active_id = first.json()["run"]["run_id"]
+    refused = await c.post(
+        f"/api/projects/{p['project_id']}/runs/{active_id}/resume",
+        json={"request_key": "rk"},
+    )
+    assert refused.status_code == 409
+    assert refused.json()["detail"]["code"] == "run_active"
+    release.set()
+    await await_terminal(api, active_id)
+
+    # A content-complete run (finalize committed) answers content_complete:
+    # read/export instead of regenerating.
+    done = await _resumable_run(api, p["project_id"], [
+        "idea_refiner", "structurer", "character_designer", "scene_designer",
+        "art_director", "scriptwriter", "storyboard_artist", "finalize",
+    ])
+    complete = await c.post(
+        f"/api/projects/{p['project_id']}/runs/{done}/resume",
+        json={"request_key": "rk2"},
+    )
+    assert complete.status_code == 409
+    detail = complete.json()["detail"]
+    assert detail["code"] == "content_complete"
+    assert "导出" in detail["message"]
+
+
+async def test_resume_old_raw_checkpoint_refused_as_missing_basis(client):
+    api, c = client
+    p = await create_project(c, "旧格式故事")
+    store = api._runtime.store
+    record = store.get_required(p["project_id"])
+    run = store.create_generation_run(
+        p["project_id"], kind="generate", request_key="legacy",
+        request={"user_input": record.state.user_input, "auto_approve": True},
+        base_revision=record.revision, base_state_json=record.state_json,
+        checkpoint_json=record.state_json,  # pre-#15 raw state blob
+        completed_steps=["idea_refiner"],
+    )
+    store.settle_generation_run(run.run_id, status="failed")
+    refused = await c.post(
+        f"/api/projects/{p['project_id']}/runs/{run.run_id}/resume",
+        json={"request_key": "rk"},
+    )
+    assert refused.status_code == 409
+    detail = refused.json()["detail"]
+    assert detail["code"] == "resume_basis_missing"
+    assert "从头生成" in detail["message"]
+    # The legacy row is preserved and viewable.
+    kept = store.get_generation_run(run.run_id)
+    assert kept.status == "failed" and kept.checkpoint_json == record.state_json
+
+
+async def test_resume_refused_when_prefix_project_or_config_changed(client):
+    api, c = client
+    p = await create_project(c, "变化故事")
+    store = api._runtime.store
+
+    # 1) Tampered (invalid) prefix on the run row.
+    tampered = await _resumable_run(api, p["project_id"], ["idea_refiner"])
+    with store._write_tx() as conn:
+        conn.execute(
+            "UPDATE generation_runs SET completed_steps_json = ? WHERE id = ?",
+            ('["structurer"]', tampered),
+        )
+    refused = await c.post(
+        f"/api/projects/{p['project_id']}/runs/{tampered}/resume",
+        json={"request_key": "rk"},
+    )
+    assert refused.status_code == 409
+    assert refused.json()["detail"]["code"] == "invalid_prefix"
+
+    # 2) Project content edited after the failure.
+    edited = await _resumable_run(api, p["project_id"], ["idea_refiner"])
+    record = store.get_required(p["project_id"])
+    user_state = record.state.model_copy(deep=True)
+    user_state.refined_idea = "用户手改的概念"
+    store.save_state(p["project_id"], user_state, record.revision,
+                     source="manual", summary="用户编辑")
+    refused = await c.post(
+        f"/api/projects/{p['project_id']}/runs/{edited}/resume",
+        json={"request_key": "rk"},
+    )
+    assert refused.status_code == 409
+    assert refused.json()["detail"]["code"] == "project_changed"
+
+    # 3) Execution basis drifted (model settings changed since the run).
+    drifted = await _resumable_run(api, p["project_id"], ["idea_refiner"])
+    from script_weaver.core import config as _config
+    old = _config._settings.llm_model
+    _config._settings.llm_model = "another-model"
+    try:
+        refused = await c.post(
+            f"/api/projects/{p['project_id']}/runs/{drifted}/resume",
+            json={"request_key": "rk"},
+        )
+    finally:
+        _config._settings.llm_model = old
+    assert refused.status_code == 409
+    detail = refused.json()["detail"]
+    assert detail["code"] == "config_changed"
+    assert "未调用模型" in detail["message"]
+
+
+async def test_resume_rename_only_project_still_resumable(client):
+    """A rename is not a content change — the resume still works."""
+    api, c = client
+    p = await create_project(c, "改名恢复故事")
+    failed = await _resumable_run(api, p["project_id"], ["idea_refiner"])
+
+    async def pipeline(**kwargs):
+        return state_with("改名恢复故事", "完整大纲")
+
+    scripted_engine(api, p["project_id"], pipeline)
+    record = api._runtime.store.get_required(p["project_id"])
+    await c.patch(
+        f"/api/projects/{p['project_id']}",
+        json={"title": "改名之后", "expected_revision": record.revision},
+    )
+    resumed = await c.post(
+        f"/api/projects/{p['project_id']}/runs/{failed}/resume",
+        json={"request_key": "rk"},
+    )
+    assert resumed.status_code == 200, resumed.text
+    terminal = await await_terminal(api, resumed.json()["run"]["run_id"])
+    assert terminal["status"] == "succeeded"
+
+
+async def test_resume_same_key_resends_same_run_and_conflicting_target_409(client):
+    api, c = client
+    p = await create_project(c, "幂等恢复故事")
+    # One content snapshot for both seeds: one project, two run rows that
+    # both remain content-compatible with the project.
+    seed_record = api._runtime.store.get_required(p["project_id"])
+    shared = _staged_state(seed_record.state.user_input, "structurer")
+    failed2 = await _resumable_run(
+        api, p["project_id"], ["idea_refiner", "structurer"], state=shared
+    )
+    failed1 = await _resumable_run(
+        api, p["project_id"], ["idea_refiner"], state=shared
+    )
+
+    async def pipeline(**kwargs):
+        await asyncio.sleep(0)
+        return state_with("幂等恢复故事", "完整大纲")
+
+    scripted_engine(api, p["project_id"], pipeline)
+    first = await c.post(
+        f"/api/projects/{p['project_id']}/runs/{failed1}/resume",
+        json={"request_key": "same"},
+    )
+    assert first.status_code == 200
+    new_id = first.json()["run"]["run_id"]
+    await await_terminal(api, new_id)
+
+    # Resending the SAME key for the SAME target returns the same run.
+    again = await c.post(
+        f"/api/projects/{p['project_id']}/runs/{failed1}/resume",
+        json={"request_key": "same"},
+    )
+    assert again.status_code == 200
+    assert again.json()["created"] is False
+    assert again.json()["run"]["run_id"] == new_id
+
+    # The same key against a DIFFERENT resume target is a conflict.
+    conflict = await c.post(
+        f"/api/projects/{p['project_id']}/runs/{failed2}/resume",
+        json={"request_key": "same"},
+    )
+    assert conflict.status_code == 409
+    assert conflict.json()["detail"]["code"] == "request_conflict"
+
+
+async def test_concurrent_resumes_admit_exactly_one_new_run(client):
+    api, c = client
+    p = await create_project(c, "并发恢复故事")
+    failed = await _resumable_run(api, p["project_id"], ["idea_refiner"])
+    release = asyncio.Event()
+
+    async def pipeline(**kwargs):
+        await release.wait()
+        return state_with("并发恢复故事", "完整大纲")
+
+    scripted_engine(api, p["project_id"], pipeline)
+    r1, r2 = await asyncio.gather(
+        c.post(f"/api/projects/{p['project_id']}/runs/{failed}/resume",
+               json={"request_key": "a"}),
+        c.post(f"/api/projects/{p['project_id']}/runs/{failed}/resume",
+               json={"request_key": "b"}),
+    )
+    statuses = sorted([r1.status_code, r2.status_code])
+    assert statuses == [200, 409]
+    busy = r2 if r2.status_code == 409 else r1
+    assert busy.json()["detail"]["code"] == "run_active"
+    release.set()
+    ok = r1 if r1.status_code == 200 else r2
+    await await_terminal(api, ok.json()["run"]["run_id"])
+    # Exactly one new run row exists for the project besides the original.
+    store = api._runtime.store
+    with store._lock:
+        rows = store._conn.execute(
+            "SELECT COUNT(*) FROM generation_runs WHERE project_id = ?",
+            (p["project_id"],),
+        ).fetchone()[0]
+    assert rows == 2  # the failed original + the one resumed run
+
+
+async def test_resume_blocked_while_refine_in_flight_and_vice_versa(client, monkeypatch):
+    api, c = client
+    p = await create_project(c, "恢复互斥故事")
+    failed = await _resumable_run(api, p["project_id"], ["idea_refiner"])
+
+    from script_weaver.core.refinement import RefineExecutionError
+
+    hold = asyncio.Event()
+
+    async def fake_get_engine(pid, **kwargs):
+        record = api._runtime.store.get_required(pid)
+        from types import SimpleNamespace
+
+        async def slow_refine(state, message):
+            await hold.wait()
+            raise RefineExecutionError("受控失败")
+
+        engine = SimpleNamespace(refine=slow_refine)
+        ctx = api._GenerationContext(
+            project_id=record.project_id, revision=record.revision,
+            base_state_json=record.state_json, state=record.state,
+            store=api._runtime.store, auto_approve=record.auto_approve,
+            skill_bindings=record.skill_bindings,
+        )
+        return engine, ctx
+
+    api._get_engine = fake_get_engine
+    refine_task = asyncio.create_task(
+        c.post(f"/api/projects/{p['project_id']}/refine", json={"message": "改短"})
+    )
+    await asyncio.sleep(0.05)  # let the refine slot acquire
+    async def pipeline(**kwargs):  # pragma: no cover - must not run
+        return state_with("恢复互斥故事", "x")
+    scripted_engine(api, p["project_id"], pipeline)
+    refused = await c.post(
+        f"/api/projects/{p['project_id']}/runs/{failed}/resume",
+        json={"request_key": "rk"},
+    )
+    assert refused.status_code == 409
+    assert refused.json()["detail"]["code"] == "run_active"
+    hold.set()
+    done = await refine_task
+    assert done.status_code == 502  # released; controlled failure surfaces
+
+
+async def test_zero_step_resume_reruns_everything(client):
+    api, c = client
+    p = await create_project(c, "空恢复故事")
+    failed = await _resumable_run(api, p["project_id"], [])
+
+    seen = {}
+
+    async def pipeline(**kwargs):
+        seen["completed_steps"] = kwargs.get("completed_steps")
+        seen["resume_from"] = kwargs.get("resume_from")
+        return state_with("空恢复故事", "完整大纲")
+
+    scripted_engine(api, p["project_id"], pipeline)
+    resumed = await c.post(
+        f"/api/projects/{p['project_id']}/runs/{failed}/resume",
+        json={"request_key": "rk"},
+    )
+    assert resumed.status_code == 200
+    terminal = await await_terminal(api, resumed.json()["run"]["run_id"])
+    assert terminal["status"] == "succeeded"
+    assert seen["completed_steps"] == []
+    assert seen["resume_from"] is not None
+
+
+async def test_growth_lifecycle_persisted_onto_checkpoint(client):
+    api, c = client
+    p = await create_project(c, "成长故事")
+
+    async def pipeline(**kwargs):
+        on_stage = kwargs.get("on_stage_complete")
+        growth = kwargs.get("on_growth_event")
+        state = state_with("成长故事", "完整大纲")
+        if on_stage:
+            for step in ("idea_refiner", "structurer"):
+                await on_stage(step, state)
+        if growth:
+            await growth("running", None)
+            await growth("failed", "画像磁盘已满")
+        return state
+
+    scripted_engine(api, p["project_id"], pipeline)
+    submitted = await c.post(
+        f"/api/projects/{p['project_id']}/generate", json={"request_key": "k"}
+    )
+    run_id = submitted.json()["run"]["run_id"]
+    terminal = await await_terminal(api, run_id)
+    assert terminal["status"] == "succeeded"  # content complete despite growth
+    from script_weaver.core.resume import decode_checkpoint
+
+    run = api._runtime.store.get_generation_run(run_id)
+    checkpoint = decode_checkpoint(run.checkpoint_json)
+    assert checkpoint.growth_status == "failed"
+    assert "画像磁盘已满" in checkpoint.growth_error
+    assert checkpoint.completed_steps == ["idea_refiner", "structurer"]
+
+
+async def test_stop_during_growth_converges_checkpoint_to_interrupted(client):
+    api, c = client
+    p = await create_project(c, "成长停止故事")
+    release = asyncio.Event()
+
+    async def pipeline(**kwargs):
+        on_stage = kwargs.get("on_stage_complete")
+        growth = kwargs.get("on_growth_event")
+        state = state_with("成长停止故事", "完整大纲")
+        if on_stage:
+            await on_stage("finalize", state)
+        if growth:
+            await growth("running", None)
+            await release.wait()  # simulates mid-growth side effects
+        return state
+
+    scripted_engine(api, p["project_id"], pipeline)
+    submitted = await c.post(
+        f"/api/projects/{p['project_id']}/generate", json={"request_key": "k"}
+    )
+    run_id = submitted.json()["run"]["run_id"]
+    await asyncio.sleep(0.05)  # let the pipeline reach the growth wait
+    stopped = await c.post(f"/api/projects/{p['project_id']}/runs/{run_id}/stop", json={})
+    release.set()
+    assert stopped.status_code == 200
+    terminal = await await_terminal(api, run_id)
+    assert terminal["status"] in ("cancelled", "succeeded")
+    from script_weaver.core.resume import decode_checkpoint
+
+    run = api._runtime.store.get_generation_run(run_id)
+    checkpoint = decode_checkpoint(run.checkpoint_json)
+    # Growth never claimed success: it either stayed running→interrupted or
+    # recorded failed — never succeeded after a stop.
+    assert checkpoint.growth_status in ("interrupted", "failed")
+
+
+async def test_startup_sweep_converges_midflight_growth_to_interrupted(client):
+    """A run killed mid-growth is marked interrupted with the growth note
+    by the restart sweep — never silently resumed nor replayed."""
+    api, c = client
+    p = await create_project(c, "重启成长故事")
+    from script_weaver.core.resume import (
+        build_checkpoint,
+        decode_checkpoint,
+        encode_checkpoint,
+    )
+
+    store = api._runtime.store
+    record = store.get_required(p["project_id"])
+    checkpoint = build_checkpoint(
+        user_input=record.state.user_input,
+        completed_steps=list(api.GENERATION_STEPS),  # content complete
+        state=record.state,
+        fingerprint={},
+        growth_status="running",
+        basis={"revision": record.revision},
+    )
+    run = store.create_generation_run(
+        p["project_id"], kind="generate", request_key="killed",
+        request={"user_input": record.state.user_input, "auto_approve": True},
+        base_revision=record.revision, base_state_json=record.state_json,
+        checkpoint_json=encode_checkpoint(checkpoint),
+    )
+    marked = await asyncio.to_thread(store.interrupt_stale_generation_runs)
+    assert marked >= 1
+    after = store.get_generation_run(run.run_id)
+    decoded = decode_checkpoint(after.checkpoint_json)
+    assert decoded.growth_status == "interrupted"
+    assert "部分发生" in decoded.growth_error
+    # Content-complete + interrupted growth: resume is refused outright.
+    refused = await c.post(
+        f"/api/projects/{p['project_id']}/runs/{run.run_id}/resume",
+        json={"request_key": "rk"},
+    )
+    assert refused.status_code == 409
+    assert refused.json()["detail"]["code"] == "content_complete"

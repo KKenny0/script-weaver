@@ -608,7 +608,14 @@ def test_commit_generation_stage_atomic_success_and_rollback(store):
     assert rec1.revision == record.revision + 1
     assert run1.base_revision == rec1.revision
     assert run1.completed_steps == ["idea_refiner"]
-    assert run1.checkpoint_json == rec1.state_json
+    # Ticket #15: the checkpoint column is the resume envelope — it wraps
+    # the committed state snapshot plus the completed prefix and the basis
+    # revision the stage committed at.
+    envelope = json.loads(run1.checkpoint_json)
+    assert envelope["format_version"] == 1
+    assert envelope["completed_steps"] == ["idea_refiner"]
+    assert envelope["state"] == json.loads(rec1.state_json)
+    assert envelope["basis"]["revision"] == rec1.revision
     assert store.get_required(project.project_id).revision == rec1.revision
 
     # A mid-transaction failure (the run's completed-steps blob corrupted so

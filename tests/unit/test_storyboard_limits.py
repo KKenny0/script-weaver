@@ -186,7 +186,14 @@ async def test_checkpoint_resume_skips_successful_agents_and_exports(tmp_path, m
     with pytest.raises(RuntimeError, match="output_token_limit"):
         await runner.verify(tmp_path, "A spy returns", llm_client=first)
     snapshot = json.loads((tmp_path / "checkpoint.json").read_text())
-    assert snapshot["completed_agents"] == runner.STAGES[:-1]
+    # Ticket #15 shared contract: the envelope records the completed
+    # success prefix (everything but the storyboard stage) plus the input
+    # and format version a resume validates against.
+    from script_weaver.core.pipeline import GENERATION_STEPS
+
+    assert snapshot["format_version"] == 1
+    assert snapshot["user_input"] == "A spy returns"
+    assert snapshot["completed_steps"] == list(GENERATION_STEPS)[:-2]
     assert snapshot["state"]["script"]["scenes"][0]["scene_id"] == "a"
     assert not (tmp_path / "project.json").exists()
     assert profile.get_profile_manager().profile.stats.completed_projects == 0
