@@ -71,6 +71,9 @@ export default function HomePage() {
   const [leftPanelCollapsed, setLeftPanelCollapsed] = useState(false);
   const [projectListOpen, setProjectListOpen] = useState(true);
   const [sessionNotice, setSessionNotice] = useState<SessionNotice | null>(null);
+  // Bumped when the user re-clicks the already-open project: the chat
+  // panel re-checks run state (keeping a live observation intact).
+  const [projectOpenEpoch, setProjectOpenEpoch] = useState(0);
   const [historyPanel, setHistoryPanel] = useState<HistoryPanelState>(HISTORY_CLOSED);
 
   // Late-response guard: async handlers compare against the project that is
@@ -83,6 +86,7 @@ export default function HomePage() {
   // one, so a late history response can only ever update the view session
   // it belongs to.
   const historyReqRef = useRef(0);
+  const contentReqRef = useRef(0);
   // Set by ChatPanel; closing the stream ends the subscription only (the
   // backend owns the task).
   const closeStreamRef = useRef<() => void>(() => {});
@@ -118,7 +122,28 @@ export default function HomePage() {
     }
   }, []);
 
+  // Page opens and chat refreshes share ownership, including failed reads.
+  // A superseded response returns null; only the newest read can write UI.
+  const refreshProjectContent = useCallback(async (id: string) => {
+    const token = ++contentReqRef.current;
+    try {
+      const fullState = await apiGet(`/projects/${id}`);
+      return token === contentReqRef.current ? fullState : null;
+    } catch (err) {
+      if (token !== contentReqRef.current) return null;
+      throw err;
+    }
+  }, []);
+
   const openProject = useCallback(async (id: string) => {
+    if (projectRef.current === id) {
+      // R5: clicking the CURRENT project keeps a live run observation
+      // (SSE + artifacts untouched); a lost view is recovered by the
+      // panel's epoch-keyed re-check below. Only a real switch resets.
+      setProjectOpenEpoch((e) => e + 1);
+      refreshProjects();
+      return;
+    }
     closeStreamRef.current();
     setIsGenerating(false);
     setProjectId(id);
@@ -130,25 +155,40 @@ export default function HomePage() {
     historyReqRef.current++; // in-flight history responses belong to the old project
     window.history.replaceState(null, "", `/?project=${encodeURIComponent(id)}`);
     nextNotice("📂 正在打开项目…");
+    // The session epoch captured right here is this open's identity: after
+    // an A→B→A round trip the project id matches again, but the FIRST open's
+    // late response belongs to a dead session and must not overwrite the
+    // second open's fresh content.
+    const epochAtStart = sessionEpochRef.current;
     try {
-      const fullState = await apiGet(`/projects/${id}`);
-      if (projectRef.current !== id) return; // stale response, another project is open
+      const fullState = await refreshProjectContent(id);
+      if (fullState === null) return;
+      if (projectRef.current !== id || !isSessionActive(epochAtStart)) return; // superseded open
       setArtifactData(pickArtifactData(fullState));
-      setProjectStatus(projectHasArtifacts(fullState) ? "complete" : "idle");
+      // The backend reports "running" while a generation run is active for
+      // the project — the run outlives any page view (ticket #14).
+      setProjectStatus(
+        fullState.status === "running"
+          ? "running"
+          : projectHasArtifacts(fullState)
+            ? "complete"
+            : "idle",
+      );
       nextNotice(`📂 已打开项目「${fullState.meta?.title || id}」，可继续修改或导出。`);
     } catch (err: any) {
-      if (projectRef.current !== id) return;
+      if (projectRef.current !== id || !isSessionActive(epochAtStart)) return;
       setProjectStatus("error");
       nextNotice(`❌ 打开项目失败: ${err.message}`);
     }
     refreshProjects();
-  }, [nextNotice, refreshProjects]);
+  }, [nextNotice, refreshProjects, isSessionActive, refreshProjectContent]);
 
   const startNewProject = useCallback(() => {
     closeStreamRef.current();
     setIsGenerating(false);
     setProjectId("");
     projectRef.current = "";
+    contentReqRef.current++;
     setArtifactData({});
     setActiveTab("outline");
     setProjectStatus("idle");
@@ -161,6 +201,7 @@ export default function HomePage() {
   // A generation that just created its project keeps the current chat
   // session; only the URL and the project list change.
   const handleProjectCreated = useCallback((id: string) => {
+    contentReqRef.current++;
     setProjectId(id);
     projectRef.current = id;
     window.history.replaceState(null, "", `/?project=${encodeURIComponent(id)}`);
@@ -171,12 +212,11 @@ export default function HomePage() {
     refreshProjects();
   }, [refreshProjects]);
 
-  // Collapsing the chat unmounts ChatPanel, which closes its generation
-  // stream (and the backend cancels the run). A "running" status must not
-  // outlive the subscription it described.
+  // Collapsing the chat unmounts ChatPanel, which closes its progress view.
+  // The run itself keeps running in the backend (ticket #14) and the status
+  // pill stays truthful; reopening the project resubscribes to the run.
   const collapseChat = useCallback(() => {
     setLeftPanelCollapsed(true);
-    setProjectStatus((s) => (s === "running" ? "idle" : s));
   }, []);
 
   const handleRename = useCallback(async (id: string, title: string, expectedRevision: number) => {
@@ -303,10 +343,12 @@ export default function HomePage() {
           projectStatus={projectStatus}
           setProjectStatus={setProjectStatus}
           onArtifactUpdate={setArtifactData}
+          refreshProjectContent={refreshProjectContent}
           onTabSwitch={setActiveTab}
           onCollapse={collapseChat}
           sessionNotice={sessionNotice}
           sessionEpoch={sessionNotice?.epoch ?? 0}
+          projectOpenEpoch={projectOpenEpoch}
           isSessionActive={isSessionActive}
           isProjectActive={isProjectActive}
           closeStreamRef={closeStreamRef}
