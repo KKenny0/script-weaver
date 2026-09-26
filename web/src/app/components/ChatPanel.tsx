@@ -3,7 +3,7 @@
 import React, { useState, useEffect, useRef, useCallback } from "react";
 import {
   Send, Sparkles, Wand2, PanelLeftClose,
-  Loader2,
+  Loader2, Square,
 } from "lucide-react";
 
 interface Message {
@@ -87,9 +87,15 @@ export default function ChatPanel({
   const [showSkillsPanel, setShowSkillsPanel] = useState(false);
   const [availableSkills, setAvailableSkills] = useState<any[]>([]);
   const [activeSkillIds, setActiveSkillIds] = useState<Set<string>>(new Set());
+  const [activeRunId, setActiveRunId] = useState<string | null>(null);
+  const [stopRequested, setStopRequested] = useState(false);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const eventSourceRef = useRef<EventSource | null>(null);
+  // The run this panel observes server-side (ticket #14): generation lives
+  // in the backend, so the subscription is only a view onto it.
+  const activeRunIdRef = useRef<string | null>(null);
+  const sessionEpochRef = useRef(0);
   // False once this instance unmounts (chat collapse). Every async
   // continuation re-checks it: an unmounted instance no longer owns any UI,
   // so its late responses and events must never write state, open a
@@ -99,14 +105,18 @@ export default function ChatPanel({
   const noticeShownKeyRef = useRef<string>("");
 
   useEffect(() => { messagesEndRef.current?.scrollIntoView({ behavior: "smooth" }); }, [messages]);
+  useEffect(() => { sessionEpochRef.current = sessionEpoch; }, [sessionEpoch]);
+
+  useEffect(() => { messagesEndRef.current?.scrollIntoView({ behavior: "smooth" }); }, [messages]);
 
   useEffect(() => {
     apiGet("/skills?stage=structuring").then(setAvailableSkills).catch(console.error);
   }, []);
 
-  // The subscription's lifetime is bound to this instance: unmounting closes
-  // the stream (the backend then cancels the run per the disconnect-cancel
-  // contract) and ends the generating flag that stream owned.
+  // The subscription's lifetime is bound to this instance: unmounting only
+  // closes the progress view — the run itself keeps running server-side
+  // (ticket #14) and is found again by reopening the project. The generating
+  // flag ends with the view that owned it.
   useEffect(() => {
     mountedRef.current = true;
     return () => {
@@ -118,11 +128,14 @@ export default function ChatPanel({
   }, [setIsGenerating]);
 
   // Let the page close the subscription when the user switches projects.
-  // Deregister on unmount so the page never holds a dead instance's closer.
+  // Closing ends the view only; the background run continues.
   useEffect(() => {
     const close = () => {
       eventSourceRef.current?.close();
       eventSourceRef.current = null;
+      activeRunIdRef.current = null;
+      setActiveRunId(null);
+      setStopRequested(false);
       setIsGenerating(false);
     };
     closeStreamRef.current = close;
@@ -161,6 +174,149 @@ export default function ChatPanel({
     });
   }, [onArtifactUpdate]);
 
+  // ── Background run subscription (ticket #14) ─────────
+
+  // Observe a server-owned run. The EventSource is only a view: closing it
+  // (unmount, project switch, network drop) never cancels the run — only
+  // the explicit stop button or a backend shutdown ends it.
+  const subscribeRun = useCallback((pid: string, runId: string) => {
+    const evtSource = new EventSource(`${API}/projects/${pid}/runs/${runId}/events`);
+    eventSourceRef.current = evtSource;
+    activeRunIdRef.current = runId;
+    setActiveRunId(runId);
+    setStopRequested(false);
+    setIsGenerating(true);
+
+    // The subscription belongs to (this instance, this session, this
+    // project). A listener that no longer matches must write nothing at
+    // all; the connection itself is closed by its owner, never by a stale
+    // listener.
+    const isStaleEvent = () =>
+      !mountedRef.current ||
+      !isProjectActive(pid);
+
+    evtSource.addEventListener("progress", (e: MessageEvent) => {
+      if (isStaleEvent()) return;
+      const data = JSON.parse(e.data);
+      setMessages((prev) => {
+        const last = prev[prev.length - 1];
+        if (last?.role === "assistant") {
+          return [...prev.slice(0, -1), { ...last, content: data.message || (data.result_summary ? `✅ ${data.result_summary.details.join(" | ")}` : last.content), timestamp: Date.now() }];
+        }
+        return prev;
+      });
+    });
+
+    evtSource.addEventListener("done", async (e: MessageEvent) => {
+      if (isStaleEvent()) return;
+      evtSource.close();
+      eventSourceRef.current = null;
+      activeRunIdRef.current = null;
+      setActiveRunId(null);
+      setIsGenerating(false);
+
+      const doneData = JSON.parse(e.data);
+      // Refresh whatever the run managed to save (every finished stage was
+      // checkpointed), then report the outcome honestly.
+      let reloaded = false;
+      try {
+        const fullState = await apiGet(`/projects/${pid}`);
+        if (isStaleEvent()) return;
+        applyFullState(fullState);
+        onProjectMutated();
+        reloaded = true;
+        if (doneData.status === "succeeded") {
+          setProjectStatus("complete");
+          setMessages((prev) => [...prev, { role: "assistant", content: `🎉 全部生成完成！\n\n${formatResultSummary(fullState)}`, timestamp: Date.now() }]);
+          if (fullState.outline) onTabSwitch("outline");
+          else if (fullState.characters) onTabSwitch("characters");
+          else if (fullState.script) onTabSwitch("script");
+          return;
+        }
+      } catch (fetchErr) {
+        console.error("Failed to fetch final state:", fetchErr);
+      }
+      if (!mountedRef.current || !isProjectActive(pid)) return;
+
+      if (doneData.status === "cancelled") {
+        setProjectStatus(reloaded ? "complete" : "idle");
+        setMessages((prev) => [...prev, { role: "assistant", content: "🛑 生成已停止。已完成并保存的阶段保留在项目中，可继续修改或重新生成。", timestamp: Date.now() }]);
+      } else {
+        // failed / interrupted / (legacy) done-with-error
+        setProjectStatus("error");
+        const reason = doneData.error || (doneData.status === "interrupted" ? "服务在生成期间重启，运行已中断" : "生成失败");
+        setMessages((prev) => [...prev, { role: "assistant", content: `❌ 生成未完成：${reason}${reloaded ? "\n已完成的阶段已保存，可重新提交生成。" : ""}`, timestamp: Date.now() }]);
+      }
+    });
+
+    evtSource.onerror = () => {
+      if (isStaleEvent()) return;
+      if (evtSource.readyState === EventSource.CLOSED) {
+        // The stream ended without a done event and will not retry. That is
+        // a LOST VIEW, not a failed run: generation keeps running in the
+        // backend, and reopening the project resubscribes to real progress.
+        evtSource.close();
+        eventSourceRef.current = null;
+        setIsGenerating(false);
+        setMessages((prev) => [...prev, { role: "assistant", content: "⚠️ 与生成进度的连接已断开。生成仍在后台进行，不会因此取消；刷新页面或重新打开项目可查看最新进度。", timestamp: Date.now() }]);
+      } else {
+        // Transient drop: the browser reconnects on its own and the server
+        // replays the current snapshot on reopen — show it, keep waiting.
+        setMessages((prev) => {
+          const last = prev[prev.length - 1];
+          if (last?.role === "assistant") {
+            return [...prev.slice(0, -1), { ...last, content: "连接中断，正在重新连接生成进度…", timestamp: Date.now() }];
+          }
+          return prev;
+        });
+      }
+    };
+  }, [isProjectActive, applyFullState, onProjectMutated, onTabSwitch, setProjectStatus, setIsGenerating]);
+
+  // Opening a project finds its real progress: an active run is resubscribed
+  // (the page refresh / close / switch never cancelled it), and a previous
+  // failed or interrupted run is reported once so the user knows.
+  useEffect(() => {
+    if (!projectId) return;
+    if (eventSourceRef.current || activeRunIdRef.current) return; // already observing
+    let cancelled = false;
+    (async () => {
+      try {
+        const run = await apiGet(`/projects/${projectId}/runs/latest`);
+        if (cancelled || !mountedRef.current || !isProjectActive(projectId)) return;
+        if (run.status === "running" || run.status === "stopping") {
+          setProjectStatus("running");
+          setMessages((prev) => [...prev, { role: "assistant", content: "🔄 该项目正在后台生成，已重新连接进度。", timestamp: Date.now() }]);
+          subscribeRun(projectId, run.run_id);
+          return;
+        }
+        if (run.status === "failed" || run.status === "interrupted") {
+          setMessages((prev) => [...prev, { role: "assistant", content: `ℹ️ 上次生成未完成（${run.error || run.status}）。已保存的阶段仍在，可重新提交生成。`, timestamp: Date.now() }]);
+        }
+      } catch {
+        // 404 no_run: the project simply has no generation history yet.
+      }
+    })();
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [projectId]);
+
+  const handleStop = useCallback(async () => {
+    const runId = activeRunIdRef.current;
+    if (!runId || !projectId) return;
+    setStopRequested(true);
+    try {
+      await apiPost(`/projects/${projectId}/runs/${runId}/stop`, {});
+      // The done(cancelled) event closes the view; repeated clicks are
+      // idempotent server-side.
+    } catch (err: any) {
+      if (!mountedRef.current || !isProjectActive(projectId)) return;
+      setStopRequested(false);
+      setMessages((prev) => [...prev, { role: "assistant", content: `⚠️ 停止请求失败：${err.message}。生成仍在进行。`, timestamp: Date.now() }]);
+    }
+  }, [projectId, isProjectActive]);
+
+
   const handleGenerate = useCallback(async () => {
     if (!inputValue.trim() || isGenerating) return;
 
@@ -186,75 +342,25 @@ export default function ChatPanel({
         onProjectMutated();
         return;
       }
-      // The project exists in persistent storage now — consume the input,
-      // but only if the user has not started typing a new draft meanwhile.
+
+      // Submit the run (ticket #14): the request_key makes double clicks and
+      // network retries of this one intent idempotent server-side.
+      const submitted = await apiPost(`/projects/${proj.project_id}/generate`, {
+        request_key: crypto.randomUUID(),
+        user_input: ideaText,
+      });
+      if (!mountedRef.current || !isSessionActive(epochAtStart)) {
+        onProjectMutated();
+        return;
+      }
+
+      // The run exists in the backend from here on — consume the input, but
+      // only if the user has not started typing a new draft meanwhile.
       setInputValue((prev) => (prev === originalInput ? "" : prev));
       onProjectCreated(proj.project_id);
-
-      const evtSource = new EventSource(`${API}/projects/${proj.project_id}/generate`);
-      eventSourceRef.current = evtSource;
-
-      // The subscription belongs to (this instance, this session, this
-      // project). A listener that no longer matches — the chat collapsed,
-      // the session changed, another project opened — must write nothing at
-      // all; the connection itself is closed by its owner (unmount cleanup
-      // or the page's closeStreamRef), never by a stale listener.
-      const isStaleEvent = () =>
-        !mountedRef.current ||
-        !isSessionActive(epochAtStart) ||
-        !isProjectActive(proj.project_id);
-
-      evtSource.addEventListener("progress", (e: MessageEvent) => {
-        if (isStaleEvent()) return;
-        const data = JSON.parse(e.data);
-        setMessages((prev) => {
-          const last = prev[prev.length - 1];
-          if (last?.role === "assistant") {
-            return [...prev.slice(0, -1), { ...last, content: data.message || (data.result_summary ? `✅ ${data.result_summary.details.join(" | ")}` : last.content), timestamp: Date.now() }];
-          }
-          return prev;
-        });
-      });
-
-      evtSource.addEventListener("done", async (e: MessageEvent) => {
-        if (isStaleEvent()) return;
-        evtSource.close();
-        eventSourceRef.current = null;
-        setIsGenerating(false);
-
-        const doneData = JSON.parse(e.data);
-        if (doneData.error) {
-          setProjectStatus("error");
-          setMessages((prev) => [...prev, { role: "assistant", content: `❌ 生成出错: ${doneData.error}`, timestamp: Date.now() }]);
-          return;
-        }
-
-        setProjectStatus("complete");
-
-        try {
-          const fullState = await apiGet(`/projects/${proj.project_id}`);
-          if (isStaleEvent()) return;
-          applyFullState(fullState);
-          onProjectMutated();
-
-          setMessages((prev) => [...prev, { role: "assistant", content: `🎉 全部生成完成！\n\n${formatResultSummary(fullState)}`, timestamp: Date.now() }]);
-
-          if (fullState.outline) onTabSwitch("outline");
-          else if (fullState.characters) onTabSwitch("characters");
-          else if (fullState.script) onTabSwitch("script");
-        } catch (fetchErr) {
-          console.error("Failed to fetch final state:", fetchErr);
-        }
-      });
-
-      evtSource.onerror = () => {
-        if (isStaleEvent()) return;
-        evtSource.close();
-        eventSourceRef.current = null;
-        setIsGenerating(false);
-        setProjectStatus("error");
-        setMessages((prev) => [...prev, { role: "assistant", content: "⚠️ 连接中断或生成启动失败，请检查后端服务与模型配置。输入的内容已保存在项目中。", timestamp: Date.now() }]);
-      };
+      setProjectStatus("running");
+      setMessages((prev) => [...prev, { role: "assistant", content: submitted.created ? "生成已提交，正在后台运行。可以离开此页，进度会自动保存。" : "检测到该项目已有进行中的生成，已连接其进度。", timestamp: Date.now() }]);
+      subscribeRun(proj.project_id, submitted.run.run_id);
     } catch (err: any) {
       if (!mountedRef.current || !isSessionActive(epochAtStart)) return; // late failure: not this session's concern
       setIsGenerating(false);
@@ -262,7 +368,7 @@ export default function ChatPanel({
       // Keep inputValue so the user's text is not lost on failure.
       setMessages((prev) => [...prev, { role: "assistant", content: `❌ 错误: ${err.message}`, timestamp: Date.now() }]);
     }
-  }, [inputValue, isGenerating, sessionEpoch, isSessionActive, isProjectActive, applyFullState, onProjectCreated, onProjectMutated, setProjectStatus, setIsGenerating, onArtifactUpdate, onTabSwitch]);
+  }, [inputValue, isGenerating, sessionEpoch, isSessionActive, isProjectActive, subscribeRun, onProjectCreated, onProjectMutated, setProjectStatus, setIsGenerating, onArtifactUpdate]);
 
   const handleRefine = useCallback(async () => {
     if (!projectId || !inputValue.trim() || isGenerating) return;
@@ -424,7 +530,25 @@ export default function ChatPanel({
 
         {isGenerating && (
           <div style={{ alignSelf: "flex-start", padding: "10px 14px", borderRadius: "4px 16px 16px 16px", background: "var(--bg-surface-3)", display: "flex", alignItems: "center", gap: 8, fontSize: 13, color: "var(--text-secondary)" }}>
-            <Loader2 size={14} className="spin" />正在生成...
+            <Loader2 size={14} className="spin" />{stopRequested ? "正在停止…" : "正在生成..."}
+            {activeRunId && (
+              <button
+                onClick={handleStop}
+                disabled={stopRequested}
+                className="btn-ghost"
+                style={{
+                  display: "inline-flex", alignItems: "center", gap: 4,
+                  padding: "2px 10px", borderRadius: 12, fontSize: 12,
+                  border: "1px solid var(--border-default)",
+                  cursor: stopRequested ? "default" : "pointer",
+                  opacity: stopRequested ? 0.5 : 1,
+                }}
+                title="停止生成（已完成阶段将保留）"
+                aria-label="停止生成"
+              >
+                <Square size={10} />停止
+              </button>
+            )}
           </div>
         )}
       </div>

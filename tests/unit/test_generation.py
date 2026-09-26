@@ -386,3 +386,103 @@ async def test_original_brief_reaches_downstream_agent_even_with_expanded_outlin
         messages = llm.chat.call_args.kwargs['messages']
         assert brief in messages[1]['content']
         assert '原始创作要求优先' in messages[1]['content']
+
+
+# ── Ticket #14: explicit initial state, completed steps, stage callback ───
+
+
+def _full_generation_script():
+    """Seven scripted agent submissions in pipeline order."""
+    return (
+        write("refined_idea", {"logline": "A spy returns"}),
+        write("outline", {"plot_outline": [
+            {"sequence_number": "1", "title": "Return", "synopsis": "A spy returns"}
+        ]}),
+        write("characters", [{"name": "Bond"}]),
+        write("scenes", [{"name": "Station", "location_type": "外景"}]),
+        write("art_style", {"overall_style": "Film noir"}),
+        write("script", {"title": "007", "scenes": [{"blocks": [
+            {"block_type": "DIALOGUE",
+             "content": {"character_name": "Bond", "dialogue": "007"}},
+        ]}]}),
+        write("storyboard", {"shots": [{
+            "visual_description": "A spy waits", "shot_size": "CLOSE_UP",
+            "image_prompt": "Spy at station", "video_prompt": "Spy turns",
+            "duration_seconds": "5",
+        }]}),
+    )
+
+
+async def test_stage_callback_fires_after_each_validated_step():
+    llm = client(*_full_generation_script())
+    engine = pipeline.PipelineEngine(llm_client=llm, auto_approve_gates=True)
+    checkpoints: list[tuple[str, str]] = []
+
+    async def on_stage_complete(step, state):
+        checkpoints.append((step, state.refined_idea or ""))
+
+    state = await engine.run_full_pipeline(
+        "A spy returns", on_stage_complete=on_stage_complete
+    )
+    assert [step for step, _ in checkpoints] == list(pipeline.GENERATION_STEPS)
+    # Each checkpoint sees the state AFTER its step integrated: the idea
+    # exists from the first checkpoint on.
+    assert all(idea == "A spy returns" for _, idea in checkpoints)
+    assert state.meta.status is ProjectStatus.COMPLETE
+
+
+async def test_callback_raising_pipeline_stopped_prevents_later_stages():
+    llm = client(*_full_generation_script())
+    engine = pipeline.PipelineEngine(llm_client=llm, auto_approve_gates=True)
+
+    async def stop_after_outline(step, state):
+        if step == "structurer":
+            raise pipeline.PipelineStopped()
+
+    with pytest.raises(pipeline.PipelineStopped):
+        await engine.run_full_pipeline(
+            "A spy returns", on_stage_complete=stop_after_outline
+        )
+    # Only the two first agents ever talked to the model; the script kept
+    # its checkpointed first stage.
+    assert llm.chat.await_count == 2
+
+
+async def test_completed_steps_skip_their_agents_and_gates():
+    llm = client(*_full_generation_script()[2:])  # designers onward
+    engine = pipeline.PipelineEngine(llm_client=llm, auto_approve_gates=True)
+    seen = []
+
+    async def on_stage_complete(step, state):
+        seen.append(step)
+
+    state = await engine.run_full_pipeline(
+        "A spy returns",
+        completed_steps=("idea_refiner", "structurer"),
+        on_stage_complete=on_stage_complete,
+    )
+    assert seen == list(pipeline.GENERATION_STEPS)[2:]
+    assert state.refined_idea is None  # skipped, not re-run
+    assert state.characters and state.storyboard.shots
+
+
+async def test_initial_state_resumes_with_its_own_input_and_title():
+    initial = ProjectState(user_input="续跑故事", meta={"id": "x", "title": "续跑标题"})
+    initial.outline = None
+    llm = client(*_full_generation_script())
+    engine = pipeline.PipelineEngine(llm_client=llm, auto_approve_gates=True)
+
+    state = await engine.run_full_pipeline(
+        initial_state=initial,
+        completed_steps=("idea_refiner", "structurer"),
+    )
+    assert state.user_input == "续跑故事"
+    assert state.meta.title == "续跑标题"
+    # The caller's snapshot is never mutated by the resumed pipeline.
+    assert initial.characters is None and state.characters
+
+
+async def test_unknown_completed_step_is_rejected():
+    engine = pipeline.PipelineEngine(llm_client=client(), auto_approve_gates=True)
+    with pytest.raises(ValueError, match="Unknown completed steps"):
+        await engine.run_full_pipeline("x", completed_steps=("nope",))

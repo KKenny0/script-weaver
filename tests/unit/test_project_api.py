@@ -70,7 +70,7 @@ def outlined_state(user_input: str, logline: str) -> ProjectState:
 
 def stub_engine(api, run_full_pipeline=None, refine=None):
     """Patch api._get_engine with a controlled engine over the real store."""
-    async def fake_get_engine(project_id):
+    async def fake_get_engine(project_id, **kwargs):
         record = api._runtime.store.get_required(project_id)
         engine = SimpleNamespace(
             run_full_pipeline=run_full_pipeline,
@@ -83,6 +83,8 @@ def stub_engine(api, run_full_pipeline=None, refine=None):
             base_state_json=record.state_json,
             state=record.state,
             store=api._runtime.store,
+            auto_approve=record.auto_approve,
+            skill_bindings=record.skill_bindings,
         )
         return engine, ctx
 
@@ -209,6 +211,18 @@ async def test_version_history_readonly_and_cross_project_404(client):
 # ── Generation persists; survives restart; meta.id pinned ──
 
 
+async def _await_run_terminal(api, run_id: str, timeout: float = 5.0) -> dict:
+    """Poll the store until the run leaves running/stopping."""
+    for _ in range(200):
+        run = api._runtime.store.get_generation_run(run_id)
+        assert run is not None
+        if run.status not in ("running", "stopping"):
+            return {"status": run.status, "error": run.error,
+                    "completed_steps": run.completed_steps}
+        await asyncio.sleep(timeout / 200)
+    raise AssertionError(f"run {run_id} did not finish in {timeout}s")
+
+
 async def test_generate_persists_result_and_survives_restart(api_factory):
     """Content generated before a restart is openable and exportable after."""
     api = api_factory()
@@ -224,9 +238,13 @@ async def test_generate_persists_result_and_survives_restart(api_factory):
 
             stub_engine(api, run_full_pipeline=fake_pipeline)
 
-            events = await consume_sse(c, f"/api/projects/{p['project_id']}/generate")
-            assert events[-1][0] == "done"
-            assert '"error"' not in events[-1][1]
+            submitted = await c.post(
+                f"/api/projects/{p['project_id']}/generate", json={}
+            )
+            assert submitted.status_code == 200, submitted.text
+            run_id = submitted.json()["run"]["run_id"]
+            terminal = await _await_run_terminal(api, run_id)
+            assert terminal["status"] == "succeeded", terminal
 
             after = (await c.get(f"/api/projects/{p['project_id']}")).json()
             assert after["has_outline"] is True
@@ -265,10 +283,9 @@ async def test_generate_rejects_concurrent_edit_without_overwrite(client):
 
     stub_engine(api, run_full_pipeline=fake_pipeline)
 
-    async def run_stream():
-        return await consume_sse(c, f"/api/projects/{p['project_id']}/generate")
-
-    stream_task = asyncio.create_task(run_stream())
+    submitted = await c.post(f"/api/projects/{p['project_id']}/generate", json={})
+    assert submitted.status_code == 200
+    run_id = submitted.json()["run"]["run_id"]
     await asyncio.wait_for(started.wait(), timeout=5)
 
     # A concurrent manual edit lands while the pipeline is running.
@@ -278,12 +295,14 @@ async def test_generate_rejects_concurrent_edit_without_overwrite(client):
         record.revision, source="manual", summary="并发编辑",
     )
     finish.set()
-    events = await stream_task
+    terminal = await _await_run_terminal(api, run_id)
 
-    assert events[-1][0] == "done"
-    assert "revision_conflict" in events[-1][1]
-    error_events = [data for name, data in events if name == "error"]
-    assert error_events, "expected an SSE error event for the conflict"
+    # Ticket #14: the run ends failed with the conflict spelled out; the
+    # user's content is never overwritten and nothing further is submitted.
+    assert terminal["status"] == "failed"
+    assert "被修改" in (terminal["error"] or "")
+    run = api._runtime.store.get_generation_run(run_id)
+    assert run.unapplied_json is not None  # the result is kept, unapplied
 
     final = (await c.get(f"/api/projects/{p['project_id']}")).json()
     assert final["outline"]["basic_info"]["logline"] == "用户手工改的大纲"
@@ -299,9 +318,11 @@ async def test_generate_missing_model_returns_clear_error(client, monkeypatch):
 
     monkeypatch.setattr(api, "LLMClient", broken_llm)
 
-    r = await c.get(f"/api/projects/{p['project_id']}/generate")
+    r = await c.post(f"/api/projects/{p['project_id']}/generate", json={})
     assert r.status_code == 400
     assert r.json()["detail"]["code"] == "model_not_configured"
+    # No run row was created by the refused submission.
+    assert api._runtime.store.latest_generation_run(p["project_id"]) is None
     # The project itself remains openable without any model key.
     got = await c.get(f"/api/projects/{p['project_id']}")
     assert got.status_code == 200

@@ -77,6 +77,22 @@ export async function release(page: Page, key: string) {
   }, key);
 }
 
+/** Wait until at least one request is held by the gate for this key.
+ *
+ * Releasing before the app has actually issued the request would let it
+ * slip through to the real network; this makes the release deterministic.
+ */
+export async function waitForHeld(page: Page, key: string, timeout = 5_000) {
+  await page.waitForFunction(
+    (k) => {
+      const queue = (window as any).__gatePending.get(k);
+      return Array.isArray(queue) && queue.length > 0;
+    },
+    key,
+    { timeout },
+  );
+}
+
 export async function releaseAll(page: Page, key: string) {
   await page.evaluate((key) => {
     const queue = (window as any).__gatePending.get(key) || [];
@@ -295,6 +311,46 @@ store.close()
       (err) => (err ? reject(err) : resolve()),
     );
   });
+}
+
+/** Seed a generation-run row directly (no model needed) and return its id.
+ *
+ * Status "running" makes the page resubscribe on open (ticket #14 restore);
+ * terminal statuses surface as a one-shot notice instead.
+ */
+export async function seedRun(
+  projectId: string,
+  status: "running" | "failed" | "succeeded",
+): Promise<string> {
+  const { execFile } = await import("node:child_process");
+  const script = `
+import json, sys
+from pathlib import Path
+from script_weaver.core.project_store import ProjectStore
+pid, status = sys.argv[1], sys.argv[2]
+store = ProjectStore(Path("/tmp/script-weaver-e2e-data/main-web/projects.sqlite3"))
+rec = store.get_required(pid)
+run = store.create_generation_run(
+    pid, kind="generate", request_key=f"seed-{status}",
+    request={"user_input": rec.state.user_input, "auto_approve": True},
+    base_revision=rec.revision, base_state_json=rec.state_json,
+    checkpoint_json=rec.state_json)
+if status != "running":
+    store.update_generation_run(run.run_id, status=status,
+                                error="种子运行预先写好的失败原因" if status == "failed" else None)
+run = store.get_generation_run(run.run_id)
+print(json.dumps({"run_id": run.run_id, "status": run.status}))
+store.close()
+`;
+  const { stdout } = await new Promise<{ stdout: string }>((resolve, reject) => {
+    execFile(
+      "../.venv/bin/python",
+      ["-c", script, projectId, status],
+      { cwd: process.cwd() },
+      (err, stdout) => (err ? reject(new Error(`${err}\n${stdout}`)) : resolve({ stdout })),
+    );
+  });
+  return (JSON.parse(stdout) as { run_id: string }).run_id;
 }
 
 /** Write script + storyboard (Chinese, one >200-char prompt) via the store.

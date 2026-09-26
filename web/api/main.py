@@ -8,6 +8,13 @@ the current ProjectState snapshot and its immutable version history live in
 one database, so content survives refreshes and backend restarts. A single
 API instance owns the data directory via an OS-level lock; a second instance
 on the same directory refuses to start.
+
+Generation runs independently of the page (ticket #14): POST submits a run,
+the FastAPI lifespan owns its asyncio task, every successful pipeline step
+is CAS-committed as it validates, and GET endpoints only observe. A page
+refresh, close or SSE disconnect never cancels a run; an explicit stop or a
+service restart does (restarts mark leftover runs ``interrupted`` and never
+re-arm model calls on their own).
 """
 
 from __future__ import annotations
@@ -19,11 +26,10 @@ import logging
 import tempfile
 import zipfile
 from contextlib import asynccontextmanager, suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from anyio import CancelScope
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse
@@ -32,14 +38,22 @@ from sse_starlette.sse import EventSourceResponse
 
 from script_weaver.core import refinement
 from script_weaver.core.config import get_settings
-from script_weaver.core.pipeline import PipelineEngine
+from script_weaver.core.pipeline import (
+    GENERATION_STEP_LABELS,
+    PipelineEngine,
+    PipelineStopped,
+)
 from script_weaver.core.project_store import (
+    RUN_ACTIVE_STATUSES,
     DataDirLock,
     DataDirLockError,
+    GenerationRun,
     ProjectRecord,
     ProjectStore,
     ProjectStoreError,
     RevisionConflictError,
+    hash_run_request,
+    serialize_state,
 )
 from script_weaver.core.refinement import RefineExecutionError, RefinementError
 from script_weaver.core.types import ProjectState, Shot
@@ -57,17 +71,21 @@ logger = logging.getLogger(__name__)
 class _Runtime:
     store: ProjectStore
     lock: DataDirLock
+    runs: _RunManager
 
 
 # Set by the lifespan; module-level so direct-call tests can substitute it.
 _runtime: _Runtime | None = None
-# Projects with an in-flight generation stream (task state, not content).
-_active_generations: set[str] = set()
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Startup: take the data-dir lock and open the persistent store."""
+    """Startup: take the data-dir lock, open the store, reconcile runs.
+
+    Runs left ``running``/``stopping`` by a previous process are marked
+    ``interrupted`` — reported as fact, never silently resumed, and no model
+    call is made here.
+    """
     global _runtime
     logger.info("Script-Weaver API starting up...")
     namespace = get_settings().data_dir / "main-web"
@@ -82,10 +100,15 @@ async def lifespan(app: FastAPI):
     except Exception:
         lock.release()
         raise
-    _runtime = _Runtime(store=store, lock=lock)
+    runs = _RunManager(store)
+    _runtime = _Runtime(store=store, lock=lock, runs=runs)
     try:
+        stale = await asyncio.to_thread(store.interrupt_stale_generation_runs)
+        if stale:
+            logger.info("Marked %d leftover generation run(s) interrupted", stale)
         yield
     finally:
+        await runs.shutdown()
         _runtime = None
         store.close()
         lock.release()
@@ -126,6 +149,18 @@ class RefineRequest(BaseModel):
     message: str
 
 
+class GenerateRequest(BaseModel):
+    """POST /generate body (ticket #14).
+
+    ``request_key`` is the client's idempotency key: retries of one submit
+    intent reuse it, a new intent mints a new one. ``user_input`` overrides
+    the idea text for this run (defaults to the project's stored idea).
+    """
+
+    request_key: str | None = Field(default=None, max_length=200)
+    user_input: str | None = Field(default=None, max_length=20000)
+
+
 class SkillActivateRequest(BaseModel):
     skill_id: str
     stage: str
@@ -137,6 +172,12 @@ def _store() -> ProjectStore:
     if _runtime is None:
         raise HTTPException(503, "项目存储尚未初始化，请等待服务启动完成")
     return _runtime.store
+
+
+def _runs() -> _RunManager:
+    if _runtime is None:
+        raise HTTPException(503, "项目存储尚未初始化，请等待服务启动完成")
+    return _runtime.runs
 
 
 def _store_error(exc: ProjectStoreError) -> HTTPException:
@@ -166,6 +207,8 @@ class _GenerationContext:
     base_state_json: str
     state: ProjectState
     store: ProjectStore
+    auto_approve: bool = True
+    skill_bindings: dict[str, Any] = field(default_factory=dict)
 
     def commit(self, new_state: ProjectState, source: str, summary: str) -> ProjectRecord:
         return self.store.replace_state(
@@ -187,7 +230,9 @@ class _GenerationContext:
         )
 
 
-async def _get_engine(project_id: str) -> tuple[PipelineEngine, _GenerationContext]:
+async def _get_engine(
+    project_id: str, *, progress_callback=None
+) -> tuple[PipelineEngine, _GenerationContext]:
     """Load a project from the store and build a pipeline engine for it.
 
     Raises 404 when the project is unknown and 400 when the configured model
@@ -209,6 +254,7 @@ async def _get_engine(project_id: str) -> tuple[PipelineEngine, _GenerationConte
         llm_client=llm,
         skill_registry=registry,
         auto_approve_gates=record.auto_approve,
+        progress_callback=progress_callback,
     )
     ctx = _GenerationContext(
         project_id=record.project_id,
@@ -216,8 +262,444 @@ async def _get_engine(project_id: str) -> tuple[PipelineEngine, _GenerationConte
         base_state_json=record.state_json,
         state=record.state,
         store=store,
+        auto_approve=record.auto_approve,
+        skill_bindings=record.skill_bindings,
     )
     return engine, ctx
+
+
+# ── Background generation runs (ticket #14) ────────────
+
+
+class RunSubmitConflict(Exception):
+    """A submission violates idempotency or the one-active-run rule."""
+
+    def __init__(self, code: str, message: str, run: GenerationRun | None = None):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.run = run
+
+
+class _StageConflict(Exception):
+    """A stage result could not be applied; the run must stop as failed."""
+
+    def __init__(self, message: str, unapplied: ProjectState):
+        super().__init__(message)
+        self.message = message
+        self.unapplied = unapplied
+
+
+class _ProgressRelay:
+    """Late-binding progress sink — the run id exists only after the row."""
+
+    def __init__(self, manager: _RunManager):
+        self._manager = manager
+        self.run_id: str | None = None
+
+    def __call__(self, stage: str, message: str) -> None:
+        if self.run_id is not None:
+            self._manager.broadcast(self.run_id, "progress",
+                                    {"stage": stage, "message": message})
+
+
+class _RunManager:
+    """Lifespan-owned generation runs (ticket #14).
+
+    A run's lifecycle belongs to the server process, never to an SSE
+    connection: submit() enforces request_key idempotency and the
+    one-active-model-run-per-project rule, then spawns the pipeline task.
+    Every successful pipeline step is CAS-committed through
+    ``on_stage_complete``; a user edit, a store failure or a stop aborts
+    before the next stage while everything already saved stays saved.
+    Subscribers only observe — disconnecting one changes nothing.
+    """
+
+    def __init__(self, store: ProjectStore):
+        self.store = store
+        self._tasks: dict[str, asyncio.Task] = {}
+        self._subscribers: dict[str, set[asyncio.Queue]] = {}
+        self._stop_events: dict[str, asyncio.Event] = {}
+        self._project_locks: dict[str, asyncio.Lock] = {}
+        self._refine_projects: set[str] = set()
+
+    # ── Admission ──────────────────────────────────────
+
+    def _project_lock(self, project_id: str) -> asyncio.Lock:
+        return self._project_locks.setdefault(project_id, asyncio.Lock())
+
+    async def submit(
+        self, project_id: str, request_key: str | None, user_input: str | None
+    ) -> tuple[GenerationRun, bool]:
+        """Admit one generation run; returns (run, created).
+
+        The engine is built first so 404/400 answers before any row exists.
+        Idempotency: an active run with the same key and identical input is
+        returned as-is; the same key with different input is a conflict, and
+        any other active run makes the project busy. Resending a request
+        that already succeeded returns the finished run — no new model call.
+        """
+        relay = _ProgressRelay(self)
+        engine, ctx = await _get_engine(project_id, progress_callback=relay)
+        request = {
+            "user_input": user_input if user_input is not None else ctx.state.user_input,
+            "auto_approve": bool(getattr(ctx, "auto_approve", True)),
+            "skill_bindings": getattr(ctx, "skill_bindings", {}) or {},
+        }
+        request_hash = hash_run_request(request)
+        key = request_key or f"auto-{request_hash}"
+
+        async with self._project_lock(project_id):
+            if project_id in self._refine_projects:
+                raise RunSubmitConflict(
+                    "run_active", "该项目正在处理修改请求，请稍后再提交生成。"
+                )
+            active = await asyncio.to_thread(
+                self.store.active_generation_run, project_id
+            )
+            if active is not None:
+                if active.request_key == key:
+                    if active.request_hash != request_hash:
+                        raise RunSubmitConflict(
+                            "request_conflict",
+                            "同一 request_key 已携带不同输入在运行中，提交被拒绝。",
+                            run=active,
+                        )
+                    return active, False
+                raise RunSubmitConflict(
+                    "run_active", "该项目已有生成运行进行中，请等待完成或先停止。",
+                    run=active,
+                )
+            latest = await asyncio.to_thread(
+                self.store.latest_generation_run, project_id
+            )
+            if (
+                latest is not None
+                and latest.request_key == key
+                and latest.status == "succeeded"
+                and latest.request_hash == request_hash
+            ):
+                return latest, False
+            run = await asyncio.to_thread(
+                self.store.create_generation_run,
+                project_id,
+                kind="generate",
+                request_key=key,
+                request=request,
+                base_revision=ctx.revision,
+                base_state_json=ctx.base_state_json,
+                checkpoint_json=ctx.base_state_json,
+            )
+            relay.run_id = run.run_id
+            self._spawn(run.run_id, engine, ctx)
+            return run, True
+
+    @asynccontextmanager
+    async def refine_slot(self, project_id: str):
+        """Admission for the synchronous refine endpoint.
+
+        Refine is a model run too: it must not overlap an active generation,
+        and generation must not start while a refine is processing.
+        """
+        async with self._project_lock(project_id):
+            active = await asyncio.to_thread(
+                self.store.active_generation_run, project_id
+            )
+            if active is not None:
+                raise RunSubmitConflict(
+                    "run_active", "项目正在生成中，请先停止或等待完成后再修改。",
+                    run=active,
+                )
+            self._refine_projects.add(project_id)
+        try:
+            yield
+        finally:
+            self._refine_projects.discard(project_id)
+
+    # ── Execution ──────────────────────────────────────
+
+    def _spawn(self, run_id: str, engine, ctx: _GenerationContext) -> None:
+        stop_event = asyncio.Event()
+        self._stop_events[run_id] = stop_event
+        task = asyncio.create_task(self._execute(run_id, engine, ctx, stop_event))
+        self._tasks[run_id] = task
+
+        def _retrieve(t: asyncio.Task) -> None:
+            # Consume the outcome so shutdown never leaves an
+            # "exception was never retrieved" warning behind.
+            if not t.cancelled():
+                with suppress(BaseException):
+                    t.exception()
+
+        task.add_done_callback(_retrieve)
+
+    async def _execute(
+        self, run_id: str, engine, ctx: _GenerationContext, stop_event: asyncio.Event
+    ) -> None:
+        project_id = ctx.project_id
+        run = await asyncio.to_thread(self.store.get_generation_run_required, run_id)
+        base_revision = run.base_revision
+        base_state_json = run.base_state_json
+        completed: list[str] = list(run.completed_steps)
+
+        async def _on_stage_complete(step: str, working: ProjectState) -> None:
+            nonlocal base_revision, base_state_json
+            if stop_event.is_set():
+                raise PipelineStopped()
+            label = GENERATION_STEP_LABELS.get(step, step)
+            try:
+                record = await asyncio.to_thread(
+                    self.store.replace_state,
+                    project_id,
+                    working,
+                    base_revision=base_revision,
+                    base_state_json=base_state_json,
+                    source="pipeline",
+                    summary=f"生成：{label}",
+                )
+            except RevisionConflictError as exc:
+                raise _StageConflict(
+                    f"项目内容在生成期间被修改，「{label}」阶段的结果未应用，已停止后续阶段。",
+                    working,
+                ) from exc
+            except ProjectStoreError as exc:
+                raise _StageConflict(
+                    f"保存「{label}」阶段结果失败，已停止后续阶段：{exc}", working
+                ) from exc
+            base_revision = record.revision
+            base_state_json = record.state_json
+            completed.append(step)
+            progress = {
+                "stage": step,
+                "message": f"阶段完成：{label}",
+                "completed_steps": list(completed),
+                "revision": record.revision,
+            }
+            await asyncio.to_thread(
+                self.store.update_generation_run,
+                run_id,
+                base_revision=base_revision,
+                base_state_json=base_state_json,
+                completed_steps=completed,
+                checkpoint_json=record.state_json,
+                last_progress=progress,
+            )
+            self.broadcast(run_id, "progress", progress)
+
+        try:
+            result = await engine.run_full_pipeline(
+                user_input=run.request.get("user_input") or ctx.state.user_input,
+                title=ctx.state.meta.title or None,
+                initial_state=None,
+                completed_steps=[],
+                on_stage_complete=_on_stage_complete,
+            )
+            if not completed:
+                # Engines that never invoked the stage callback (pre-#14
+                # stubs) still get their single atomic final commit.
+                try:
+                    record = await asyncio.to_thread(
+                        self.store.replace_state,
+                        project_id,
+                        result,
+                        base_revision=base_revision,
+                        base_state_json=base_state_json,
+                        source="pipeline",
+                        summary="完整生成",
+                    )
+                except RevisionConflictError as exc:
+                    raise _StageConflict(
+                        "项目内容在生成期间被修改，生成结果未应用。", result
+                    ) from exc
+                base_revision = record.revision
+                base_state_json = record.state_json
+                completed.append("finalize")
+                await asyncio.to_thread(
+                    self.store.update_generation_run,
+                    run_id,
+                    base_revision=base_revision,
+                    base_state_json=base_state_json,
+                    completed_steps=completed,
+                    checkpoint_json=record.state_json,
+                )
+            summary = _build_result_summary(result)
+            run = await asyncio.to_thread(
+                self.store.update_generation_run,
+                run_id,
+                status="succeeded",
+                error=None,
+                result_summary=summary,
+                last_progress={"stage": "complete", "message": "Pipeline complete!"},
+            )
+            self.broadcast(run_id, "done", _run_done_payload(run))
+        except PipelineStopped:
+            run = await asyncio.to_thread(
+                self.store.update_generation_run,
+                run_id,
+                status="cancelled",
+                error=None,
+                last_progress={"stage": "stop", "message": "生成已停止；已完成阶段保留。"},
+            )
+            self.broadcast(run_id, "done", _run_done_payload(run))
+        except _StageConflict as exc:
+            run = await asyncio.to_thread(
+                self.store.update_generation_run,
+                run_id,
+                status="failed",
+                error=exc.message,
+                unapplied_json=serialize_state(exc.unapplied),
+            )
+            self.broadcast(run_id, "done", _run_done_payload(run))
+        except asyncio.CancelledError:
+            # Stop/shutdown cancelled the task mid-stage: classify by intent.
+            status = "cancelled" if stop_event.is_set() else "interrupted"
+            message = (
+                "生成已停止；已完成阶段保留。"
+                if status == "cancelled"
+                else "服务关闭，生成中断；已完成阶段保留，不会自动继续。"
+            )
+            with suppress(asyncio.CancelledError, ProjectStoreError):
+                run = await asyncio.to_thread(
+                    self.store.update_generation_run,
+                    run_id,
+                    status=status,
+                    error=message,
+                )
+                self.broadcast(run_id, "done", _run_done_payload(run))
+        except Exception as exc:
+            logger.exception("Generation run %s failed", run_id)
+            run = await asyncio.to_thread(
+                self.store.update_generation_run,
+                run_id,
+                status="failed",
+                error=f"生成失败：{exc}",
+            )
+            self.broadcast(run_id, "done", _run_done_payload(run))
+        finally:
+            self._tasks.pop(run_id, None)
+            self._stop_events.pop(run_id, None)
+            self._finish_subscribers(run_id)
+
+    # ── Stop / shutdown ────────────────────────────────
+
+    async def request_stop(self, run_id: str) -> tuple[GenerationRun, bool]:
+        """User stop: no new stages, local waits cancelled. Idempotent."""
+        run = await asyncio.to_thread(
+            self.store.get_generation_run_required, run_id
+        )
+        if run.status not in RUN_ACTIVE_STATUSES:
+            return run, False
+        run = await asyncio.to_thread(
+            self.store.update_generation_run,
+            run_id,
+            status="stopping",
+            last_progress={"stage": "stop", "message": "正在停止生成…"},
+        )
+        stop_event = self._stop_events.get(run_id)
+        if stop_event is not None:
+            stop_event.set()
+        task = self._tasks.get(run_id)
+        if task is not None and not task.done():
+            # Cancels local waits only; whether a remote provider request
+            # lands (and bills) is not claimed either way.
+            task.cancel()
+        return run, True
+
+    async def shutdown(self) -> None:
+        """Lifespan teardown: cancel and await every run task, then sweep."""
+        tasks = list(self._tasks.values())
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        for run_id in list(self._subscribers):
+            self._finish_subscribers(run_id)
+        with suppress(ProjectStoreError):
+            await asyncio.to_thread(self.store.interrupt_stale_generation_runs)
+
+    # ── Subscription ───────────────────────────────────
+
+    def broadcast(self, run_id: str, event: str, data: Any) -> None:
+        payload = _sse_event(event, data)
+        for queue in list(self._subscribers.get(run_id, ())):
+            queue.put_nowait(payload)
+
+    def register(self, run_id: str) -> asyncio.Queue:
+        queue: asyncio.Queue = asyncio.Queue()
+        self._subscribers.setdefault(run_id, set()).add(queue)
+        return queue
+
+    def unregister(self, run_id: str, queue: asyncio.Queue) -> None:
+        queues = self._subscribers.get(run_id)
+        if queues is not None:
+            queues.discard(queue)
+            if not queues:
+                self._subscribers.pop(run_id, None)
+
+    def _finish_subscribers(self, run_id: str) -> None:
+        for queue in list(self._subscribers.get(run_id, ())):
+            queue.put_nowait(None)  # sentinel: the run reached a terminal state
+
+
+async def _run_event_stream(manager: _RunManager, run_id: str):
+    """SSE generator observing a run: snapshot first, then live events.
+
+    Disconnecting the generator only unregisters the queue — the run keeps
+    going. Terminal runs replay their final state and close immediately, so
+    a reconnect never regenerates anything.
+    """
+    queue = manager.register(run_id)
+    try:
+        run = await asyncio.to_thread(manager.store.get_generation_run, run_id)
+        if run is None:
+            return
+        yield _sse_event("status", _serialize_run(run))
+        if run.status not in RUN_ACTIVE_STATUSES:
+            yield _sse_event("done", _run_done_payload(run))
+            return
+        while True:
+            item = await queue.get()
+            if item is None:
+                break
+            yield item
+    finally:
+        manager.unregister(run_id, queue)
+
+
+def _serialize_run(run: GenerationRun) -> dict:
+    """API shape of a run — progress facts only, no bulky state blobs."""
+    return {
+        "run_id": run.run_id,
+        "project_id": run.project_id,
+        "kind": run.kind,
+        "request_key": run.request_key,
+        "status": run.status,
+        "base_revision": run.base_revision,
+        "completed_steps": run.completed_steps,
+        "last_progress": run.last_progress,
+        "error": run.error,
+        "result_summary": run.result_summary,
+        "created_at": run.created_at,
+        "updated_at": run.updated_at,
+    }
+
+
+def _run_done_payload(run: GenerationRun) -> dict:
+    return {
+        "run_id": run.run_id,
+        "status": run.status,
+        "error": run.error,
+        "completed_steps": run.completed_steps,
+        "result_summary": run.result_summary,
+    }
+
+
+async def _latest_run_or_none(project_id: str) -> GenerationRun | None:
+    try:
+        await asyncio.to_thread(_store().get_required, project_id)
+    except ProjectStoreError as exc:
+        raise _store_error(exc) from exc
+    return await asyncio.to_thread(_store().latest_generation_run, project_id)
 
 
 # ── Project CRUD ────────────────────────────────────────
@@ -248,13 +730,16 @@ async def get_project(project_id: str) -> dict:
         record = await asyncio.to_thread(_store().get_required, project_id)
     except ProjectStoreError as exc:
         raise _store_error(exc) from exc
+    active_run = await asyncio.to_thread(
+        _store().active_generation_run, project_id
+    )
     return _serialize_project(
         record.project_id,
         record.state,
         revision=record.revision,
         created_at=record.created_at,
         updated_at=record.updated_at,
-        status="running" if project_id in _active_generations else record.state.meta.status.value,
+        status="running" if active_run is not None else record.state.meta.status.value,
     )
 
 
@@ -352,85 +837,113 @@ async def get_version(project_id: str, revision: int) -> dict:
     )
 
 
-# ── Pipeline Execution (SSE Streaming) ───────────────
+# ── Pipeline Execution (background runs, ticket #14) ────────
+
+
+@app.post("/api/projects/{project_id}/generate")
+async def submit_generation(project_id: str, req: GenerateRequest) -> dict:
+    """Submit a generation run owned by the server, not the page.
+
+    Returns 200 with ``created: true`` for a new run and ``created: false``
+    when an idempotent match was returned (active run with the same
+    request_key and identical input, or a resent request that already
+    succeeded) — those never trigger a new model call. 409 ``run_active``
+    for any other active run, 409 ``request_conflict`` for the same key
+    with different input.
+    """
+    try:
+        run, created = await _runs().submit(
+            project_id, req.request_key, req.user_input
+        )
+    except RunSubmitConflict as exc:
+        detail: dict[str, Any] = {"code": exc.code, "message": exc.message}
+        if exc.run is not None:
+            detail["run"] = _serialize_run(exc.run)
+        raise HTTPException(409, detail=detail) from exc
+    return {"run": _serialize_run(run), "created": created}
 
 
 @app.get("/api/projects/{project_id}/generate")
-async def generate(project_id: str) -> StreamingResponse:
-    """Run the full pipeline with SSE progress streaming."""
-    engine, ctx = await _get_engine(project_id)
+async def generate_alias(project_id: str) -> StreamingResponse:
+    """Read-only subscription alias onto the project's most recent run.
 
-    async def event_generator():
-        yield _sse_event("status", {"message": "Starting pipeline...", "stage": "init"})
+    Compatibility shim for the pre-#14 endpoint shape: generation is
+    submitted with POST now, and this GET never starts one. A project
+    without any run answers 404 ``no_run`` with a submit-first hint.
+    """
+    run = await _latest_run_or_none(project_id)
+    if run is None:
+        raise HTTPException(
+            404,
+            detail={
+                "code": "no_run",
+                "message": "该项目尚无生成运行；请先 POST /api/projects/{id}/generate 提交。",
+            },
+        )
+    return EventSourceResponse(_run_event_stream(_runs(), run.run_id))
 
-        state: ProjectState = ctx.state
-        _active_generations.add(project_id)
 
-        # Bridge the sync progress callback to the async SSE stream via a queue
-        queue: asyncio.Queue = asyncio.Queue()
+@app.get("/api/projects/{project_id}/runs/latest")
+async def latest_run(project_id: str) -> dict:
+    """The project's most recent run (progress facts; 404 no_run if none)."""
+    run = await _latest_run_or_none(project_id)
+    if run is None:
+        raise HTTPException(
+            404,
+            detail={
+                "code": "no_run",
+                "message": "该项目尚无生成运行。",
+            },
+        )
+    return _serialize_run(run)
 
-        def on_progress(stage: str, message: str) -> None:
-            queue.put_nowait({"stage": stage, "message": message})
 
-        engine._progress = on_progress
+@app.get("/api/projects/{project_id}/runs/{run_id}")
+async def get_run(project_id: str, run_id: str) -> dict:
+    run = await asyncio.to_thread(_runs().store.get_generation_run, run_id)
+    if run is None or run.project_id != project_id:
+        raise HTTPException(
+            404,
+            detail={"code": "run_not_found", "message": f"运行 '{run_id}' 不存在"},
+        )
+    return _serialize_run(run)
 
-        async def _run() -> ProjectState:
-            return await engine.run_full_pipeline(
-                user_input=state.user_input,
-                title=state.meta.title or None,
-            )
 
-        task = asyncio.create_task(_run())
-        try:
-            # Stream progress events as the pipeline runs
-            while not task.done():
-                try:
-                    yield _sse_event("progress", queue.get_nowait())
-                except asyncio.QueueEmpty:
-                    await asyncio.sleep(0.1)
+@app.get("/api/projects/{project_id}/runs/{run_id}/events")
+async def run_events(project_id: str, run_id: str) -> StreamingResponse:
+    """Subscribe to a run: current snapshot first, then live SSE updates.
 
-            # Drain any remaining queued events
-            while not queue.empty():
-                yield _sse_event("progress", queue.get_nowait())
+    Terminal runs replay their result and close — reconnecting never
+    regenerates. Dropping the connection never cancels the run.
+    """
+    run = await asyncio.to_thread(_runs().store.get_generation_run, run_id)
+    if run is None or run.project_id != project_id:
+        raise HTTPException(
+            404,
+            detail={"code": "run_not_found", "message": f"运行 '{run_id}' 不存在"},
+        )
+    return EventSourceResponse(_run_event_stream(_runs(), run_id))
 
-            result_state = await task
 
-            # Persist the result atomically; the service project ID wins so
-            # exports always carry meta.id == project_id.
-            result_state.meta.id = project_id
-            try:
-                await asyncio.to_thread(
-                    ctx.commit, result_state, "pipeline", "完整生成"
-                )
-            except RevisionConflictError as exc:
-                logger.warning("Generation result rejected for %s: %s", project_id, exc)
-                yield _sse_event("error", {
-                    "message": "项目内容在生成期间被修改，本次生成结果未覆盖当前内容。请重新生成。",
-                })
-                yield _sse_event("done", {"project_id": project_id, "error": "revision_conflict"})
-                return
+@app.post("/api/projects/{project_id}/runs/{run_id}/stop")
+async def stop_run(project_id: str, run_id: str) -> dict:
+    """Explicit stop: no further stages start, local waits are cancelled.
 
-            yield _sse_event("progress", {
-                "stage": "complete",
-                "message": "Pipeline complete!",
-                "result_summary": _build_result_summary(result_state),
-            })
-            yield _sse_event("done", {"project_id": project_id})
-
-        except Exception as e:
-            logger.exception("Pipeline error")
-            yield _sse_event("error", {"message": str(e)})
-            yield _sse_event("done", {"project_id": project_id, "error": str(e)})
-        finally:
-            if not task.done():
-                task.cancel()
-            # Always retrieve the result/exception, including disconnect cancellation.
-            with CancelScope(shield=True):
-                with suppress(asyncio.CancelledError, Exception):
-                    await task
-            _active_generations.discard(project_id)
-
-    return EventSourceResponse(event_generator())
+    Idempotent — stopping a terminal run just reports it. The run keeps
+    every stage that was already saved; whether an in-flight provider
+    request landed (or billed) is not claimed either way.
+    """
+    manager = _runs()
+    run = await asyncio.to_thread(manager.store.get_generation_run, run_id)
+    if run is None or run.project_id != project_id:
+        raise HTTPException(
+            404,
+            detail={"code": "run_not_found", "message": f"运行 '{run_id}' 不存在"},
+        )
+    if run.status not in RUN_ACTIVE_STATUSES:
+        return {"run": _serialize_run(run), "stopped": False}
+    run, stopped = await manager.request_stop(run_id)
+    return {"run": _serialize_run(run), "stopped": stopped}
 
 
 @app.post("/api/projects/{project_id}/refine")
@@ -447,8 +960,15 @@ async def refine(project_id: str, req: RefineRequest) -> dict:
 
     # PipelineEngine.refine runs on an internal copy and raises before any
     # write when the result lacks a substantive, constraint-respecting change.
+    # The refine slot keeps the one-active-model-run rule intact: refine and
+    # generation never overlap on the same project.
     try:
-        updated = await engine.refine(ctx.state, req.message)
+        async with _runs().refine_slot(project_id):
+            updated = await engine.refine(ctx.state, req.message)
+    except RunSubmitConflict as exc:
+        raise HTTPException(
+            409, detail={"code": exc.code, "message": exc.message}
+        ) from exc
     except RefinementError as exc:
         raise HTTPException(422, detail={"code": exc.code, "message": str(exc)}) from exc
     except RefineExecutionError as exc:

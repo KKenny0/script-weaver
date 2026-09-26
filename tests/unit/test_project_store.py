@@ -363,3 +363,119 @@ def test_data_dir_lock_rejects_second_holder(tmp_path):
     second = DataDirLock(tmp_path)
     second.acquire()
     second.release()
+
+
+# ── Generation runs (ticket #14) ───────────────────────────
+
+
+def _seed_run(store: ProjectStore, project_id: str, **overrides):
+    record = store.get_required(project_id)
+    defaults = {
+        "kind": "generate",
+        "request_key": "k1",
+        "request": {"user_input": "run story", "auto_approve": True},
+        "base_revision": record.revision,
+        "base_state_json": record.state_json,
+        "checkpoint_json": record.state_json,
+    }
+    defaults.update(overrides)
+    return store.create_generation_run(project_id, **defaults)
+
+
+def test_run_lifecycle_create_query_update(store):
+    project = store.create_project(user_input="run story")
+    run = _seed_run(store, project.project_id)
+
+    assert run.status == "running"
+    assert run.request_hash  # fingerprint stored
+    fetched = store.get_generation_run(run.run_id)
+    assert fetched.request == {"user_input": "run story", "auto_approve": True}
+    assert store.get_generation_run("nope") is None
+    with pytest.raises(ProjectStoreError):
+        store.get_generation_run_required("nope")
+
+    # Stage progress persists step by step.
+    updated = store.update_generation_run(
+        run.run_id,
+        status="running",
+        completed_steps=["idea_refiner"],
+        last_progress={"stage": "idea_refiner", "message": "阶段完成：概念精炼"},
+    )
+    assert updated.completed_steps == ["idea_refiner"]
+    assert updated.last_progress["stage"] == "idea_refiner"
+
+    terminal = store.update_generation_run(
+        run.run_id, status="succeeded", error=None,
+        result_summary={"title": "t", "details": ["大纲: x"]},
+    )
+    assert terminal.status == "succeeded"
+    assert terminal.result_summary["details"] == ["大纲: x"]
+    # Unknown fields are a programming error, not silent data loss.
+    with pytest.raises(TypeError):
+        store.update_generation_run(run.run_id, nope=1)
+
+
+def test_active_and_latest_run_selection(store):
+    project = store.create_project(user_input="multi run")
+    finished = _seed_run(store, project.project_id)
+    store.update_generation_run(finished.run_id, status="succeeded")
+
+    active = _seed_run(store, project.project_id, request_key="k2",
+                       request={"user_input": "second", "auto_approve": True})
+    assert store.active_generation_run(project.project_id).run_id == active.run_id
+    assert store.latest_generation_run(project.project_id).run_id == active.run_id
+
+    stopping = _seed_run(store, project.project_id, request_key="k3",
+                         request={"user_input": "third", "auto_approve": True})
+    store.update_generation_run(stopping.run_id, status="stopping")
+    assert store.active_generation_run(project.project_id).run_id == stopping.run_id
+
+    store.update_generation_run(active.run_id, status="cancelled")
+    assert store.active_generation_run(project.project_id).run_id == stopping.run_id
+    # Per-project isolation: another project's runs never leak in.
+    other = store.create_project(user_input="other")
+    assert store.active_generation_run(other.project_id) is None
+    assert store.latest_generation_run(other.project_id) is None
+
+
+def test_interrupt_stale_runs_marks_only_active(store):
+    project = store.create_project(user_input="stale")
+    live = _seed_run(store, project.project_id)
+    stopping = _seed_run(store, project.project_id, request_key="k2",
+                         request={"user_input": "b", "auto_approve": True})
+    store.update_generation_run(stopping.run_id, status="stopping")
+    done = _seed_run(store, project.project_id, request_key="k3",
+                     request={"user_input": "c", "auto_approve": True})
+    store.update_generation_run(done.run_id, status="succeeded")
+
+    assert store.interrupt_stale_generation_runs() == 2
+    assert store.get_generation_run(live.run_id).status == "interrupted"
+    assert store.get_generation_run(stopping.run_id).status == "interrupted"
+    assert store.get_generation_run(done.run_id).status == "succeeded"
+    # Re-sweep is a no-op and keeps a pre-existing error message intact.
+    store.update_generation_run(live.run_id, status="running")
+    store.get_generation_run(live.run_id)  # still readable
+    assert store.interrupt_stale_generation_runs() == 1
+
+
+def test_delete_project_cascades_runs(store):
+    project = store.create_project(user_input="doomed")
+    run = _seed_run(store, project.project_id)
+    assert store.delete_project(project.project_id) is True
+    assert store.get_generation_run(run.run_id) is None
+
+
+def test_version_one_database_migrates_to_runs_schema(tmp_path):
+    """A pre-#14 database (user_version=1) gains the runs table in place."""
+    db = tmp_path / "projects.sqlite3"
+    conn = sqlite3.connect(str(db))
+    conn.execute("PRAGMA user_version=1")
+    conn.close()
+
+    store = ProjectStore(db)
+    try:
+        assert store.interrupt_stale_generation_runs() == 0  # table usable
+        version = store._conn.execute("PRAGMA user_version").fetchone()[0]
+        assert version == 2
+    finally:
+        store.close()

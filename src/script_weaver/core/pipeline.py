@@ -11,7 +11,7 @@ import json
 import logging
 import time
 from datetime import datetime
-from typing import Any, Callable, Coroutine
+from typing import Any, Callable, Coroutine, Iterable
 
 from script_weaver.agents.impl import (
     ArtDirector,
@@ -44,6 +44,42 @@ logger = logging.getLogger(__name__)
 
 # Type alias for async functions
 AsyncFunc = Callable[..., Coroutine[Any, Any, Any]]
+
+# The checkpointable steps of a full generation, in execution order. Each
+# entry is a model-driven agent stage (or the derived finalize step); a step
+# only counts as completed once its artifact validated and integrated.
+GENERATION_STEPS = (
+    "idea_refiner",
+    "structurer",
+    "character_designer",
+    "scene_designer",
+    "art_director",
+    "scriptwriter",
+    "storyboard_artist",
+    "finalize",
+)
+
+GENERATION_STEP_LABELS = {
+    "idea_refiner": "概念精炼",
+    "structurer": "故事大纲",
+    "character_designer": "角色设计",
+    "scene_designer": "场景设计",
+    "art_director": "美术风格",
+    "scriptwriter": "剧本",
+    "storyboard_artist": "分镜",
+    "finalize": "视觉亮点与收尾",
+}
+
+StageCompleteCallback = Callable[[str, ProjectState], Coroutine[Any, Any, None]]
+
+
+class PipelineStopped(Exception):
+    """The pipeline was asked to stop between stages (e.g. user stop).
+
+    Raised by the stage-completion callback (or awaited inside it) to abort
+    before the next stage starts; everything already checkpointed stays
+    saved. Distinct from a failure: the run is user-stopped, not broken.
+    """
 
 
 class HumanGateResult:
@@ -191,22 +227,51 @@ class PipelineEngine:
 
     async def run_full_pipeline(
         self,
-        user_input: str,
+        user_input: str | None = None,
         title: str | None = None,
+        *,
+        initial_state: ProjectState | None = None,
+        completed_steps: Iterable[str] = (),
+        on_stage_complete: StageCompleteCallback | None = None,
     ) -> ProjectState:
         """Run the complete pipeline from idea to storyboard.
 
-        This is the primary entry point for end-to-end generation.
+        The keyword arguments are the ticket-#14 detach contract:
+        ``initial_state`` resumes from an explicit snapshot instead of a
+        fresh state, ``completed_steps`` names steps that already succeeded
+        (they and their gates are skipped), and ``on_stage_complete`` is
+        awaited after every step's artifact validated and integrated — the
+        caller persists its checkpoint there and may raise (e.g.
+        :class:`PipelineStopped`) to abort before the next stage. Legacy
+        callers pass only ``user_input``/``title`` and keep today's
+        behavior.
         """
         self._notify("pipeline", "=== Starting Full Pipeline ===")
 
         # Initialize state
-        state = ProjectState()
-        state.user_input = user_input
-        if title:
-            state.meta.title = title
+        if initial_state is not None:
+            state = initial_state.model_copy(deep=True)
+            if user_input is not None:
+                state.user_input = user_input
+            if title:
+                state.meta.title = title
         else:
-            state.meta.title = user_input[:50] + ("..." if len(user_input) > 50 else "")
+            state = ProjectState()
+            state.user_input = user_input or ""
+            if title:
+                state.meta.title = title
+            else:
+                idea = state.user_input
+                state.meta.title = idea[:50] + ("..." if len(idea) > 50 else "")
+
+        done: set[str] = set(completed_steps)
+        unknown = done - set(GENERATION_STEPS)
+        if unknown:
+            raise ValueError(f"Unknown completed steps: {sorted(unknown)}")
+
+        async def _checkpoint(step: str) -> None:
+            if on_stage_complete is not None:
+                await on_stage_complete(step, state)
 
         # Discover skills
         await self._skill_registry.discover()
@@ -216,46 +281,52 @@ class PipelineEngine:
         )
 
         # ── Stage 1: Idea Refinement ────────────────────
-        self._notify("pipeline", "--- Stage 1: Idea Refinement ---")
-        await self._run_agent("idea_refiner", state, user_input)
-
-        if not await self._await_gate("ideation", state):
-            return state
+        if "idea_refiner" not in done:
+            self._notify("pipeline", "--- Stage 1: Idea Refinement ---")
+            await self._run_agent("idea_refiner", state, state.user_input)
+            if not await self._await_gate("ideation", state):
+                return state
+            await _checkpoint("idea_refiner")
 
         # ── Stage 2: Structuring ───────────────────────
-        self._notify("pipeline", "--- Stage 2: Story Structuring ---")
-        await self._run_agent("structurer", state)
-
-        if not await self._await_gate("structuring", state):
-            return state
+        if "structurer" not in done:
+            self._notify("pipeline", "--- Stage 2: Story Structuring ---")
+            await self._run_agent("structurer", state)
+            if not await self._await_gate("structuring", state):
+                return state
+            await _checkpoint("structurer")
 
         # ── Stage 3: Design (Parallel) ────────────────
         self._notify("pipeline", "--- Stage 3: Design (Characters/Scenes/Art) ---")
-        await self._run_agent("character_designer", state)
-        await self._run_agent("scene_designer", state)
-        await self._run_agent("art_director", state)
-
-        if not await self._await_gate("designing", state):
+        for designer in ("character_designer", "scene_designer", "art_director"):
+            if designer not in done:
+                await self._run_agent(designer, state)
+                await _checkpoint(designer)
+        designers_done = {"character_designer", "scene_designer", "art_director"} <= done
+        if not designers_done and not await self._await_gate("designing", state):
             return state
 
         # ── Stage 4: Script Writing ────────────────────
-        self._notify("pipeline", "--- Stage 4: Script Writing ---")
-        await self._run_agent("scriptwriter", state)
-
-        if not await self._await_gate("scriptwriting", state):
-            return state
+        if "scriptwriter" not in done:
+            self._notify("pipeline", "--- Stage 4: Script Writing ---")
+            await self._run_agent("scriptwriter", state)
+            if not await self._await_gate("scriptwriting", state):
+                return state
+            await _checkpoint("scriptwriter")
 
         # ── Stage 5: Storyboarding ────────────────────
-        self._notify("pipeline", "--- Stage 5: Storyboard Generation ---")
-        await self._run_agent("storyboard_artist", state)
+        if "storyboard_artist" not in done:
+            self._notify("pipeline", "--- Stage 5: Storyboard Generation ---")
+            await self._run_agent("storyboard_artist", state)
+            await _checkpoint("storyboard_artist")
 
-        # ── Stage 6: Visual Highlights ─────────────────
-        self._notify("pipeline", "--- Stage 6: Visual Highlights ---")
-        await self._generate_visual_highlights(state)
-
-        # ── Final State ───────────────────────────────
-        state.meta.status = ProjectStatus.COMPLETE
-        state.touch()
+        # ── Stage 6: Visual Highlights + completion ────
+        if "finalize" not in done:
+            self._notify("pipeline", "--- Stage 6: Visual Highlights ---")
+            await self._generate_visual_highlights(state)
+            state.meta.status = ProjectStatus.COMPLETE
+            state.touch()
+            await _checkpoint("finalize")
 
         # ── Growth Loop ──────────────────────────────
         await self._run_growth_loop(state)

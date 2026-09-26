@@ -1,8 +1,12 @@
 """SQLite-backed persistent storage for web projects (``main-web`` namespace).
 
 Ticket #13 scope: the ``projects`` table holds the current effective
-ProjectState snapshot; ``project_versions`` keeps immutable history. Run and
-candidate records arrive with later phase-1 tickets.
+ProjectState snapshot; ``project_versions`` keeps immutable history. Ticket
+#14 adds ``generation_runs`` so a generation outlives any single page
+connection: the run row is the durable progress record (status, base
+revision, completed steps, checkpoint), restarted in-memory tasks are
+reconciled from it, and stale active rows are marked interrupted — never
+silently resumed.
 
 Concurrency model: a single API process owns the data directory (enforced by
 :class:`DataDirLock`); one connection guarded by a re-entrant lock keeps write
@@ -21,14 +25,22 @@ import threading
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager, suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
 from script_weaver.core.types import ProjectState
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+
+# Run statuses that mean "an in-memory task may still be driving this run".
+RUN_ACTIVE_STATUSES = ("running", "stopping")
+# Every status the run lifecycle can end in.
+RUN_STATUSES = (
+    "running", "stopping", "succeeded", "failed", "cancelled", "interrupted",
+)
 
 _SCHEMA_STATEMENTS = (
     """
@@ -56,6 +68,31 @@ _SCHEMA_STATEMENTS = (
         created_at TEXT NOT NULL,
         PRIMARY KEY (project_id, revision)
     )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS generation_runs (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        kind TEXT NOT NULL DEFAULT 'generate',
+        request_key TEXT NOT NULL,
+        request_hash TEXT NOT NULL,
+        status TEXT NOT NULL,
+        base_revision INTEGER NOT NULL,
+        base_state_json TEXT NOT NULL,
+        request_json TEXT NOT NULL,
+        completed_steps_json TEXT NOT NULL DEFAULT '[]',
+        checkpoint_json TEXT,
+        unapplied_json TEXT,
+        last_progress_json TEXT,
+        error TEXT,
+        result_summary_json TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_generation_runs_project
+        ON generation_runs (project_id, created_at DESC)
     """,
 )
 
@@ -181,6 +218,43 @@ class VersionSnapshot:
     summary: str
     created_at: str
     state: ProjectState
+
+
+@dataclass
+class GenerationRun:
+    """A persisted generation run: durable progress for a background task.
+
+    ``request``/``request_hash`` identify the submitted input/config snapshot
+    (idempotency), ``base_revision``/``base_state_json`` anchor the per-stage
+    CAS commits, ``completed_steps``/``checkpoint_json`` record how far the
+    pipeline got, and ``unapplied_json`` keeps a stage result that could not
+    be applied because the user edited the project meanwhile.
+    """
+
+    run_id: str
+    project_id: str
+    kind: str
+    request_key: str
+    request_hash: str
+    status: str
+    base_revision: int
+    base_state_json: str
+    request: dict[str, Any] = field(default_factory=dict)
+    completed_steps: list[str] = field(default_factory=list)
+    checkpoint_json: str | None = None
+    unapplied_json: str | None = None
+    last_progress: dict[str, Any] | None = None
+    error: str | None = None
+    result_summary: dict[str, Any] | None = None
+    created_at: str = ""
+    updated_at: str = ""
+
+
+def hash_run_request(request: dict[str, Any]) -> str:
+    """Stable fingerprint of a run's input/config snapshot."""
+    return sha256(
+        json.dumps(request, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()[:16]
 
 
 def serialize_state(state: ProjectState) -> str:
@@ -477,6 +551,164 @@ class ProjectStore:
                 "DELETE FROM projects WHERE id = ?", (project_id,)
             )
             return cursor.rowcount > 0
+
+    # ── Generation runs (ticket #14) ──────────────────────
+
+    _RUN_COLUMNS = (
+        "id, project_id, kind, request_key, request_hash, status, base_revision,"
+        " base_state_json, request_json, completed_steps_json, checkpoint_json,"
+        " unapplied_json, last_progress_json, error, result_summary_json,"
+        " created_at, updated_at"
+    )
+
+    @staticmethod
+    def _row_to_run(row: sqlite3.Row) -> GenerationRun:
+        def _load_json(text: str | None) -> Any:
+            return json.loads(text) if text else None
+
+        return GenerationRun(
+            run_id=row["id"],
+            project_id=row["project_id"],
+            kind=row["kind"],
+            request_key=row["request_key"],
+            request_hash=row["request_hash"],
+            status=row["status"],
+            base_revision=row["base_revision"],
+            base_state_json=row["base_state_json"],
+            request=_load_json(row["request_json"]) or {},
+            completed_steps=_load_json(row["completed_steps_json"]) or [],
+            checkpoint_json=row["checkpoint_json"],
+            unapplied_json=row["unapplied_json"],
+            last_progress=_load_json(row["last_progress_json"]),
+            error=row["error"],
+            result_summary=_load_json(row["result_summary_json"]),
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
+    def create_generation_run(
+        self,
+        project_id: str,
+        *,
+        kind: str,
+        request_key: str,
+        request: dict[str, Any],
+        base_revision: int,
+        base_state_json: str,
+        checkpoint_json: str | None,
+    ) -> GenerationRun:
+        """Insert a run in ``running`` status; the caller then starts its task."""
+        run_id = uuid.uuid4().hex[:12]
+        now = _utcnow()
+        with self._write_tx() as conn:
+            conn.execute(
+                "INSERT INTO generation_runs (id, project_id, kind, request_key,"
+                " request_hash, status, base_revision, base_state_json,"
+                " request_json, completed_steps_json, checkpoint_json,"
+                " created_at, updated_at)"
+                " VALUES (?, ?, ?, ?, ?, 'running', ?, ?, ?, '[]', ?, ?, ?)",
+                (
+                    run_id, project_id, kind, request_key,
+                    hash_run_request(request), base_revision, base_state_json,
+                    json.dumps(request, ensure_ascii=False), checkpoint_json,
+                    now, now,
+                ),
+            )
+        return self.get_generation_run_required(run_id)
+
+    def get_generation_run(self, run_id: str) -> GenerationRun | None:
+        with self._lock:
+            row = self._conn.execute(
+                f"SELECT {self._RUN_COLUMNS} FROM generation_runs WHERE id = ?",
+                (run_id,),
+            ).fetchone()
+        return self._row_to_run(row) if row else None
+
+    def get_generation_run_required(self, run_id: str) -> GenerationRun:
+        run = self.get_generation_run(run_id)
+        if run is None:
+            raise ProjectNotFoundError(f"Run '{run_id}' not found")
+        return run
+
+    def latest_generation_run(self, project_id: str) -> GenerationRun | None:
+        """The project's most recent run of any status."""
+        with self._lock:
+            row = self._conn.execute(
+                f"SELECT {self._RUN_COLUMNS} FROM generation_runs"
+                " WHERE project_id = ? ORDER BY created_at DESC, rowid DESC"
+                " LIMIT 1",
+                (project_id,),
+            ).fetchone()
+        return self._row_to_run(row) if row else None
+
+    def active_generation_run(self, project_id: str) -> GenerationRun | None:
+        """The project's active run, if any (running/stopping)."""
+        with self._lock:
+            row = self._conn.execute(
+                f"SELECT {self._RUN_COLUMNS} FROM generation_runs"
+                f" WHERE project_id = ? AND status IN ({','.join('?' * len(RUN_ACTIVE_STATUSES))})"
+                " ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                (project_id, *RUN_ACTIVE_STATUSES),
+            ).fetchone()
+        return self._row_to_run(row) if row else None
+
+    def update_generation_run(
+        self, run_id: str, **updates: Any
+    ) -> GenerationRun:
+        """Persist run progress fields; unknown fields are a programming error."""
+        column_map = {
+            "status": "status",
+            "base_revision": "base_revision",
+            "base_state_json": "base_state_json",
+            "completed_steps": "completed_steps_json",
+            "checkpoint_json": "checkpoint_json",
+            "unapplied_json": "unapplied_json",
+            "last_progress": "last_progress_json",
+            "error": "error",
+            "result_summary": "result_summary_json",
+        }
+        assignments, params = [], []
+        for attr, column in column_map.items():
+            if attr not in updates:
+                continue
+            value = updates.pop(attr)
+            if attr in ("completed_steps", "last_progress", "result_summary"):
+                value = (
+                    json.dumps(value, ensure_ascii=False)
+                    if value is not None else None
+                )
+            assignments.append(f"{column} = ?")
+            params.append(value)
+        if updates:
+            raise TypeError(f"Unknown generation-run fields: {sorted(updates)}")
+        if not assignments:
+            return self.get_generation_run_required(run_id)
+        assignments.append("updated_at = ?")
+        params.extend([_utcnow(), run_id])
+        with self._write_tx() as conn:
+            cursor = conn.execute(
+                f"UPDATE generation_runs SET {', '.join(assignments)} WHERE id = ?",
+                params,
+            )
+            if cursor.rowcount != 1:
+                raise ProjectNotFoundError(f"Run '{run_id}' not found")
+        return self.get_generation_run_required(run_id)
+
+    def interrupt_stale_generation_runs(self) -> int:
+        """Mark leftover active runs as interrupted (startup reconciliation).
+
+        Runs whose in-memory task died with the previous process are facts to
+        report, never work to silently resume: no model call happens here.
+        """
+        now = _utcnow()
+        with self._write_tx() as conn:
+            cursor = conn.execute(
+                "UPDATE generation_runs SET status = 'interrupted',"
+                " error = COALESCE(error, '服务在运行期间重启，生成已中断；不会自动继续。'),"
+                " updated_at = ? WHERE status IN ('running', 'stopping')",
+                (now,),
+            )
+            return cursor.rowcount
 
     # ── Internals ─────────────────────────────────────────
 

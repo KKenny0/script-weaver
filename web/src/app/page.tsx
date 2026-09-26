@@ -134,7 +134,15 @@ export default function HomePage() {
       const fullState = await apiGet(`/projects/${id}`);
       if (projectRef.current !== id) return; // stale response, another project is open
       setArtifactData(pickArtifactData(fullState));
-      setProjectStatus(projectHasArtifacts(fullState) ? "complete" : "idle");
+      // The backend reports "running" while a generation run is active for
+      // the project — the run outlives any page view (ticket #14).
+      setProjectStatus(
+        fullState.status === "running"
+          ? "running"
+          : projectHasArtifacts(fullState)
+            ? "complete"
+            : "idle",
+      );
       nextNotice(`📂 已打开项目「${fullState.meta?.title || id}」，可继续修改或导出。`);
     } catch (err: any) {
       if (projectRef.current !== id) return;
@@ -171,12 +179,11 @@ export default function HomePage() {
     refreshProjects();
   }, [refreshProjects]);
 
-  // Collapsing the chat unmounts ChatPanel, which closes its generation
-  // stream (and the backend cancels the run). A "running" status must not
-  // outlive the subscription it described.
+  // Collapsing the chat unmounts ChatPanel, which closes its progress view.
+  // The run itself keeps running in the backend (ticket #14) and the status
+  // pill stays truthful; reopening the project resubscribes to the run.
   const collapseChat = useCallback(() => {
     setLeftPanelCollapsed(true);
-    setProjectStatus((s) => (s === "running" ? "idle" : s));
   }, []);
 
   const handleRename = useCallback(async (id: string, title: string, expectedRevision: number) => {

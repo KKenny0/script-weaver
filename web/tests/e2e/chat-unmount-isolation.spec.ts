@@ -6,7 +6,9 @@ import {
   installSSEStub,
   modelEgressWatcher,
   openApp,
+  release,
   releaseAndSettle,
+  waitForHeld,
   seedOutline,
   seedProject,
   seedSecondRevision,
@@ -169,6 +171,14 @@ test("draft typed during a pending creation is preserved (kept regression)", asy
   await openApp(page, "/");
   await expect(page.getByPlaceholder("输入你的故事想法，按 Enter 开始生成...")).toBeVisible();
 
+  // Ticket #14: creation is followed by the run submission — mock it too so
+  // the model-less e2e backend never sees it. The gate matches rules in
+  // insertion order, so the more specific /generate rule must come first
+  // (the creation URL would otherwise swallow the submission request).
+  await gateRespond(page, "POST /generate", 200, {
+    run: { run_id: "run_draft", status: "running", completed_steps: [] },
+    created: true,
+  });
   await gate(page, "POST /api/projects");
   const composer = page.getByPlaceholder("输入你的故事想法，按 Enter 开始生成...");
   await composer.fill("原始想法E");
@@ -178,6 +188,8 @@ test("draft typed during a pending creation is preserved (kept regression)", asy
   await composer.fill("等待期间的新草稿E2");
 
   await releaseAndSettle(page, "POST /api/projects", "/api/projects");
+  await waitForHeld(page, "POST /generate");
+  await release(page, "POST /generate");
 
   await expect(page).toHaveURL(/project=/);
   // The new draft survives; the submitted idea was consumed into the project.
