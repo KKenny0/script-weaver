@@ -453,25 +453,105 @@ def _reference_defects(state: ProjectState) -> list[ReferenceDefect]:
     return defects
 
 
+_OWNER_ID_FIELDS = {
+    _REL_SHOT_TO_SCENE: "shot_id",
+    _REL_SCENE_TO_DESIGN: "scene_id",
+    _REL_HIGHLIGHT_TO_SHOT: "id",
+}
+
+
+def _owning_objects(state: ProjectState, relation: str) -> list[Any]:
+    """Every owning object of a relation — not only defective ones."""
+    if relation == _REL_SHOT_TO_SCENE:
+        return list(state.storyboard.shots) if state.storyboard else []
+    if relation == _REL_SCENE_TO_DESIGN:
+        return list(state.script.scenes) if state.script else []
+    return list(state.visual_highlights or [])
+
+
+def _owner_id_census(state: ProjectState) -> collections.Counter[tuple[str, str]]:
+    """Count owning-object IDs per relation across all owning objects."""
+    census: collections.Counter[tuple[str, str]] = collections.Counter()
+    for relation, id_field in _OWNER_ID_FIELDS.items():
+        for obj in _owning_objects(state, relation):
+            census[(relation, getattr(obj, id_field))] += 1
+    return census
+
+
+def _duplicate_group_multiset(
+    state: ProjectState, relation: str, owner_id: str
+) -> collections.Counter[str]:
+    """The owner-ID group as an unordered multiset of raw contents."""
+    id_field = _OWNER_ID_FIELDS[relation]
+    return collections.Counter(
+        json.dumps(obj.model_dump(mode="json"), ensure_ascii=False, sort_keys=True)
+        for obj in _owning_objects(state, relation)
+        if getattr(obj, id_field) == owner_id
+    )
+
+
+def _historical_group_intact(
+    before: ProjectState, after: ProjectState, relation: str, owner_id: str
+) -> bool:
+    """Whether every surviving member of a duplicated owner-ID group is
+    byte-identical to a before member.
+
+    Compared as unordered multiset containment (multiplicity kept, no
+    array positions, never collapsed to a set), so members cannot be
+    matched by slot and a removed member does not void the exemption for
+    the unchanged survivors.
+    """
+    after_group = _duplicate_group_multiset(after, relation, owner_id)
+    before_group = _duplicate_group_multiset(before, relation, owner_id)
+    return not (after_group - before_group)
+
+
 def validate_reference_integrity(before: ProjectState, after: ProjectState) -> None:
     """Reject references this modification newly breaks.
 
-    Defects are compared by stable identity with local counting: a
-    pre-existing defect neither blocks unrelated edits nor pardons a new
-    one. Moving with its owner keeps it historical, while a rebuilt
-    target value, a defect on a different object (even at an index an old
-    defect used to occupy), or a second object hiding behind a duplicated
-    owner ID are all new. The check is independent of the evidence diff's
-    ID/reference exclusions, IDs are never rewritten or guessed on the
-    model's behalf, and no downstream artifact is dropped to "fix" a link.
+    Defects are compared by stable identity with local counting, and the
+    historical exemption additionally requires the defect's owner ID to be
+    reliably matchable: a duplication this modification introduces or
+    worsens cannot lend a historical defect to a different object wearing
+    the same ID, and a historically duplicated group keeps its exemption
+    only while every surviving member is unchanged. Otherwise: a rebuilt
+    target value, a defect on a different object, or a new bad reference
+    are all rejected. Unique owners keep the identity/count semantics, so
+    reordering stays harmless. The check is independent of the evidence
+    diff's ID/reference exclusions, IDs are never rewritten or guessed on
+    the model's behalf, and no downstream artifact is dropped to "fix" a
+    link.
     """
-    before_counts = collections.Counter(d.identity for d in _reference_defects(before))
+    before_defects = _reference_defects(before)
     after_defects = _reference_defects(after)
+    before_counts = collections.Counter(d.identity for d in before_defects)
     after_counts = collections.Counter(d.identity for d in after_defects)
-    new_displays = [
-        f"{d.path}({d.kind})" for d in after_defects
-        if after_counts[d.identity] > before_counts.get(d.identity, 0)
-    ]
+    before_owners = _owner_id_census(before)
+    after_owners = _owner_id_census(after)
+
+    new_displays: list[str] = []
+    for defect in after_defects:
+        if after_counts[defect.identity] > before_counts.get(defect.identity, 0):
+            new_displays.append(f"{defect.path}({defect.kind})")
+            continue
+        # The identity count did not grow, so the defect looks historical —
+        # but the exemption needs a reliably matchable owner, not just
+        # matching counts.
+        owner_key = (defect.relation, defect.owner_id)
+        owner_before = before_owners.get(owner_key, 0)
+        owner_after = after_owners.get(owner_key, 0)
+        if owner_after >= 2 and owner_after > owner_before:
+            new_displays.append(
+                f"{defect.path}({defect.kind}, "
+                f"所属对象 ID {defect.owner_id!r} 本次新增重复，不可借用历史缺陷)"
+            )
+        elif owner_before >= 2 and not _historical_group_intact(
+            before, after, defect.relation, defect.owner_id
+        ):
+            new_displays.append(
+                f"{defect.path}({defect.kind}, "
+                f"所属对象 ID {defect.owner_id!r} 历史重复组已变化，不可借用历史缺陷)"
+            )
     if new_displays:
         shown = ", ".join(list(dict.fromkeys(new_displays))[:5])
         raise RefineConstraintFailed(f"修改破坏了引用完整性: {shown}，修改未应用")

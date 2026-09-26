@@ -1418,6 +1418,70 @@ async def test_refine_scene_design_id_rebuild_only_is_no_meaningful_change(clien
     assert current["scenes"][0]["id"] == "sd_roof"
 
 
+# ── Review round 4: duplicate owner IDs must not transfer exemptions ───
+
+
+def designed_unstoried_state() -> ProjectState:
+    """The reviewed repro shape: two script scenes, no storyboard, sd_ok
+    exists; sc_first carries the historical dangling design ref."""
+    state = designed_scripted_state()
+    state.storyboard = None
+    return state
+
+
+async def _project_snapshot(c: httpx.AsyncClient, project_id: str) -> tuple[dict, list]:
+    detail = (await c.get(f"/api/projects/{project_id}")).json()
+    versions = (await c.get(f"/api/projects/{project_id}/versions")).json()["versions"]
+    return detail, versions
+
+
+async def test_refine_owner_id_duplication_defect_transfer_rejected_no_write(client):
+    """Real Pipeline → API → Store (offline model stand-in): repairing
+    sc_first while sc_last adopts its ID and its defect leaves identity
+    and count unchanged — index-keyed and count-keyed comparisons both
+    waved it through (200, revision bump, two sc_first saved). The
+    exemption must require a reliably-unique owner ID."""
+    api, c = client
+    p = await create_project(c, "修改目标故事", "重复ID转移缺陷")
+    state = designed_unstoried_state()
+    record = api._runtime.store.get_required(p["project_id"])
+    api._runtime.store.save_state(
+        p["project_id"], state, record.revision, source="manual", summary="seed")
+
+    def repair_a_transfer_defect_to_b(script: dict) -> dict:
+        out = copy.deepcopy(script)
+        out["scenes"][0]["scene_design_id"] = "sd_ok"        # sc_first repaired
+        out["scenes"][1]["scene_id"] = "sc_first"            # sc_last steals the ID
+        out["scenes"][1]["scene_design_id"] = "old_missing"  # defect moves to B
+        out["scenes"][1]["blocks"][1]["content"]["dialogue"] = "请一定记住今晚。"
+        return out
+
+    llm = ScriptedLLM(ROUTE_GENERAL_SCRIPT,
+                      repair_a_transfer_defect_to_b(scripted_script_dict(state)))
+    real_engine(api, llm)
+
+    before_detail, before_versions = await _project_snapshot(c, p["project_id"])
+    assert before_detail["script"]["scenes"][0]["scene_id"] == "sc_first"
+    assert before_detail["script"]["scenes"][1]["scene_id"] == "sc_last"
+
+    r = await c.post(f"/api/projects/{p['project_id']}/refine",
+                     json={"message": "修好第一场引用，第二场换个编号并改对白"})
+    assert r.status_code == 422, r.text
+    assert r.json()["detail"]["code"] == "refine_constraint_failed"
+    assert "scene_design_id" in r.json()["detail"]["message"]
+    assert "sc_first" in r.json()["detail"]["message"]
+
+    # Full before/after snapshot comparison — not just the status code.
+    after_detail, after_versions = await _project_snapshot(c, p["project_id"])
+    assert after_detail == before_detail, "rejected refine must change nothing"
+    assert after_versions == before_versions, "rejected refine must add no history"
+    assert after_detail["script"]["scenes"][0]["scene_design_id"] == "old_missing"
+    assert after_detail["script"]["scenes"][1]["scene_design_id"] == "sd_ok"
+    assert after_detail["script"]["scenes"][1]["blocks"][1]["content"]["dialogue"] \
+        == LAST_DIALOGUE
+    assert after_detail["memory_decisions"] == []
+
+
 def test_cli_generate_does_not_touch_web_database(tmp_path, monkeypatch):
     from click.testing import CliRunner
 

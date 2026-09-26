@@ -752,6 +752,115 @@ def test_general_scene_design_content_change_with_reference_intact_succeeds():
     assert [c.path for c in changes] == ["scenes[0].environment"]
 
 
+# ── Review round 4: duplicate owner IDs must not transfer exemptions ──
+
+
+def _design_relation_transfer():
+    """The reviewed repro shape: repair A, then let B wear A's scene_id and
+    reproduce the same defect — identity and count both unchanged."""
+    before = _with_designs(sample_state())
+    before.storyboard = None  # repro has no storyboard yet
+    after = before.model_copy(deep=True)
+    after.script.scenes[0].scene_design_id = "sd_ok"        # A repaired
+    after.script.scenes[1].scene_id = "sc_1"                # B steals A's ID
+    after.script.scenes[1].scene_design_id = "old_missing"  # defect moves to B
+    after.script.scenes[1].blocks[1].content["dialogue"] = "请一定记住今晚。"
+    return before, after, "scriptwriter"
+
+
+def _shot_relation_transfer():
+    before = sample_state()
+    before.storyboard.shots[0].scene_id = "sc_missing"  # historical dangling
+    after = before.model_copy(deep=True)
+    after.storyboard.shots[0].scene_id = "sc_2"             # shot_1 repaired
+    after.storyboard.shots[1].shot_id = "shot_1"            # shot_2 steals the ID
+    after.storyboard.shots[1].scene_id = "sc_missing"       # defect transferred
+    after.storyboard.shots[1].visual_description = "新的画面描述"
+    return before, after, "storyboard_artist"
+
+
+def _highlight_relation_transfer():
+    before = sample_state()
+    before.visual_highlights = [
+        VisualHighlight(id="vh_1", title="坏", description="旧亮点",
+                        related_shot_ids=["shot_missing"]),
+        VisualHighlight(id="vh_2", title="好", description="新亮点",
+                        related_shot_ids=["shot_1"]),
+    ]
+    after = before.model_copy(deep=True)
+    after.visual_highlights[0].related_shot_ids = ["shot_1"]      # vh_1 repaired
+    after.visual_highlights[1].id = "vh_1"                        # vh_2 steals the ID
+    after.visual_highlights[1].related_shot_ids = ["shot_missing"]
+    after.script.scenes[0].blocks[1].content["dialogue"] = "灯，不能灭。"
+    return before, after, "scriptwriter"
+
+
+@pytest.mark.parametrize(
+    "setup",
+    [_design_relation_transfer, _shot_relation_transfer, _highlight_relation_transfer],
+    ids=["scene→design", "shot→scene", "highlight→shot"],
+)
+def test_defect_transfer_via_owner_id_duplication_is_rejected(setup):
+    """A defect whose identity and count match a historical one is NOT
+    historical when its owner ID is duplicated by this modification — the
+    defect may simply have moved to another object wearing the ID."""
+    before, after, agent = setup()
+    with pytest.raises(RefineConstraintFailed) as exc:
+        refinement.validate_general_result(before, after, agent)
+    message = str(exc.value)
+    assert "dangling" in message or "ambiguous" in message
+    assert "重复" in message  # the rejection names the duplicate owner ID
+
+
+def test_changed_duplicate_group_cannot_swap_defect_between_members():
+    """Inside a historically duplicated group the members cannot be told
+    apart by ID, so once the group's content changes the historical
+    exemption no longer applies — swapping the defect between members
+    (repair one, break the other) must be refused."""
+    before = _with_designs(sample_state())
+    before.storyboard = None
+    before.script.scenes[0].scene_id = "sc_dup"  # A: old_missing (historical)
+    extra = before.script.scenes[1].model_copy(deep=True)
+    extra.scene_id = "sc_dup"
+    extra.scene_design_id = "sd_ok"  # B: fine — group sc_dup ×2
+    before.script.scenes.append(extra)
+    after = before.model_copy(deep=True)
+    after.script.scenes[0].scene_design_id = "sd_ok"        # A repaired
+    after.script.scenes[2].scene_design_id = "old_missing"  # B now defective
+    after.script.scenes[2].blocks[1].content["dialogue"] = "记住今晚。"
+    with pytest.raises(RefineConstraintFailed):
+        refinement.validate_general_result(before, after, "scriptwriter")
+
+
+def test_unchanged_duplicate_group_does_not_block_outside_edit():
+    """Positive control: a historically duplicated group left byte-identical
+    keeps its exemption — unrelated edits elsewhere stay allowed."""
+    before = _with_designs(sample_state())
+    before.storyboard = None
+    before.script.scenes[0].scene_id = "sc_dup"  # both members defective
+    before.script.scenes.append(before.script.scenes[0].model_copy(deep=True))
+    after = before.model_copy(deep=True)
+    # sc_2 sits outside the group; only its dialogue changes.
+    after.script.scenes[1].blocks[1].content["dialogue"] = "请一定记住今晚。"
+    changes = refinement.validate_general_result(before, after, "scriptwriter")
+    assert any(c.path.endswith("dialogue") for c in changes)
+
+
+def test_shrunk_duplicate_group_with_unchanged_survivor_keeps_exemption():
+    """Removing one member of a duplicate group is an improvement, not a
+    transfer: the surviving (byte-identical) object's defect stays
+    historical and must not block an unrelated edit."""
+    before = _with_designs(sample_state())
+    before.storyboard = None
+    before.script.scenes[0].scene_id = "sc_dup"  # group sc_dup ×2, both defective
+    before.script.scenes.append(before.script.scenes[0].model_copy(deep=True))
+    after = before.model_copy(deep=True)
+    del after.script.scenes[2]  # dedup improvement: only one sc_dup remains
+    after.script.scenes[1].blocks[1].content["dialogue"] = "请一定记住今晚。"
+    changes = refinement.validate_general_result(before, after, "scriptwriter")
+    assert any(c.path.endswith("dialogue") for c in changes)
+
+
 @pytest.mark.parametrize(
     "data",
     [
