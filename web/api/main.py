@@ -35,15 +35,20 @@ import zipfile
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from sse_starlette.sse import EventSourceResponse
 
 from script_weaver.core import refinement
+from script_weaver.core.card_edit import (
+    CardNotFoundError,
+    DuplicateTargetIdError,
+    InvalidCardChangeError,
+)
 from script_weaver.core.config import get_settings
 from script_weaver.core.pipeline import (
     GENERATION_STEP_LABELS,
@@ -168,6 +173,22 @@ class CreateProjectRequest(BaseModel):
 class RenameProjectRequest(BaseModel):
     title: str = Field(min_length=1, max_length=200)
     expected_revision: int = Field(ge=1)
+
+
+class CardEditRequest(BaseModel):
+    """PATCH one card body (ticket #16).
+
+    ``changes`` carries only the fields actually edited; per-kind whitelists,
+    canonical enums and bounded durations are enforced in
+    ``script_weaver.core.card_edit`` (explicit validation — the default
+    Pydantic behaviour of ignoring unknown keys must never apply here, at
+    the request boundary either).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    expected_revision: int = Field(ge=1)
+    changes: dict[str, Any]
 
 
 class RefineRequest(BaseModel):
@@ -1242,6 +1263,67 @@ async def rename_project(project_id: str, req: RenameProjectRequest) -> dict:
         "revision": record.revision,
         "updated_at": record.updated_at,
     }
+
+
+@app.patch("/api/projects/{project_id}/artifacts/{kind}/{target_id}")
+async def edit_card(
+    project_id: str,
+    kind: Literal["characters", "scenes", "shots"],
+    target_id: str,
+    req: CardEditRequest,
+) -> dict:
+    """Save manual edits to one character/scene/shot card (ticket #16).
+
+    One store transaction performs the revision CAS, the single-target edit
+    (located by stable id, never by index), full validation, the derived
+    shot-total recompute, the conservative downstream review flags and the
+    new immutable version. The response carries ``changed`` plus the
+    complete project snapshot and ``review`` metadata this transaction
+    wrote — an unchanged save answers ``changed=false`` with the current
+    snapshot and no new revision. A project or in-project target that does
+    not exist answers 404; a stale revision 409 with ``current_revision``;
+    unknown/read-only fields, non-canonical enum values and bad durations
+    422 — and a duplicated target id is reported as the data anomaly it is
+    instead of silently editing one of the duplicates. Manual edits never
+    require model keys and never start a model call; an in-flight
+    generation run does not block them, and the run's own CAS keeps its
+    late results from overwriting a landed manual save.
+    """
+    try:
+        record, changed = await asyncio.to_thread(
+            _store().save_card_edit,
+            project_id,
+            kind=kind,
+            target_id=target_id,
+            changes=req.changes,
+            expected_revision=req.expected_revision,
+        )
+    except CardNotFoundError as exc:
+        raise HTTPException(
+            404, detail={"code": "card_not_found", "message": str(exc)}
+        ) from exc
+    except DuplicateTargetIdError as exc:
+        raise HTTPException(
+            422, detail={"code": "duplicate_target_id", "message": str(exc)}
+        ) from exc
+    except InvalidCardChangeError as exc:
+        detail: dict[str, Any] = {"code": "invalid_card_change", "message": str(exc)}
+        if exc.field:
+            detail["field"] = exc.field
+        raise HTTPException(422, detail=detail) from exc
+    except ProjectStoreError as exc:
+        raise _store_error(exc) from exc
+    body = _serialize_project(
+        record.project_id,
+        record.state,
+        revision=record.revision,
+        created_at=record.created_at,
+        updated_at=record.updated_at,
+        status=record.state.meta.status.value,
+    )
+    body["changed"] = changed
+    body["review"] = record.review
+    return body
 
 
 @app.delete("/api/projects/{project_id}")

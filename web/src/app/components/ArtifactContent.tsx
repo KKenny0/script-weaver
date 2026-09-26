@@ -1,5 +1,5 @@
 import React from "react";
-import { FileText, Users, Map, Palette, Film, Eye } from "lucide-react";
+import { FileText, Users, Map, Palette, Film, Eye, Pencil } from "lucide-react";
 
 // ── Types ────────────────────────────────────────
 
@@ -13,6 +13,12 @@ export interface ArtifactData {
   storyboard?: object | null;
   visual_highlights?: object[] | null;
 }
+
+/** Entry point for single-card editing; absent for read-only history views. */
+export type EditCardHandler = (
+  kind: "characters" | "scenes" | "shots",
+  id: string,
+) => void;
 
 // ── Label helpers ────────────────────────────────
 
@@ -75,6 +81,32 @@ function InfoRow({ label, value, highlight }: { label: string; value: string; hi
   );
 }
 
+// ── Card edit entry ──────────────────────────────
+
+function CardEditButton({
+  kind, id, name, onEditCard,
+}: {
+  kind: "characters" | "scenes" | "shots";
+  id: string;
+  name: string;
+  onEditCard?: EditCardHandler;
+}) {
+  if (!onEditCard) return null;
+  const label = `编辑${kind === "characters" ? "角色" : kind === "scenes" ? "场景" : "镜头"} ${name}`;
+  return (
+    <button
+      type="button"
+      className="card-edit-btn"
+      data-testid={`edit-card-${kind}-${id}`}
+      aria-label={label}
+      title={label}
+      onClick={() => onEditCard(kind, id)}
+    >
+      <Pencil size={12} /> 编辑
+    </button>
+  );
+}
+
 // ── Tab renderers ────────────────────────────────
 
 function renderOutline(data: ArtifactData) {
@@ -110,16 +142,17 @@ function renderOutline(data: ArtifactData) {
   );
 }
 
-function renderCharacters(data: ArtifactData) {
+function renderCharacters(data: ArtifactData, onEditCard?: EditCardHandler) {
   if (!data.characters?.length) return <EmptyState text="暂无角色数据" />;
   return (
     <div className="artifact-content grid-cards">
-      {data.characters.map((char: any, i: number) => (
-        <div key={i} className="card character-card">
+      {data.characters.map((char: any) => (
+        <div key={char.id} className="card character-card">
           <div className="card-header">
             <Users size={16} />
             <span>{char.name}</span>
             <span className={`role-tag role-${char.role}`}>{char.role}</span>
+            <CardEditButton kind="characters" id={char.id} name={char.name} onEditCard={onEditCard} />
           </div>
           <div className="card-body">
             {char.appearance && <p className="text-sm muted">{char.appearance}</p>}
@@ -135,15 +168,16 @@ function renderCharacters(data: ArtifactData) {
   );
 }
 
-function renderScenes(data: ArtifactData) {
+function renderScenes(data: ArtifactData, onEditCard?: EditCardHandler) {
   if (!data.scenes?.length) return <EmptyState text="暂无场景数据" />;
   return (
     <div className="artifact-content grid-cards">
-      {data.scenes.map((scene: any, i: number) => (
-        <div key={i} className="card scene-card">
+      {data.scenes.map((scene: any) => (
+        <div key={scene.id} className="card scene-card">
           <div className="card-header">
             <Map size={16} />
             <span>{scene.name}</span>
+            <CardEditButton kind="scenes" id={scene.id} name={scene.name} onEditCard={onEditCard} />
           </div>
           <div className="card-body">
             <InfoRow label="类型" value={scene.location_type} />
@@ -244,7 +278,7 @@ function renderScript(data: ArtifactData) {
   );
 }
 
-function renderStoryboard(data: ArtifactData) {
+function renderStoryboard(data: ArtifactData, onEditCard?: EditCardHandler) {
   if (!data.visual_highlights?.length && !data.storyboard)
     return <EmptyState text="暂无影像亮点数据" />;
 
@@ -270,13 +304,16 @@ function renderStoryboard(data: ArtifactData) {
             <span className="badge">{(data.storyboard as any).total_shot_count} 镜头 · ~{Math.round((data.storyboard as any).total_estimated_duration)}s</span>
             <span className="badge muted">{(data.storyboard as any).aspect_ratio} · {(data.storyboard as any).fps}fps</span>
           </div>
+          {/* Every shot stays reachable in a plain scrolling list — no cap,
+              no virtualization (ticket #16). Stable ids key and locate cards. */}
           <div className="shots-grid">
-            {(data.storyboard as any).shots?.slice(0, 20).map((shot: any, i: number) => (
-              <div key={i} className="shot-card">
+            {(data.storyboard as any).shots?.map((shot: any) => (
+              <div key={shot.shot_id} className="shot-card">
                 <div className="shot-header-row">
                   <span className="shot-id">{shot.shot_id?.slice(-6)}</span>
                   <span className="shot-size">{shotSizeLabel(shot.shot_size)}</span>
                   <span className="shot-duration">{shot.duration_seconds}s</span>
+                  <CardEditButton kind="shots" id={shot.shot_id} name={shot.shot_id} onEditCard={onEditCard} />
                 </div>
                 <p className="shot-desc">{shot.visual_description?.slice(0, 120)}</p>
                 <div className="shot-meta-row">
@@ -293,9 +330,6 @@ function renderStoryboard(data: ArtifactData) {
               </div>
             ))}
           </div>
-          {(data.storyboard as any).shots?.length > 20 && (
-            <p className="text-center muted text-sm mt-2">... 还有 {(data.storyboard as any).shots.length - 20} 个镜头</p>
-          )}
         </>
       )}
     </div>
@@ -304,14 +338,18 @@ function renderStoryboard(data: ArtifactData) {
 
 // ── Main renderer ────────────────────────────────
 
-export function renderArtifactContent(tabId: string, artifactData: ArtifactData): React.ReactNode {
+export function renderArtifactContent(
+  tabId: string,
+  artifactData: ArtifactData,
+  onEditCard?: EditCardHandler,
+): React.ReactNode {
   switch (tabId) {
     case "outline": return renderOutline(artifactData);
-    case "characters": return renderCharacters(artifactData);
-    case "scenes": return renderScenes(artifactData);
+    case "characters": return renderCharacters(artifactData, onEditCard);
+    case "scenes": return renderScenes(artifactData, onEditCard);
     case "art_style": return renderArtStyle(artifactData);
     case "script": return renderScript(artifactData);
-    case "storyboard": return renderStoryboard(artifactData);
+    case "storyboard": return renderStoryboard(artifactData, onEditCard);
     default: return <EmptyState text="选择一个标签页查看内容" />;
   }
 }

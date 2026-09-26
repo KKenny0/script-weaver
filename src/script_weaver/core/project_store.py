@@ -594,6 +594,98 @@ class ProjectStore:
             )
             return cursor.rowcount > 0
 
+    def save_card_edit(
+        self,
+        project_id: str,
+        *,
+        kind: str,
+        target_id: str,
+        changes: dict[str, Any],
+        expected_revision: int,
+    ) -> tuple[ProjectRecord, bool]:
+        """CAS-save edits to ONE character/scene/shot card (ticket #16).
+
+        The whole edit is one write transaction: read the current project,
+        check ``expected_revision``, locate the target by stable id, apply
+        and fully validate the change, recompute derived fields for shots,
+        merge the conservative downstream review flags into ``review_json``,
+        and write the new snapshot + immutable version. Returns
+        ``(record, changed)`` where ``record`` is the exact snapshot this
+        transaction wrote (never a post-commit re-read); with
+        ``changed=False`` the project is returned untouched — still fully
+        validated, but without a new revision, version or review flag.
+        """
+        # Function-level import: card_edit imports this module's error base
+        # class, so a module-level import would be circular.
+        from script_weaver.core.card_edit import (
+            KIND_LABELS,
+            apply_card_changes,
+            build_review_flags,
+            merge_review_flags,
+        )
+
+        with self._write_tx() as conn:
+            row = conn.execute(
+                "SELECT id, revision, title, state_json, review_json, auto_approve,"
+                " skill_bindings_json, created_at, updated_at"
+                " FROM projects WHERE id = ?",
+                (project_id,),
+            ).fetchone()
+            if row is None:
+                raise ProjectNotFoundError(f"Project '{project_id}' not found")
+            if row["revision"] != expected_revision:
+                raise RevisionConflictError(
+                    f"期望 revision {expected_revision} 已过期，当前为 {row['revision']}",
+                    current_revision=row["revision"],
+                )
+            state = ProjectState.model_validate_json(row["state_json"])
+            outcome = apply_card_changes(state, kind, target_id, changes)
+            current_review = json.loads(row["review_json"] or "{}")
+            if not outcome.changed:
+                record = self._record_from_row(row, state, row["revision"],
+                                               row["state_json"], current_review,
+                                               row["updated_at"])
+                return record, False
+            review = merge_review_flags(
+                current_review,
+                build_review_flags(
+                    kind, target_id, outcome.label,
+                    since_revision=expected_revision + 1,
+                    affected_artifacts=outcome.affected_artifacts,
+                ),
+            )
+            new_revision, new_state_json, updated_at = self._write_new_state(
+                conn, project_id, state, expected_revision, row["title"],
+                json.dumps(review, ensure_ascii=False), "manual",
+                f"编辑{KIND_LABELS[kind]}：{outcome.label}",
+            )
+            record = self._record_from_row(row, state, new_revision,
+                                           new_state_json, review, updated_at)
+            return record, True
+
+    @staticmethod
+    def _record_from_row(
+        row: sqlite3.Row,
+        state: ProjectState,
+        revision: int,
+        state_json: str,
+        review: dict[str, Any],
+        updated_at: str,
+    ) -> ProjectRecord:
+        """Build the record for the exact values a transaction produced."""
+        return ProjectRecord(
+            project_id=row["id"],
+            title=row["title"],
+            revision=revision,
+            state=state,
+            state_json=state_json,
+            review=review,
+            auto_approve=bool(row["auto_approve"]),
+            skill_bindings=json.loads(row["skill_bindings_json"] or "{}"),
+            created_at=row["created_at"],
+            updated_at=updated_at,
+        )
+
     # ── Generation runs (ticket #14) ──────────────────────
 
     _RUN_COLUMNS = (
