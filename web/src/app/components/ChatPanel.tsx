@@ -276,17 +276,41 @@ export default function ChatPanel({
     ]);
 
     try {
-      await apiPost(`/projects/${projectId}/refine`, { message: refineText });
+      const body = await apiPost(`/projects/${projectId}/refine`, { message: refineText });
       if (!mountedRef.current || !isProjectActive(projectId)) return;
-      // Consume the submitted instruction only if the composer still holds
-      // it; a draft typed while the model was processing must survive.
+      // The change is saved server-side from here on. Consume the submitted
+      // instruction only if the composer still holds it; a draft typed while
+      // the model was processing must survive.
       setInputValue((prev) => (prev === originalInput ? "" : prev));
-      const fullState = await apiGet(`/projects/${projectId}`);
-      if (!mountedRef.current || !isProjectActive(projectId)) return;
-      applyFullState(fullState);
-      onProjectMutated();
 
-      setMessages((prev) => [...prev.slice(0, -1), { role: "assistant", content: "✅ 修改已应用。", timestamp: Date.now() }]);
+      let reloaded = false;
+      try {
+        const fullState = await apiGet(`/projects/${projectId}`);
+        if (!mountedRef.current || !isProjectActive(projectId)) return;
+        applyFullState(fullState);
+        onProjectMutated();
+        reloaded = true;
+      } catch (fetchErr) {
+        // Saved, but the reload failed — the catch must NOT write anything
+        // itself; the shared exit guard below decides whether this instance
+        // still owns the chat.
+        console.error("Failed to reload project:", fetchErr);
+      }
+      // Common exit after the refresh settled, success or failure: the
+      // outcome message may only be written while this instance is still
+      // mounted AND the user has not moved to another project — otherwise a
+      // late refresh failure would splice A's summary into B's chat and
+      // delete B's latest message.
+      if (!mountedRef.current || !isProjectActive(projectId)) return;
+
+      const summary = formatChangeSummary(body);
+      const outcome = summary
+        ? `✅ 修改已保存。\n\n${summary}`
+        : "修改请求已返回，但未检测到内容差异；未产生新版本。";
+      const content = reloaded
+        ? outcome
+        : `✅ 修改已保存，但刷新项目显示失败；请手动刷新页面查看最新内容，无需重新提交。\n\n${summary}`;
+      setMessages((prev) => [...prev.slice(0, -1), { role: "assistant", content, timestamp: Date.now() }]);
     } catch (err: any) {
       if (!mountedRef.current || !isProjectActive(projectId)) return; // late failure
       // Keep inputValue so the user's text is not lost on failure.
@@ -298,6 +322,11 @@ export default function ChatPanel({
         } catch (fetchErr) {
           console.error("Failed to reload project:", fetchErr);
         }
+      } else if (REFINE_UNAPPLIED_CODES.has(err?.code)) {
+        // The backend refused the modification (no substantive change,
+        // constraint violation, unusable routing, missing target): nothing
+        // was saved, so show the reason and keep the draft retryable.
+        setMessages((prev) => [...prev.slice(0, -1), { role: "assistant", content: `⚠️ 未应用修改：${err.message}\n原文未变动，可调整指令后重试。`, timestamp: Date.now() }]);
       } else {
         setMessages((prev) => [...prev.slice(0, -1), { role: "assistant", content: `❌ 修改失败: ${err.message}`, timestamp: Date.now() }]);
       }
@@ -433,6 +462,31 @@ export default function ChatPanel({
 }
 
 // ── Helpers ─────────────────────────────────────
+
+/** detail.code values for a refused refine: nothing was saved, the draft
+ * stays retryable, and the UI must not claim success. */
+const REFINE_UNAPPLIED_CODES = new Set([
+  "refine_no_meaningful_change",
+  "refine_constraint_failed",
+  "refine_not_executable",
+  "refine_target_not_found",
+]);
+
+/** Render the backend's real diff (computed from the before/after
+ * snapshots) as chat text: field path plus before/after preview, with the
+ * out-of-cap hint and the storyboard-not-synced notice when present. */
+function formatChangeSummary(body: any): string {
+  const changes: Array<{ path: string; before: string; after: string }> = body?.changes ?? [];
+  if (!changes.length) return "";
+  const total = typeof body?.total_changes === "number" ? body.total_changes : changes.length;
+  const lines = changes.map((c) => `- ${c.path}\n  修改前: ${c.before}\n  修改后: ${c.after}`);
+  let text = `本次实际变化（${total} 处）:\n${lines.join("\n")}`;
+  if (total > changes.length) {
+    text += `\n…共 ${total} 处变化，仅显示前 ${changes.length} 处；完整内容见项目历史。`;
+  }
+  if (body?.notice) text += `\n\nℹ️ ${body.notice}`;
+  return text;
+}
 
 function formatResultSummary(state: any): string {
   const parts: string[] = [];

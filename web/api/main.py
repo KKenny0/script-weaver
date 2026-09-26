@@ -13,7 +13,6 @@ on the same directory refuses to start.
 from __future__ import annotations
 
 import asyncio
-import copy
 import io
 import json
 import logging
@@ -31,6 +30,7 @@ from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
 
+from script_weaver.core import refinement
 from script_weaver.core.config import get_settings
 from script_weaver.core.pipeline import PipelineEngine
 from script_weaver.core.project_store import (
@@ -41,6 +41,7 @@ from script_weaver.core.project_store import (
     ProjectStoreError,
     RevisionConflictError,
 )
+from script_weaver.core.refinement import RefineExecutionError, RefinementError
 from script_weaver.core.types import ProjectState, Shot
 from script_weaver.exporters.fountain_exporter import export_fountain
 from script_weaver.exporters.json_exporter import export_json
@@ -434,12 +435,31 @@ async def generate(project_id: str) -> StreamingResponse:
 
 @app.post("/api/projects/{project_id}/refine")
 async def refine(project_id: str, req: RefineRequest) -> dict:
-    """Send an iterative refinement request."""
+    """Send an iterative refinement request.
+
+    A 200 means a validated substantive change was CAS-saved and the body
+    reports the diff computed from the before/after snapshots — never the
+    model's own claim of completion. Refusals answer 422 with a stable
+    detail.code; model/protocol failures answer a sanitized 502; nothing is
+    written in any non-200 path.
+    """
     engine, ctx = await _get_engine(project_id)
 
-    # Run on a copy so a failed refine cannot partially write content.
-    updated = await engine.refine(copy.deepcopy(ctx.state), req.message)
+    # PipelineEngine.refine runs on an internal copy and raises before any
+    # write when the result lacks a substantive, constraint-respecting change.
+    try:
+        updated = await engine.refine(ctx.state, req.message)
+    except RefinementError as exc:
+        raise HTTPException(422, detail={"code": exc.code, "message": str(exc)}) from exc
+    except RefineExecutionError as exc:
+        logger.error("refine model failure for %s: %s", project_id, exc)
+        raise HTTPException(
+            502,
+            detail={"code": "refine_model_failed", "message": "模型调用失败，修改未应用"},
+        ) from exc
+
     updated.meta.id = project_id
+    summary = refinement.build_change_summary(ctx.state, updated)
     try:
         record = await asyncio.to_thread(
             ctx.save, updated, "manual", f"修改: {req.message[:60]}"
@@ -447,12 +467,22 @@ async def refine(project_id: str, req: RefineRequest) -> dict:
     except ProjectStoreError as exc:
         raise _store_error(exc) from exc
 
-    return {
+    body = {
         "project_id": project_id,
         "revision": record.revision,
         "stage": updated.current_stage_status().value,
         "message": "Refinement applied",
+        "changed_artifacts": summary["changed_artifacts"],
+        "changes": summary["changes"],
+        "total_changes": summary["total_changes"],
     }
+    # Editing the script never re-runs the storyboard: say so instead of
+    # letting stale shots/video prompts masquerade as up to date.
+    if "script" in summary["changed_artifacts"] and (
+        updated.storyboard or updated.visual_highlights
+    ):
+        body["notice"] = "本次仅更新剧本，已有分镜和视频提示词未自动同步。"
+    return body
 
 
 # ── Skills Management ─────────────────────────────────

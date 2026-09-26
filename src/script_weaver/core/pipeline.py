@@ -25,6 +25,8 @@ from script_weaver.agents.impl import (
     Structurer,
     create_agent,
 )
+from script_weaver.core import refinement
+from script_weaver.core.refinement import RefineExecutionError
 from script_weaver.core.types import (
     DecisionRecord,
     ProjectMeta,
@@ -378,38 +380,62 @@ class PipelineEngine:
     ) -> ProjectState:
         """Handle an iterative refinement request.
 
-        Routes the user's modification request to the appropriate agent(s).
+        Routes the user's modification request to one agent and returns the
+        modified state — but only after validation proves a substantive,
+        constraint-respecting change. Every refusal raises a
+        :class:`~script_weaver.core.refinement.RefinementError` (or a
+        sanitized :class:`RefineExecutionError` for model failures) and the
+        caller's state stays untouched: agents run on a deep copy, and the
+        decision record and touch are only added once validation passes.
         """
         self._notify("refine", f"Processing refinement: {user_message[:80]}...")
 
-        # Use orchestrator to decide routing
+        # Route on the incoming snapshot (read-only for the orchestrator).
         orchestrator = create_agent("orchestrator", llm_client=self._llm)
-        routing_result = await orchestrator.execute(state, user_message)
+        try:
+            routing_result = await orchestrator.execute(state, user_message)
+        except Exception as e:
+            logger.exception("[refine] orchestrator failed")
+            raise RefineExecutionError("编排器调用失败，修改未应用") from e
+        decision = refinement.parse_routing(routing_result)
 
-        # Parse routing decision
-        next_agent = "orchestrator"
-        if isinstance(routing_result, dict):
-            data = routing_result.get("data", routing_result)
-            if isinstance(data, dict):
-                next_agent = data.get("next_agent", "orchestrator")
+        # Locate the constrained target from the pre-modification snapshot;
+        # without it the execution agent must not even be called.
+        target = (
+            refinement.locate_last_dialogue(state)
+            if decision.constraint == "shorten_last_dialogue"
+            else None
+        )
 
-        # Execute the routed agent
-        if next_agent and next_agent in [
-            "scriptwriter", "storyboard_artist", "structurer",
-            "character_designer", "scene_designer", "art_director",
-        ]:
-            await self._run_agent(next_agent, state, user_message)
+        # Execute on a deep copy so a failed validation can never leak
+        # partial writes into the caller's state.
+        working = state.model_copy(deep=True)
+        instruction = refinement.build_agent_instruction(
+            state, decision, user_message, target
+        )
+        try:
+            await self._run_agent(decision.next_agent, working, instruction)
+        except Exception as e:
+            logger.exception("[refine] agent %s failed", decision.next_agent)
+            raise RefineExecutionError(
+                f"{decision.next_agent} 执行失败，修改未应用"
+            ) from e
 
-            # Record modification decision
-            decision = DecisionRecord(
-                stage=getattr(
-                    create_agent(next_agent), 'stage', 'unknown'
-                ),
-                context=user_message,
-                action=UserAction.MODIFY,
-                modification=user_message,
-            )
-            state.memory.record_decision(decision)
+        # Validate the returned content against the snapshot, never the
+        # model's own claims about what it did.
+        if target is not None:
+            refinement.validate_shorten_result(state, working, target)
+        else:
+            refinement.validate_general_result(state, working, decision.next_agent)
 
-        state.touch()
-        return state
+        # Validation passed: only now record the modification and touch —
+        # in the returned copy only, so the caller's snapshot stays pristine.
+        stage = create_agent(decision.next_agent, llm_client=self._llm).stage
+        working.memory.record_decision(DecisionRecord(
+            stage=stage,
+            context=user_message,
+            action=UserAction.MODIFY,
+            modification=user_message,
+        ))
+        working.touch()
+        return working

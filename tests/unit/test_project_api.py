@@ -5,6 +5,7 @@ controlled fakes so no network or model calls happen.
 """
 
 import asyncio
+import copy
 import io
 import json
 import os
@@ -21,9 +22,11 @@ import pytest
 
 from script_weaver.core.types import (
     BasicInfo,
+    Character,
     Outline,
     ProjectState,
     ProjectStatus,
+    SceneDesign,
     Script,
     ScriptBlock,
     ScriptBlockType,
@@ -636,6 +639,847 @@ def test_second_api_instance_rejected_and_restart_allowed(tmp_path):
 
 
 # ── CLI never writes the web database ─────────────────────
+
+
+# ── Refine outcome: substantive change or honest failure (#22) ───────
+
+
+LAST_DIALOGUE = "请你一定要记住今晚的一切，无论将来发生什么事情，都绝对不要忘记我们在这里说过的话。"
+SHORTENED_DIALOGUE = "记住今晚的一切。"
+
+
+def scripted_state() -> ProjectState:
+    """A persisted-ready project whose last dialogue is the shorten target."""
+    state = outlined_state("修改目标故事", "修改目标故事的一句话梗概")
+    state.script = Script(
+        title="夜行灯塔",
+        scenes=[
+            ScriptScene(
+                scene_id="sc_first",
+                heading=ScriptSceneHeading(scene_number=1, location="天台", time_of_day="夜"),
+                blocks=[
+                    ScriptBlock(
+                        block_type=ScriptBlockType.ACTION,
+                        content={"description": "阿芸推开锈蚀的铁门。"},
+                    ),
+                    ScriptBlock(
+                        block_type=ScriptBlockType.DIALOGUE,
+                        content={"character_name": "阿芸", "dialogue": "灯不能灭。"},
+                    ),
+                ],
+                characters_involved=["阿芸"],
+            ),
+            ScriptScene(
+                scene_id="sc_last",
+                heading=ScriptSceneHeading(scene_number=2, location="码头", time_of_day="黎明"),
+                blocks=[
+                    ScriptBlock(
+                        block_type=ScriptBlockType.ACTION,
+                        content={"description": "老周握住阿芸的手。"},
+                    ),
+                    ScriptBlock(
+                        block_type=ScriptBlockType.DIALOGUE,
+                        content={"character_name": "老周", "dialogue": LAST_DIALOGUE},
+                    ),
+                ],
+                characters_involved=["老周"],
+            ),
+        ],
+        notes="初稿备注",
+        total_estimated_duration=20,
+    )
+    state.storyboard = Storyboard(shots=[
+        Shot(shot_id="shot_1", scene_id="sc_first",
+             visual_description="天台外景", duration_seconds=2),
+        Shot(shot_id="shot_2", scene_id="sc_last",
+             visual_description="码头告别", dialogue=LAST_DIALOGUE, duration_seconds=3),
+    ])
+    state.storyboard.compute_totals()
+    return state
+
+
+def scripted_script_dict(state: ProjectState) -> dict:
+    """The seeded script as the model would receive/echo it (JSON shape)."""
+    return state.script.model_dump(mode="json")
+
+
+class ScriptedLLM:
+    """Deterministic model stand-in driving the real refine flow.
+
+    Calls without tools are the Orchestrator's one-shot routing call; calls
+    with tools get a single ``write_artifact`` submission of the scripted
+    artifact. ``artifact`` may be a callable run per submission so tests can
+    simulate concurrent writes from inside the "model call".
+    """
+
+    def __init__(self, routing: dict, artifact=None, *, artifact_type: str = "script",
+                 routing_error: Exception | None = None):
+        self.routing = routing
+        self.artifact = artifact
+        self.artifact_type = artifact_type
+        self.routing_error = routing_error
+        self.tool_submissions = 0
+
+    async def chat(self, messages, tools=None, temperature=None, max_tokens=None):
+        from script_weaver.llm.providers import ChatResponse, ToolCall
+
+        if tools is None:
+            if self.routing_error is not None:
+                raise self.routing_error
+            return ChatResponse(content=json.dumps(self.routing, ensure_ascii=False))
+        artifact = self.artifact() if callable(self.artifact) else self.artifact
+        self.tool_submissions += 1
+        return ChatResponse(
+            stop_reason="tool_use",
+            tool_calls=[ToolCall(
+                id="call_scripted",
+                name="write_artifact",
+                arguments={
+                    "artifact_type": self.artifact_type,
+                    "content": json.dumps(artifact, ensure_ascii=False),
+                },
+            )],
+        )
+
+
+def real_engine(api, llm):
+    """Patch ``_get_engine`` with the real PipelineEngine over a scripted model.
+
+    Unlike ``stub_engine``, everything except the LLM is production code, so
+    routing validation, the diff check and the CAS save all run for real.
+    """
+    from script_weaver.core.pipeline import PipelineEngine
+    from script_weaver.memory import profile as profile_m
+    from script_weaver.skills.registry import SkillRegistry
+
+    async def fake_get_engine(project_id):
+        record = api._runtime.store.get_required(project_id)
+        profile_m._profile_manager = None  # keep profile IO inside this tmp dir
+        engine = PipelineEngine(
+            llm_client=llm,
+            skill_registry=SkillRegistry(),
+            auto_approve_gates=record.auto_approve,
+        )
+        ctx = api._GenerationContext(
+            project_id=record.project_id,
+            revision=record.revision,
+            base_state_json=record.state_json,
+            state=record.state,
+            store=api._runtime.store,
+        )
+        return engine, ctx
+
+    api._get_engine = fake_get_engine
+
+
+async def seed_scripted_project(c: httpx.AsyncClient, api, title: str) -> dict:
+    p = await create_project(c, "修改目标故事", title)
+    record = api._runtime.store.get_required(p["project_id"])
+    api._runtime.store.save_state(
+        p["project_id"], scripted_state(), record.revision,
+        source="manual", summary="seed",
+    )
+    return p
+
+
+ROUTE_SHORTEN = {
+    "next_agent": "scriptwriter",
+    "action": "execute_agent",
+    "constraint": "shorten_last_dialogue",
+    "reason": "受限修改：只缩短最后一句对白",
+    "message_to_user": "",
+}
+
+ROUTE_GENERAL_SCRIPT = {
+    "next_agent": "scriptwriter",
+    "action": "execute_agent",
+    "constraint": "general",
+    "reason": "普通剧本修改",
+    "message_to_user": "",
+}
+
+
+def with_notes_claim(script: dict, claim: str = "已按用户要求缩短最后一句对白。") -> dict:
+    """The defect shape: notes claim completion, dialogue untouched."""
+    out = copy.deepcopy(script)
+    out["notes"] = claim
+    return out
+
+
+def with_shortened_last(script: dict, new_text: str = SHORTENED_DIALOGUE) -> dict:
+    out = copy.deepcopy(script)
+    out["scenes"][1]["blocks"][1]["content"]["dialogue"] = new_text
+    return out
+
+
+async def assert_project_untouched(c: httpx.AsyncClient, api, p: dict) -> None:
+    """Nothing was written: same revision, history, memory and content."""
+    current = (await c.get(f"/api/projects/{p['project_id']}")).json()
+    assert current["revision"] == 2, "rejected refine must not create a revision"
+    versions = (await c.get(f"/api/projects/{p['project_id']}/versions")).json()["versions"]
+    assert len(versions) == 2, "rejected refine must not create history"
+    assert current["script"]["notes"] == "初稿备注"
+    assert current["script"]["scenes"][1]["blocks"][1]["content"]["dialogue"] == LAST_DIALOGUE
+    assert current["memory_decisions"] == [], "rejected refine must not record decisions"
+
+
+async def test_refine_notes_only_claim_rejected_no_write(client):
+    """Defect regression (#22): the model only claims completion in
+    script.notes while the dialogue stays identical. Old behaviour saved a
+    new revision and answered 200; the fix must answer 422 and write
+    nothing."""
+    api, c = client
+    p = await seed_scripted_project(c, api, "修改目标A")
+    base = scripted_script_dict(scripted_state())
+
+    llm = ScriptedLLM(ROUTE_SHORTEN, with_notes_claim(base))
+    real_engine(api, llm)
+
+    r = await c.post(f"/api/projects/{p['project_id']}/refine", json={
+        "message": "只把结尾最后一句对白改得更简短，保持人物、地点和主要情节不变",
+    })
+    assert r.status_code == 422, r.text
+    detail = r.json()["detail"]
+    assert detail["code"] == "refine_constraint_failed"
+    assert detail["message"]
+    await assert_project_untouched(c, api, p)
+
+
+async def test_refine_general_notes_only_change_is_no_meaningful_change(client):
+    api, c = client
+    p = await seed_scripted_project(c, api, "修改目标B")
+    base = scripted_script_dict(scripted_state())
+
+    llm = ScriptedLLM(ROUTE_GENERAL_SCRIPT, with_notes_claim(base))
+    real_engine(api, llm)
+
+    r = await c.post(f"/api/projects/{p['project_id']}/refine",
+                     json={"message": "把剧本对白整体调整得更简洁"})
+    assert r.status_code == 422
+    assert r.json()["detail"]["code"] == "refine_no_meaningful_change"
+    await assert_project_untouched(c, api, p)
+
+
+async def test_refine_shorten_last_dialogue_success(client):
+    api, c = client
+    p = await seed_scripted_project(c, api, "缩短成功")
+    base = scripted_script_dict(scripted_state())
+    b = await create_project(c, "B 的想法", "项目B")
+
+    llm = ScriptedLLM(ROUTE_SHORTEN, with_shortened_last(base))
+    real_engine(api, llm)
+
+    r = await c.post(f"/api/projects/{p['project_id']}/refine", json={
+        "message": "只把结尾最后一句对白改得更简短，其他内容保持不变",
+    })
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["revision"] == 3
+    assert body["changed_artifacts"] == ["script"]
+    assert body["total_changes"] == 1
+    [change] = body["changes"]
+    assert change["path"] == "script.scenes[1].blocks[1].content.dialogue"
+    assert change["before"] == LAST_DIALOGUE
+    assert change["after"] == SHORTENED_DIALOGUE
+    assert "分镜" in body["notice"] and "未自动同步" in body["notice"]
+
+    current = (await c.get(f"/api/projects/{p['project_id']}")).json()
+    assert current["revision"] == 3
+    assert current["script"]["scenes"][1]["blocks"][1]["content"]["dialogue"] == SHORTENED_DIALOGUE
+    assert current["script"]["notes"] == "初稿备注"  # untouched by the constrained edit
+    assert len(current["memory_decisions"]) == 1
+
+    versions = (await c.get(f"/api/projects/{p['project_id']}/versions")).json()["versions"]
+    assert [v["revision"] for v in versions] == [3, 2, 1]  # newest first
+    new_version = (await c.get(f"/api/projects/{p['project_id']}/versions/3")).json()
+    assert new_version["script"]["scenes"][1]["blocks"][1]["content"]["dialogue"] == SHORTENED_DIALOGUE
+    old_version = (await c.get(f"/api/projects/{p['project_id']}/versions/2")).json()
+    assert old_version["script"]["scenes"][1]["blocks"][1]["content"]["dialogue"] == LAST_DIALOGUE
+
+    # Project B is untouched by A's refine.
+    b_current = (await c.get(f"/api/projects/{b['project_id']}")).json()
+    assert b_current["revision"] == 1 and b_current["script"] is None
+
+
+@pytest.mark.parametrize(
+    "mutate,reason",
+    [
+        (lambda s: s, "对白完全未修改"),
+        (lambda s: with_shortened_last(s, "   "), "对白清空/仅空白"),
+        (lambda s: with_shortened_last(s, LAST_DIALOGUE + "，就这样。"), "对白变更长"),
+        (lambda s: _set(s, ["notes"], "只改了备注"), "只改备注"),
+        (lambda s: _set(s, ["scenes", 0, "blocks", 1, "content", "dialogue"], "灯，不能灭。"),
+         "改错句子（第一句）"),
+        (lambda s: _set(s, ["scenes", 1, "blocks", 1, "content", "character_name"], "阿芸"),
+         "改了角色名"),
+        (lambda s: _set(s, ["scenes", 1, "blocks", 0, "content", "description"], "老周松开手。"),
+         "改了动作描述"),
+        (lambda s: _set(s, ["scenes", 1, "scene_id"], "sc_regenerated"), "ID 被改写"),
+        (lambda s: _swap(s), "场次顺序调换"),
+        (lambda s: with_shortened_last(s), "正常缩短（阳性对照）"),
+    ],
+)
+async def test_refine_shorten_counterexamples(client, mutate, reason):
+    """Every out-of-bounds shape must be rejected whole — no partial adoption."""
+    api, c = client
+    p = await seed_scripted_project(c, api, "缩短反例")
+    base = scripted_script_dict(scripted_state())
+
+    llm = ScriptedLLM(ROUTE_SHORTEN, mutate(copy.deepcopy(base)))
+    real_engine(api, llm)
+
+    r = await c.post(f"/api/projects/{p['project_id']}/refine",
+                     json={"message": "只缩短最后一句对白"})
+    if reason == "正常缩短（阳性对照）":
+        assert r.status_code == 200, r.text
+    else:
+        assert r.status_code == 422, f"{reason}: {r.text}"
+        assert r.json()["detail"]["code"] == "refine_constraint_failed"
+        await assert_project_untouched(c, api, p)
+
+
+def _set(script: dict, path: list, value) -> dict:
+    """Set a nested value in the scripted script dict (in place)."""
+    node = script
+    for key in path[:-1]:
+        node = node[key]
+    node[path[-1]] = value
+    return script
+
+
+def _swap(script: dict) -> dict:
+    script["scenes"][0], script["scenes"][1] = script["scenes"][1], script["scenes"][0]
+    return script
+
+
+@pytest.mark.parametrize(
+    "routing,reason",
+    [
+        ({"next_agent": "scriptwriter", "action": "ask_user",
+          "message_to_user": "要缩短哪一句？", "constraint": "general"}, "ask_user"),
+        ({"next_agent": None, "action": "complete", "constraint": "general"}, "complete"),
+        ({"next_agent": "reviewer", "action": "execute_agent", "constraint": "general"},
+         "不可修改的 Agent"),
+        ({"next_agent": "unknown_agent", "action": "execute_agent", "constraint": "general"},
+         "未知 Agent"),
+        ({"next_agent": "scriptwriter", "action": "execute", "constraint": "general"},
+         "未知 action"),
+        ({"next_agent": "scriptwriter", "action": "execute_agent", "constraint": "shorten"},
+         "未知 constraint"),
+        ({"next_agent": "storyboard_artist", "action": "execute_agent",
+          "constraint": "shorten_last_dialogue"}, "受限约束必须路由 scriptwriter"),
+        # Review round 2: non-string routing fields must be refused as 422,
+        # not crash the handler with a TypeError (500).
+        ({"next_agent": "scriptwriter", "action": []}, "action 是数组"),
+        ({"next_agent": "scriptwriter", "action": {}}, "action 是对象"),
+        ({"next_agent": "scriptwriter", "action": 1}, "action 是数字"),
+        ({"next_agent": "scriptwriter", "action": "execute_agent", "constraint": {}},
+         "constraint 是对象"),
+        ({"next_agent": "scriptwriter", "action": "execute_agent", "constraint": []},
+         "constraint 是数组"),
+        ({"next_agent": "scriptwriter", "action": "execute_agent", "constraint": 3},
+         "constraint 是数字"),
+    ],
+)
+async def test_refine_unusable_routing_is_not_executable(client, routing, reason):
+    api, c = client
+    p = await seed_scripted_project(c, api, "路由反例")
+    base = scripted_script_dict(scripted_state())
+
+    llm = ScriptedLLM(routing, with_shortened_last(base))
+    real_engine(api, llm)
+
+    r = await c.post(f"/api/projects/{p['project_id']}/refine",
+                     json={"message": "随便改点什么"})
+    assert r.status_code == 422, f"{reason}: {r.text}"
+    assert r.json()["detail"]["code"] == "refine_not_executable"
+    assert llm.tool_submissions == 0, f"{reason}: 不可执行路由不应调用目标 Agent"
+    await assert_project_untouched(c, api, p)
+
+
+async def test_refine_routing_text_response_is_not_executable(client):
+    api, c = client
+    p = await seed_scripted_project(c, api, "路由文本")
+
+    class TextLLM(ScriptedLLM):
+        async def chat(self, messages, tools=None, temperature=None, max_tokens=None):
+            from script_weaver.llm.providers import ChatResponse
+
+            if tools is None:
+                return ChatResponse(content="我觉得应该先问问用户。")
+            return await super().chat(messages, tools, temperature, max_tokens)
+
+    real_engine(api, TextLLM(ROUTE_GENERAL_SCRIPT, with_shortened_last(
+        scripted_script_dict(scripted_state()))))
+
+    r = await c.post(f"/api/projects/{p['project_id']}/refine",
+                     json={"message": "改一下"})
+    assert r.status_code == 422
+    assert r.json()["detail"]["code"] == "refine_not_executable"
+    await assert_project_untouched(c, api, p)
+
+
+@pytest.mark.parametrize("strip_script", [True, False], ids=["无剧本", "无对白"])
+async def test_refine_shorten_without_target_is_target_not_found(client, strip_script):
+    api, c = client
+    p = await create_project(c, "修改目标故事", "目标缺失")
+    state = scripted_state()
+    if strip_script:
+        state.script = None
+        state.storyboard = None
+    else:
+        for scene in state.script.scenes:
+            scene.blocks = [b for b in scene.blocks
+                            if b.block_type != ScriptBlockType.DIALOGUE]
+    record = api._runtime.store.get_required(p["project_id"])
+    api._runtime.store.save_state(
+        p["project_id"], state, record.revision, source="manual", summary="seed")
+
+    llm = ScriptedLLM(ROUTE_SHORTEN, {"scenes": []})
+    real_engine(api, llm)
+
+    r = await c.post(f"/api/projects/{p['project_id']}/refine",
+                     json={"message": "只缩短最后一句对白"})
+    assert r.status_code == 422
+    assert r.json()["detail"]["code"] == "refine_target_not_found"
+    assert llm.tool_submissions == 0, "目标不存在时不应调用执行 Agent"
+    current = (await c.get(f"/api/projects/{p['project_id']}")).json()
+    assert current["revision"] == 2
+    versions = (await c.get(f"/api/projects/{p['project_id']}/versions")).json()["versions"]
+    assert len(versions) == 2
+    assert current["memory_decisions"] == []
+
+
+async def test_refine_model_failure_is_sanitized_502(client):
+    api, c = client
+    p = await seed_scripted_project(c, api, "模型失败")
+
+    llm = ScriptedLLM(
+        ROUTE_GENERAL_SCRIPT, None,
+        routing_error=RuntimeError("connection refused to api.deepseek.com (key=sk-secret)"),
+    )
+    real_engine(api, llm)
+
+    r = await c.post(f"/api/projects/{p['project_id']}/refine",
+                     json={"message": "改一下"})
+    assert r.status_code == 502, r.text
+    detail = r.json()["detail"]
+    assert detail["code"] == "refine_model_failed"
+    assert "sk-secret" not in json.dumps(detail)  # sanitized
+    assert "deepseek" not in json.dumps(detail).lower()
+    await assert_project_untouched(c, api, p)
+
+
+async def test_refine_invalid_artifact_is_model_failure_no_write(client):
+    api, c = client
+    p = await seed_scripted_project(c, api, "非法产物")
+    llm = ScriptedLLM(ROUTE_GENERAL_SCRIPT, {"scenes": []})  # empty script
+    real_engine(api, llm)
+
+    r = await c.post(f"/api/projects/{p['project_id']}/refine",
+                     json={"message": "改一下"})
+    assert r.status_code == 502, r.text
+    assert r.json()["detail"]["code"] == "refine_model_failed"
+    await assert_project_untouched(c, api, p)
+
+
+async def test_refine_general_real_change_succeeds_with_true_diff(client):
+    api, c = client
+    p = await seed_scripted_project(c, api, "普通修改成功")
+    base = scripted_script_dict(scripted_state())
+
+    def rewrite_first_dialogue(script: dict) -> dict:
+        out = copy.deepcopy(script)
+        out["scenes"][0]["blocks"][1]["content"]["dialogue"] = "灯，不能灭。"
+        return out
+
+    llm = ScriptedLLM(ROUTE_GENERAL_SCRIPT, rewrite_first_dialogue(base))
+    real_engine(api, llm)
+
+    r = await c.post(f"/api/projects/{p['project_id']}/refine",
+                     json={"message": "第一句对白加个顿号"})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["changed_artifacts"] == ["script"]
+    assert body["total_changes"] == 1
+    assert body["changes"][0]["before"] == "灯不能灭。"
+    assert body["changes"][0]["after"] == "灯，不能灭。"
+
+
+async def test_refine_auto_id_shuffle_is_no_meaningful_change(client):
+    """Regenerated IDs alone must not masquerade as a substantive edit."""
+    api, c = client
+    p = await seed_scripted_project(c, api, "ID 重生成")
+    base = scripted_script_dict(scripted_state())
+
+    def scene_ids_only(script: dict) -> dict:
+        out = copy.deepcopy(script)
+        out["scenes"][0]["scene_id"] = "sc_new_1"
+        out["scenes"][1]["scene_id"] = "sc_new_2"
+        return out
+
+    llm = ScriptedLLM(ROUTE_GENERAL_SCRIPT, scene_ids_only(base))
+    real_engine(api, llm)
+
+    r = await c.post(f"/api/projects/{p['project_id']}/refine",
+                     json={"message": "重写剧本"})
+    assert r.status_code == 422
+    assert r.json()["detail"]["code"] == "refine_no_meaningful_change"
+    await assert_project_untouched(c, api, p)
+
+
+async def test_refine_conflict_when_project_changes_during_model_call(client):
+    api, c = client
+    p = await seed_scripted_project(c, api, "并发修改")
+    base = scripted_script_dict(scripted_state())
+
+    class ConcurrentWriterLLM(ScriptedLLM):
+        async def chat(self, messages, tools=None, temperature=None, max_tokens=None):
+            if tools is not None and self.tool_submissions == 0:
+                record = api._runtime.store.get_required(p["project_id"])
+                api._runtime.store.rename_project(
+                    p["project_id"], "并发期间改名", record.revision)
+            return await super().chat(messages, tools, temperature, max_tokens)
+
+    real_engine(api, ConcurrentWriterLLM(ROUTE_SHORTEN, with_shortened_last(base)))
+
+    r = await c.post(f"/api/projects/{p['project_id']}/refine",
+                     json={"message": "只缩短最后一句对白"})
+    assert r.status_code == 409, r.text
+    detail = r.json()["detail"]
+    assert detail["code"] == "revision_conflict"
+    assert detail["current_revision"] == 3
+    # The concurrent rename survives; the refine result was not applied.
+    current = (await c.get(f"/api/projects/{p['project_id']}")).json()
+    assert current["meta"]["title"] == "并发期间改名"
+    assert current["script"]["scenes"][1]["blocks"][1]["content"]["dialogue"] == LAST_DIALOGUE
+
+
+async def test_refine_store_failure_is_500_without_partial_write(client, monkeypatch):
+    import sqlite3
+
+    api, c = client
+    p = await seed_scripted_project(c, api, "存储失败")
+    base = scripted_script_dict(scripted_state())
+    real_engine(api, ScriptedLLM(ROUTE_SHORTEN, with_shortened_last(base)))
+
+    original_save = api._runtime.store.save_state
+
+    def broken_save(*args, **kwargs):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(api._runtime.store, "save_state", broken_save)
+    r = await c.post(f"/api/projects/{p['project_id']}/refine",
+                     json={"message": "只缩短最后一句对白"})
+    assert r.status_code == 500, r.text
+    monkeypatch.setattr(api._runtime.store, "save_state", original_save)
+    await assert_project_untouched(c, api, p)
+
+
+async def test_refine_summary_truncates_to_ten_previews_300(client):
+    api, c = client
+    p = await create_project(c, "修改目标故事", "摘要截断")
+    state = outlined_state("修改目标故事", "摘要截断的故事梗概")
+    long_text = "很长很长的对白" * 60  # >300 chars
+    blocks = [
+        ScriptBlock(
+            block_type=ScriptBlockType.ACTION,
+            content={"description": "群像场景。"},
+        ),
+    ]
+    blocks += [
+        ScriptBlock(
+            block_type=ScriptBlockType.DIALOGUE,
+            content={"character_name": f"角色{i}", "dialogue": long_text if i == 0 else f"第{i}句原对白"},
+        )
+        for i in range(12)
+    ]
+    state.script = Script(
+        title="群像",
+        scenes=[ScriptScene(scene_id="sc_only", heading=ScriptSceneHeading(
+            scene_number=1, location="广场", time_of_day="夜"), blocks=blocks)],
+    )
+    record = api._runtime.store.get_required(p["project_id"])
+    api._runtime.store.save_state(
+        p["project_id"], state, record.revision, source="manual", summary="seed")
+
+    def rewrite_all(script: dict) -> dict:
+        out = copy.deepcopy(script)
+        for block in out["scenes"][0]["blocks"]:
+            if block["block_type"] == "dialogue":
+                block["content"]["dialogue"] += "改"
+        return out
+
+    llm = ScriptedLLM(ROUTE_GENERAL_SCRIPT, rewrite_all(state.script.model_dump(mode="json")))
+    real_engine(api, llm)
+
+    r = await c.post(f"/api/projects/{p['project_id']}/refine",
+                     json={"message": "整体改写"})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["total_changes"] == 12
+    assert len(body["changes"]) == 10  # capped for display; full diff lives in history
+    for change in body["changes"]:
+        assert len(change["before"]) <= 303  # 300 + "..."
+        assert len(change["after"]) <= 303
+
+
+# ── Review round 2: raw strict compare + reference integrity ────────
+
+
+async def test_refine_shorten_whitespace_padded_other_id_rejected(client):
+    """The constrained check must compare raw values: padding another
+    scene's ID with whitespace is an out-of-bounds change, not a no-op."""
+    api, c = client
+    p = await seed_scripted_project(c, api, "空白ID越界")
+    base = scripted_script_dict(scripted_state())
+
+    def pad_other_scene_id(script: dict) -> dict:
+        out = with_shortened_last(script)
+        out["scenes"][0]["scene_id"] = f" {out['scenes'][0]['scene_id']} "
+        return out
+
+    llm = ScriptedLLM(ROUTE_SHORTEN, pad_other_scene_id(base))
+    real_engine(api, llm)
+
+    r = await c.post(f"/api/projects/{p['project_id']}/refine",
+                     json={"message": "只缩短最后一句对白"})
+    assert r.status_code == 422, r.text
+    assert r.json()["detail"]["code"] == "refine_constraint_failed"
+    assert "scene_id" in r.json()["detail"]["message"]
+    await assert_project_untouched(c, api, p)
+
+
+async def test_refine_general_rebuilt_referenced_id_rejected_no_write(client):
+    """Real Pipeline → API → Store chain: a substantive dialogue edit that
+    also rebuilds a storyboard-referenced scene_id must be refused whole —
+    saving it would leave the export's scene→character lookup dangling."""
+    api, c = client
+    p = await seed_scripted_project(c, api, "引用重建")
+    base = scripted_script_dict(scripted_state())
+
+    def shorten_first_and_rebuild_id(script: dict) -> dict:
+        out = copy.deepcopy(script)
+        out["scenes"][0]["blocks"][1]["content"]["dialogue"] = "灯，不能灭。"
+        out["scenes"][0]["scene_id"] = "sc_new"  # storyboard shot_1 refs sc_first
+        return out
+
+    llm = ScriptedLLM(ROUTE_GENERAL_SCRIPT, shorten_first_and_rebuild_id(base))
+    real_engine(api, llm)
+
+    r = await c.post(f"/api/projects/{p['project_id']}/refine",
+                     json={"message": "第一句对白加顿号"})
+    assert r.status_code == 422, r.text
+    assert r.json()["detail"]["code"] == "refine_constraint_failed"
+    assert "storyboard.shots[0].scene_id" in r.json()["detail"]["message"]
+    await assert_project_untouched(c, api, p)
+
+
+async def test_refine_general_intact_references_succeed(client):
+    api, c = client
+    p = await seed_scripted_project(c, api, "引用完整修改")
+    base = scripted_script_dict(scripted_state())
+
+    def keep_ids_change_dialogue(script: dict) -> dict:
+        out = copy.deepcopy(script)
+        out["scenes"][0]["blocks"][1]["content"]["dialogue"] = "灯，不能灭。"
+        return out
+
+    llm = ScriptedLLM(ROUTE_GENERAL_SCRIPT, keep_ids_change_dialogue(base))
+    real_engine(api, llm)
+
+    r = await c.post(f"/api/projects/{p['project_id']}/refine",
+                     json={"message": "第一句对白加顿号"})
+    assert r.status_code == 200, r.text
+    assert r.json()["changed_artifacts"] == ["script"]
+
+
+# ── Review round 3: stable defect identity + auto-ID exclusions ────
+
+ROUTE_GENERAL_CHARACTERS = {
+    "next_agent": "character_designer",
+    "action": "execute_agent",
+    "constraint": "general",
+    "reason": "普通角色修改",
+    "message_to_user": "",
+}
+
+ROUTE_GENERAL_SCENES = {
+    "next_agent": "scene_designer",
+    "action": "execute_agent",
+    "constraint": "general",
+    "reason": "普通场景设计修改",
+    "message_to_user": "",
+}
+
+
+def designed_scripted_state() -> ProjectState:
+    """scripted_state plus a historical defect: sc_first→old_missing
+    (dangling), sc_last→sd_ok (valid)."""
+    state = scripted_state()
+    state.scenes = [SceneDesign(id="sd_ok", name="码头", environment="夜色中的码头")]
+    state.script.scenes[0].scene_design_id = "old_missing"
+    state.script.scenes[1].scene_design_id = "sd_ok"
+    return state
+
+
+async def seed_designed_project(c: httpx.AsyncClient, api, title: str) -> dict:
+    p = await create_project(c, "修改目标故事", title)
+    record = api._runtime.store.get_required(p["project_id"])
+    api._runtime.store.save_state(
+        p["project_id"], designed_scripted_state(), record.revision,
+        source="manual", summary="seed",
+    )
+    return p
+
+
+async def test_refine_repair_one_break_other_same_index_rejected_no_write(client):
+    """Real Pipeline → API → Store leak regression: repairing sc_first's
+    design ref while breaking sc_last's — after a swap both snapshots show
+    the defect at scenes[0], so the index-keyed comparison waved it through
+    and saved a new revision. Identity-keyed comparison must refuse whole."""
+    api, c = client
+    p = await seed_designed_project(c, api, "同位换缺陷")
+    base = scripted_script_dict(designed_scripted_state())
+
+    def swap_repair_and_break(script: dict) -> dict:
+        out = copy.deepcopy(script)
+        out["scenes"].reverse()                                # sc_last first now
+        out["scenes"][0]["scene_design_id"] = "new_missing"    # sc_last breaks
+        out["scenes"][1]["scene_design_id"] = "sd_ok"          # sc_first repaired
+        out["scenes"][0]["blocks"][1]["content"]["dialogue"] = "请一定记住今晚。"
+        return out
+
+    llm = ScriptedLLM(ROUTE_GENERAL_SCRIPT, swap_repair_and_break(base))
+    real_engine(api, llm)
+
+    r = await c.post(f"/api/projects/{p['project_id']}/refine",
+                     json={"message": "交换两场并修好第一场的场景引用"})
+    assert r.status_code == 422, r.text
+    assert r.json()["detail"]["code"] == "refine_constraint_failed"
+    assert "scene_design_id" in r.json()["detail"]["message"]
+    await assert_project_untouched(c, api, p)
+    current = (await c.get(f"/api/projects/{p['project_id']}")).json()
+    assert current["script"]["scenes"][0]["scene_design_id"] == "old_missing"
+    assert current["script"]["scenes"][1]["scene_design_id"] == "sd_ok"
+
+
+async def test_refine_character_id_rebuild_only_is_no_meaningful_change(client):
+    """Real Pipeline → API → Store: the model echoes the character minus
+    its id; Pydantic regenerates char_xxx and the echo used to count as a
+    substantive edit (200 + new revision). Only real content may."""
+    api, c = client
+    p = await create_project(c, "修改目标故事", "角色ID重建")
+    state = scripted_state()
+    state.characters = [Character(id="char_ayun", name="阿芸", personality="坚韧")]
+    record = api._runtime.store.get_required(p["project_id"])
+    api._runtime.store.save_state(
+        p["project_id"], state, record.revision, source="manual", summary="seed")
+
+    # The model echoes the identical content but omits id — Pydantic's
+    # default_factory mints a fresh char_xxx during integration.
+    echoed_without_id = [{"name": "阿芸", "personality": "坚韧"}]
+    llm = ScriptedLLM(ROUTE_GENERAL_CHARACTERS, echoed_without_id,
+                      artifact_type="characters")
+    real_engine(api, llm)
+
+    r = await c.post(f"/api/projects/{p['project_id']}/refine",
+                     json={"message": "把主角性格写得更鲜明"})
+    assert r.status_code == 422, r.text
+    assert r.json()["detail"]["code"] == "refine_no_meaningful_change"
+    await assert_project_untouched(c, api, p)
+    current = (await c.get(f"/api/projects/{p['project_id']}")).json()
+    assert current["characters"][0]["id"] == "char_ayun"
+
+
+async def test_refine_scene_design_id_rebuild_only_is_no_meaningful_change(client):
+    """Same defect shape on an unreferenced SceneDesign: id regeneration
+    alone must not create a version."""
+    api, c = client
+    p = await create_project(c, "修改目标故事", "场景ID重建")
+    state = scripted_state()
+    state.scenes = [SceneDesign(id="sd_roof", name="天台", environment="夜风中的天台")]
+    record = api._runtime.store.get_required(p["project_id"])
+    api._runtime.store.save_state(
+        p["project_id"], state, record.revision, source="manual", summary="seed")
+
+    # Identical content, id omitted — a fresh scene_xxx is minted on save.
+    echoed_without_id = [{"name": "天台", "environment": "夜风中的天台"}]
+    llm = ScriptedLLM(ROUTE_GENERAL_SCENES, echoed_without_id,
+                      artifact_type="scenes")
+    real_engine(api, llm)
+
+    r = await c.post(f"/api/projects/{p['project_id']}/refine",
+                     json={"message": "把天台环境写得更具体"})
+    assert r.status_code == 422, r.text
+    assert r.json()["detail"]["code"] == "refine_no_meaningful_change"
+    await assert_project_untouched(c, api, p)
+    current = (await c.get(f"/api/projects/{p['project_id']}")).json()
+    assert current["scenes"][0]["id"] == "sd_roof"
+
+
+# ── Review round 4: duplicate owner IDs must not transfer exemptions ───
+
+
+def designed_unstoried_state() -> ProjectState:
+    """The reviewed repro shape: two script scenes, no storyboard, sd_ok
+    exists; sc_first carries the historical dangling design ref."""
+    state = designed_scripted_state()
+    state.storyboard = None
+    return state
+
+
+async def _project_snapshot(c: httpx.AsyncClient, project_id: str) -> tuple[dict, list]:
+    detail = (await c.get(f"/api/projects/{project_id}")).json()
+    versions = (await c.get(f"/api/projects/{project_id}/versions")).json()["versions"]
+    return detail, versions
+
+
+async def test_refine_owner_id_duplication_defect_transfer_rejected_no_write(client):
+    """Real Pipeline → API → Store (offline model stand-in): repairing
+    sc_first while sc_last adopts its ID and its defect leaves identity
+    and count unchanged — index-keyed and count-keyed comparisons both
+    waved it through (200, revision bump, two sc_first saved). The
+    exemption must require a reliably-unique owner ID."""
+    api, c = client
+    p = await create_project(c, "修改目标故事", "重复ID转移缺陷")
+    state = designed_unstoried_state()
+    record = api._runtime.store.get_required(p["project_id"])
+    api._runtime.store.save_state(
+        p["project_id"], state, record.revision, source="manual", summary="seed")
+
+    def repair_a_transfer_defect_to_b(script: dict) -> dict:
+        out = copy.deepcopy(script)
+        out["scenes"][0]["scene_design_id"] = "sd_ok"        # sc_first repaired
+        out["scenes"][1]["scene_id"] = "sc_first"            # sc_last steals the ID
+        out["scenes"][1]["scene_design_id"] = "old_missing"  # defect moves to B
+        out["scenes"][1]["blocks"][1]["content"]["dialogue"] = "请一定记住今晚。"
+        return out
+
+    llm = ScriptedLLM(ROUTE_GENERAL_SCRIPT,
+                      repair_a_transfer_defect_to_b(scripted_script_dict(state)))
+    real_engine(api, llm)
+
+    before_detail, before_versions = await _project_snapshot(c, p["project_id"])
+    assert before_detail["script"]["scenes"][0]["scene_id"] == "sc_first"
+    assert before_detail["script"]["scenes"][1]["scene_id"] == "sc_last"
+
+    r = await c.post(f"/api/projects/{p['project_id']}/refine",
+                     json={"message": "修好第一场引用，第二场换个编号并改对白"})
+    assert r.status_code == 422, r.text
+    assert r.json()["detail"]["code"] == "refine_constraint_failed"
+    assert "scene_design_id" in r.json()["detail"]["message"]
+    assert "sc_first" in r.json()["detail"]["message"]
+
+    # Full before/after snapshot comparison — not just the status code.
+    after_detail, after_versions = await _project_snapshot(c, p["project_id"])
+    assert after_detail == before_detail, "rejected refine must change nothing"
+    assert after_versions == before_versions, "rejected refine must add no history"
+    assert after_detail["script"]["scenes"][0]["scene_design_id"] == "old_missing"
+    assert after_detail["script"]["scenes"][1]["scene_design_id"] == "sd_ok"
+    assert after_detail["script"]["scenes"][1]["blocks"][1]["content"]["dialogue"] \
+        == LAST_DIALOGUE
+    assert after_detail["memory_decisions"] == []
 
 
 def test_cli_generate_does_not_touch_web_database(tmp_path, monkeypatch):

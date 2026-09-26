@@ -214,6 +214,18 @@ Web UI 创建的项目保存在 SQLite 数据库中，刷新页面或重启后�
 - 回滚到旧代码不会删除或改动 `main-web` 数据库与历史版本，但旧版本无法展示其中的项目；重新部署新版本后仍可读取。
 - 数据库通过 `PRAGMA user_version` 管理格式版本；当数据库版本超出当前程序支持时会拒绝写入，不会自动降级。
 
+## 全局修改（refine）的真实结果契约
+
+`POST /api/projects/{id}/refine` 只在验证通过且 CAS 保存成功时返回 200；返回体在原有字段之上追加由前后快照实际计算出的差异摘要（不引用模型自报的完成声明）：
+
+- `changed_artifacts`：发生实质变化的产物列表（如 `["script"]`）。
+- `changes`：字段路径 + `before`/`after` 预览，最多展示 10 条，每侧最多 300 字符；`total_changes` 给出总数，完整内容在项目历史中。摘要只读，不是可应用的 patch。
+- 修改了剧本但未重跑分镜时返回 `notice` 提示"已有分镜和视频提示词未自动同步"。
+
+未应用返回 422，`detail.code` 区分四种原因：`refine_no_meaningful_change`（无实质变化，仅备注/自动 ID——含角色与场景设计的 `id`——或元数据变化不算）、`refine_constraint_failed`（受限修改越界，整体拒绝；普通修改新破坏引用完整性同样归入此码——`storyboard.shots[*].scene_id → script.scenes[*].scene_id`、`script.scenes[*].scene_design_id → scenes[*].id`、`visual_highlights[*].related_shot_ids → storyboard.shots[*].shot_id` 中新引入的悬空或歧义引用会被拒绝并指出字段。缺陷按稳定身份比较（引用关系、所属对象稳定 ID、引用目标原值、缺陷类型，数组下标仅用于报错信息），且历史豁免要求所属对象 ID 可靠匹配：本次新增或加重所属 ID 重复、或历史重复组内容已变化时不可借用旧缺陷；修改前快照已有的历史缺陷随对象重排或引用列表重排不阻断无关编辑，但同一对象换成新断链值、在旧缺陷下标处换一个对象破坏都会被视为新缺陷）、`refine_not_executable`（路由决定不执行或目标不可修改，含 action/constraint 非字符串等非法类型）、`refine_target_not_found`（约束目标不存在，执行 Agent 不会被调用）。模型协议或请求失败返回脱敏的 502（`refine_model_failed`），不会伪装成未应用或成功。所有非 200 路径都不写库：revision、历史、memory 与产物保持原样。
+
+约束修改 `shorten_last_dialogue`（用户明确要求"只缩短剧本最后一句对白，其他内容保持"时由编排器选择）：目标定位自修改前快照（`script.scenes` 与 blocks 顺序最后一个非空对白 block 的 `content.dialogue`），返回结果中该字符串去首尾空白后必须非空、不同且字符数严格减少，剧本其余全部字段（含 notes、ID、场次顺序）与其他产物保持逐字一致；任何越界改动都会被整体拒绝，不会从越界整稿中挑出部分变化冒充成功。
+
 ## 导出格式
 
 ### Web 导出 API（`GET /api/projects/{id}/export/{format}`）
