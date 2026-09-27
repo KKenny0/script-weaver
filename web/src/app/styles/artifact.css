@@ -438,8 +438,10 @@
   line-height: 1.5;
 }
 
-/* Right-side edit drawer on a native <dialog> */
-dialog.card-edit-drawer {
+/* Right-side edit drawer on a native <dialog>; the review panel (ticket #17)
+   reuses the same shell geometry */
+dialog.card-edit-drawer,
+dialog.review-drawer {
   position: fixed;
   top: 0;
   right: 0;
@@ -457,12 +459,102 @@ dialog.card-edit-drawer {
   color: var(--text-primary);
   box-shadow: var(--shadow-lg);
 }
-dialog.card-edit-drawer::backdrop {
+dialog.card-edit-drawer::backdrop,
+dialog.review-drawer::backdrop {
   background: rgba(4, 8, 18, 0.55);
 }
-:root[data-theme="light"] dialog.card-edit-drawer::backdrop {
+:root[data-theme="light"] dialog.card-edit-drawer::backdrop,
+:root[data-theme="light"] dialog.review-drawer::backdrop {
   background: rgba(20, 28, 45, 0.30);
 }
+
+/* Review panel flag rows (ticket #17) */
+.rv-flag {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  background: var(--bg-surface-2);
+  cursor: pointer;
+}
+.rv-flag:hover { border-color: var(--border-strong); }
+.rv-flag input[type="checkbox"] {
+  width: 16px;
+  height: 16px;
+  margin-top: 2px;
+  flex-shrink: 0;
+  accent-color: var(--brand-primary);
+  cursor: pointer;
+}
+.rv-flag-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.rv-flag-title {
+  font-size: 13px;
+  font-weight: 600;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.rv-flag-sub {
+  font-size: 12px;
+  font-weight: 400;
+  color: var(--text-secondary);
+}
+.rv-flag-hint {
+  font-size: 12px;
+  color: var(--text-tertiary);
+  line-height: 1.5;
+}
+.rv-view-btn {
+  flex-shrink: 0;
+  font-size: 12px;
+  padding: 4px 10px;
+}
+
+/* Centered export confirmation dialog (ticket #17) */
+dialog.export-confirm {
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-lg);
+  padding: 0;
+  background: var(--bg-elevated);
+  color: var(--text-primary);
+  box-shadow: var(--shadow-lg);
+  max-width: min(440px, calc(100vw - 32px));
+}
+dialog.export-confirm::backdrop {
+  background: rgba(4, 8, 18, 0.55);
+}
+:root[data-theme="light"] dialog.export-confirm::backdrop {
+  background: rgba(20, 28, 45, 0.30);
+}
+.ec-card { padding: 20px 22px; }
+.ec-warning-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.ec-warning-list li {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  padding: 8px 12px;
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-sm);
+  background: var(--bg-surface-2);
+  font-size: 12px;
+}
+.ec-warning-list strong { font-size: 13px; }
+.ec-warning-list span { color: var(--text-secondary); }
 
 .ced-shell {
   display: flex;

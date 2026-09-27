@@ -1,6 +1,6 @@
 "use client";
 
-import React from "react";
+import React, { useEffect, useRef, useState } from "react";
 import {
   FileText, Users, Map, Palette, Film, Eye,
   Download, ChevronRight, History,
@@ -22,6 +22,51 @@ const ARTIFACT_TABS = [
 
 const API = "/api";
 
+const REVIEW_ARTIFACT_LABELS: Record<string, string> = {
+  script: "剧本",
+  storyboard: "分镜",
+  visual_highlights: "影像亮点",
+};
+
+const REVIEW_REASON_LABELS: Record<string, string> = {
+  upstream_manual_edit: "上游内容被手工修改",
+};
+
+/** One compact export warning from the X-Review-Warnings header. */
+export interface ExportReviewWarning {
+  artifact: string;
+  reason: string;
+  since_revision: number;
+}
+
+/** Parse the ASCII-safe JSON warnings header; a missing/garbled header is
+ * treated as "no warnings" — the file itself is still downloaded as-is. */
+function parseReviewWarningsHeader(raw: string | null): ExportReviewWarning[] {
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    const list = parsed?.review_warnings;
+    if (!Array.isArray(list)) return [];
+    return list.filter(
+      (w: any) => w && typeof w.artifact === "string" && typeof w.reason === "string",
+    );
+  } catch {
+    return [];
+  }
+}
+
+/** An export response waiting for the user's still-export decision. The
+ * blob is the exact bytes the server answered with — confirming downloads
+ * THAT file, never a re-fetch (which could be a different snapshot). */
+interface PendingExport {
+  projectId: string;
+  format: string;
+  blob: Blob;
+  filename: string;
+  revision: number;
+  warnings: ExportReviewWarning[];
+}
+
 interface ArtifactPanelProps {
   projectId: string;
   artifactData: ArtifactData;
@@ -32,6 +77,7 @@ interface ArtifactPanelProps {
   onEditCard?: EditCardHandler;
   reviewNotice: string | null;
   onDismissReviewNotice: () => void;
+  onOpenReviewPanel?: () => void;
   historyPanel: HistoryPanelState;
   onOpenHistory: () => void;
   onRefreshHistory: () => void;
@@ -55,19 +101,82 @@ function iconBtnStyle(enabled: boolean): React.CSSProperties {
 export default function ArtifactPanel({
   projectId, artifactData, projectStatus,
   activeTab, onTabChange, onCollapse,
-  onEditCard, reviewNotice, onDismissReviewNotice,
+  onEditCard, reviewNotice, onDismissReviewNotice, onOpenReviewPanel,
   historyPanel, onOpenHistory, onRefreshHistory,
   onSelectHistoryVersion, onBackToHistoryList, onCloseHistory,
 }: ArtifactPanelProps) {
   const { theme, toggleTheme } = useTheme();
+  // The export awaiting confirmation and the in-flight marker. Both belong
+  // to the project session that STARTED the request: switching projects
+  // clears them, and a late response for a previous project never opens a
+  // dialog, never downloads and never touches the new session's state
+  // (A→B→A included — the session check runs against the live ref).
+  const [pendingExport, setPendingExport] = useState<PendingExport | null>(null);
+  const [exportBusy, setExportBusy] = useState(false);
+  const projectIdRef = useRef(projectId);
+  const exportDialogRef = useRef<HTMLDialogElement>(null);
+  const previouslyFocusedRef = useRef<HTMLElement | null>(null);
+
+  useEffect(() => {
+    projectIdRef.current = projectId;
+    setPendingExport(null);
+    setExportBusy(false);
+  }, [projectId]);
+
+  // Native <dialog> for the export confirmation: showModal on open, Escape
+  // cancels (nothing is downloaded), focus restored after close.
+  useEffect(() => {
+    const dialog = exportDialogRef.current;
+    if (!pendingExport || !dialog) return;
+    if (!previouslyFocusedRef.current) {
+      previouslyFocusedRef.current = document.activeElement as HTMLElement | null;
+    }
+    if (!dialog.open) {
+      dialog.showModal();
+    }
+    const onCancel = (e: Event) => {
+      e.preventDefault();
+      setPendingExport(null);
+    };
+    dialog.addEventListener("cancel", onCancel);
+    return () => {
+      dialog.removeEventListener("cancel", onCancel);
+      const prev = previouslyFocusedRef.current;
+      if (!exportDialogRef.current) {
+        setTimeout(() => {
+          if (
+            prev &&
+            document.contains(prev) &&
+            document.activeElement === document.body
+          ) {
+            prev.focus();
+          }
+        }, 0);
+        previouslyFocusedRef.current = null;
+      }
+    };
+  }, [pendingExport]);
+
+  const triggerDownload = (blob: Blob, filename: string) => {
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
 
   const handleExport = async (format: string) => {
-    if (!projectId) return;
+    if (!projectId || exportBusy) return;
+    const pid = projectId;
+    setExportBusy(true);
     try {
       // The backend serves real files (JSON state / Fountain text / ZIP) with
       // a Content-Disposition filename; the blob is saved as-is, never
-      // re-wrapped through JSON.stringify.
-      const res = await fetch(`${API}/projects/${projectId}/export/${format}`);
+      // re-wrapped through JSON.stringify. The review headers describe the
+      // SAME snapshot as the bytes — the confirmation below is bound to this
+      // exact download, with no pre-check window in between.
+      const res = await fetch(`${API}/projects/${pid}/export/${format}`);
       if (!res.ok) {
         let message = `HTTP ${res.status}`;
         try {
@@ -77,17 +186,22 @@ export default function ArtifactPanel({
         throw new Error(message);
       }
       const blob = await res.blob();
+      if (pid !== projectIdRef.current) return; // session ended mid-flight
       const disposition = res.headers.get("Content-Disposition") ?? "";
       const filename = /filename="?([^";]+)"?/.exec(disposition)?.[1]
-        ?? `${projectId}.${format === "video_gen" ? "zip" : format}`;
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = filename;
-      a.click();
-      URL.revokeObjectURL(url);
+        ?? `${pid}.${format === "video_gen" ? "zip" : format}`;
+      const revision = Number(res.headers.get("X-Project-Revision")) || 0;
+      const warnings = parseReviewWarningsHeader(res.headers.get("X-Review-Warnings"));
+      if (warnings.length === 0) {
+        triggerDownload(blob, filename);
+        return;
+      }
+      setPendingExport({ projectId: pid, format, blob, filename, revision, warnings });
     } catch (err: any) {
+      if (pid !== projectIdRef.current) return; // no stale error in the new session
       alert(`导出失败: ${err.message}`);
+    } finally {
+      if (pid === projectIdRef.current) setExportBusy(false);
     }
   };
 
@@ -130,9 +244,9 @@ export default function ArtifactPanel({
           >
             <History size={14} style={historyPanel.open ? { color: "var(--brand-primary)" } : undefined} />
           </button>
-          <button onClick={() => handleExport("json")} disabled={!projectId} style={iconBtnStyle(!!projectId)} title="导出 JSON"><Download size={14} /></button>
-          <button onClick={() => handleExport("fountain")} disabled={!projectId || !artifactData.script} style={iconBtnStyle(!!projectId && !!artifactData.script)} title="导出 Fountain 格式"><FileText size={14} /></button>
-          <button onClick={() => handleExport("video_gen")} disabled={!projectId || !artifactData.storyboard} style={iconBtnStyle(!!projectId && !!artifactData.storyboard)} title="导出 VideoGen 提示词"><Film size={14} /></button>
+          <button onClick={() => handleExport("json")} disabled={!projectId || exportBusy} style={iconBtnStyle(!!projectId)} title="导出 JSON"><Download size={14} /></button>
+          <button onClick={() => handleExport("fountain")} disabled={!projectId || !artifactData.script || exportBusy} style={iconBtnStyle(!!projectId && !!artifactData.script)} title="导出 Fountain 格式"><FileText size={14} /></button>
+          <button onClick={() => handleExport("video_gen")} disabled={!projectId || !artifactData.storyboard || exportBusy} style={iconBtnStyle(!!projectId && !!artifactData.storyboard)} title="导出 VideoGen 提示词"><Film size={14} /></button>
         </div>
       </div>
 
@@ -165,6 +279,12 @@ export default function ArtifactPanel({
               <div className="review-banner" data-testid="review-notice" role="status">
                 <TriangleAlert size={14} style={{ flexShrink: 0, color: "var(--warning)" }} />
                 <span style={{ flex: 1 }}>{reviewNotice}</span>
+                {onOpenReviewPanel && (
+                  <button className="btn-ghost" data-testid="open-review-panel"
+                    onClick={onOpenReviewPanel} style={{ flexShrink: 0, fontSize: 12 }}>
+                    去复核
+                  </button>
+                )}
                 <button className="btn-ghost" data-testid="dismiss-review-notice"
                   aria-label="关闭复核提示" onClick={onDismissReviewNotice}
                   style={{ width: 26, height: 26, flexShrink: 0 }}>
@@ -203,6 +323,53 @@ export default function ArtifactPanel({
             </button>
           </div>
         </div>
+      )}
+
+      {/* Export confirmation (ticket #17): the dialog offers the exact blob
+          that was already downloaded into memory — 仍然导出 saves THAT file,
+          取消 discards it without creating a download. */}
+      {pendingExport && pendingExport.projectId === projectId && (
+        <dialog ref={exportDialogRef} className="export-confirm" data-testid="export-confirm"
+          aria-label="确认导出仍有待复核内容的项目">
+          <div className="ec-card">
+            <h4 style={{ fontSize: 15, fontWeight: 600, margin: "0 0 8px", display: "flex", alignItems: "center", gap: 6 }}>
+              <TriangleAlert size={15} color="var(--warning)" />
+              仍有内容待复核
+            </h4>
+            <p style={{ fontSize: 13, margin: "0 0 10px", lineHeight: 1.6 }}
+              data-testid="export-confirm-scope">
+              即将导出 r{pendingExport.revision}，仍有以下内容待复核
+              （项目级保守警告，未自动重新生成）：
+            </p>
+            <ul className="ec-warning-list" data-testid="export-confirm-list">
+              {pendingExport.warnings.map((w, i) => (
+                <li key={`${w.artifact}-${w.reason}-${i}`}>
+                  <strong>{REVIEW_ARTIFACT_LABELS[w.artifact] || w.artifact}</strong>
+                  <span>
+                    {REVIEW_REASON_LABELS[w.reason] || w.reason} · 自 r{w.since_revision} 起
+                  </span>
+                </li>
+              ))}
+            </ul>
+            <p style={{ fontSize: 12, color: "var(--text-tertiary)", margin: "10px 0 14px" }}>
+              导出文件与以上警告来自同一份快照；确认后下载该文件，取消则不会下载。
+            </p>
+            <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+              <button type="button" className="btn-secondary" data-testid="export-confirm-cancel"
+                onClick={() => setPendingExport(null)}>
+                取消
+              </button>
+              <button type="button" className="btn-primary" data-testid="export-confirm-yes"
+                onClick={() => {
+                  const pending = pendingExport;
+                  setPendingExport(null);
+                  if (pending) triggerDownload(pending.blob, pending.filename);
+                }}>
+                仍然导出
+              </button>
+            </div>
+          </div>
+        </dialog>
       )}
     </div>
   );

@@ -48,6 +48,10 @@ from script_weaver.core.card_edit import (
     CardNotFoundError,
     DuplicateTargetIdError,
     InvalidCardChangeError,
+    InvalidReviewSelectionError,
+    ReviewSelectionMismatchError,
+    summarize_review_warnings,
+    validate_review_selections,
 )
 from script_weaver.core.config import get_settings
 from script_weaver.core.pipeline import (
@@ -157,6 +161,9 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    # Direct API consumers read the export's review facts cross-origin:
+    # without an explicit expose list the browser hides non-simple headers.
+    expose_headers=["Content-Disposition", "X-Project-Revision", "X-Review-Warnings"],
 )
 
 
@@ -193,6 +200,39 @@ class CardEditRequest(BaseModel):
 
 class RefineRequest(BaseModel):
     message: str
+
+
+class ReviewFlagSelection(BaseModel):
+    """One pending-review flag the user confirmed to keep as-is (ticket #17).
+
+    The client echoes back what the project GET showed it — it never submits
+    new artifacts, rewrites flags or sends a whole ``review`` object.
+    ``extra="forbid"`` keeps unknown fields out, and the confirmable
+    artifacts are a closed set: the three conservative downstream artifacts
+    a manual edit can flag.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    artifact: Literal["script", "storyboard", "visual_highlights"]
+    reason: str = Field(min_length=1, max_length=100)
+    upstream_kind: str = Field(min_length=1, max_length=40)
+    upstream_id: str = Field(min_length=1, max_length=200)
+    since_revision: int = Field(ge=1)
+
+
+class ReviewConfirmRequest(BaseModel):
+    """POST /review/confirm body (ticket #17).
+
+    ``expected_revision`` is the CAS basis the selection was read at;
+    ``selections`` must be non-empty — confirming nothing is a 422, not a
+    silent success.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    expected_revision: int = Field(ge=1)
+    selections: list[ReviewFlagSelection] = Field(min_length=1, max_length=100)
 
 
 class GenerateRequest(BaseModel):
@@ -1337,6 +1377,56 @@ async def delete_project(project_id: str) -> dict:
     return {"deleted": True}
 
 
+@app.post("/api/projects/{project_id}/review/confirm")
+async def confirm_review(project_id: str, req: ReviewConfirmRequest) -> dict:
+    """Confirm selected pending-review artifacts as kept as-is (ticket #17).
+
+    One store transaction performs the revision CAS, the exact matching of
+    every selection against the CURRENT review flags (full identity:
+    artifact + reason + upstream kind/id + ``since_revision``), the
+    downstream-existence check and the removal of exactly the matched flags
+    — content is never rewritten and no model is ever called. The response
+    carries the complete project snapshot this transaction wrote, the
+    remaining ``review`` metadata and the ``confirmed`` scope. Refusals:
+    unknown project 404; a stale revision or a selection that no longer
+    matches (already confirmed, foreign project, or the upstream
+    re-triggered the flag) 409 with nothing written — the client must
+    re-read, and the same stale request never clears a newer flag; empty,
+    duplicated or malformed selections 422.
+    """
+    selections = [s.model_dump() for s in req.selections]
+    try:
+        validate_review_selections(selections)
+    except InvalidReviewSelectionError as exc:
+        raise HTTPException(
+            422, detail={"code": "invalid_review_selection", "message": str(exc)}
+        ) from exc
+    try:
+        record, confirmed = await asyncio.to_thread(
+            _store().confirm_review,
+            project_id,
+            expected_revision=req.expected_revision,
+            selections=selections,
+        )
+    except ReviewSelectionMismatchError as exc:
+        raise HTTPException(
+            409, detail={"code": "review_changed", "message": str(exc)}
+        ) from exc
+    except ProjectStoreError as exc:
+        raise _store_error(exc) from exc
+    body = _serialize_project(
+        record.project_id,
+        record.state,
+        revision=record.revision,
+        created_at=record.created_at,
+        updated_at=record.updated_at,
+        status=record.state.meta.status.value,
+        review=record.review,
+    )
+    body["confirmed"] = confirmed
+    return body
+
+
 # ── Version History (read-only) ──────────────────────────
 
 
@@ -1681,6 +1771,21 @@ def _build_video_gen_zip(state: ProjectState) -> bytes:
         return buf.getvalue()
 
 
+def _review_warnings_header_value(review: dict[str, Any] | None) -> str:
+    """The X-Review-Warnings header value: compact, ASCII-safe JSON.
+
+    Fixed top-level shape ``{"review_warnings": [...]}``, one entry per
+    (artifact, reason) with a stable reason code and the triggering
+    revision — never free text or object names, so the header stays bounded
+    and latin-1 encodable.
+    """
+    return json.dumps(
+        {"review_warnings": summarize_review_warnings(review)},
+        ensure_ascii=True,
+        separators=(",", ":"),
+    )
+
+
 @app.get("/api/projects/{project_id}/export/{format_type}")
 async def export_project(project_id: str, format_type: str) -> Response:
     """Export the persisted current project as a real, tool-readable file.
@@ -1689,6 +1794,14 @@ async def export_project(project_id: str, format_type: str) -> Response:
     is a file download (Content-Disposition: attachment), not a JSON envelope:
     json → the raw ProjectState object, fountain → Fountain text,
     video_gen → a ZIP_DEFLATED archive (video_gen_shots.json/.csv + shots/*).
+
+    Every format also reports the review facts of THAT snapshot in response
+    headers (ticket #17): ``X-Project-Revision`` and ``X-Review-Warnings``
+    are built from the same ProjectRecord as the bytes, so a concurrent
+    modification during the export can never pair a file with someone
+    else's warnings. The warnings are project-level and conservative —
+    unhandled review scope, not per-shot analysis — and identical across
+    the three formats so no format can masquerade as reviewed.
     """
     try:
         record = await asyncio.to_thread(_store().get_required, project_id)
@@ -1696,12 +1809,19 @@ async def export_project(project_id: str, format_type: str) -> Response:
         raise _store_error(exc) from exc
 
     state: ProjectState = record.state
+    review_headers = {
+        "X-Project-Revision": str(record.revision),
+        "X-Review-Warnings": _review_warnings_header_value(record.review),
+    }
 
     if format_type == "json":
         return Response(
             content=export_json(state),
             media_type="application/json",
-            headers={"Content-Disposition": f'attachment; filename="{project_id}.json"'},
+            headers={
+                **review_headers,
+                "Content-Disposition": f'attachment; filename="{project_id}.json"',
+            },
         )
     elif format_type == "fountain":
         if not state.script:
@@ -1709,7 +1829,10 @@ async def export_project(project_id: str, format_type: str) -> Response:
         return Response(
             content=export_fountain(state.script),
             media_type="text/plain; charset=utf-8",
-            headers={"Content-Disposition": f'attachment; filename="{project_id}.fountain"'},
+            headers={
+                **review_headers,
+                "Content-Disposition": f'attachment; filename="{project_id}.fountain"',
+            },
         )
     elif format_type == "video_gen":
         if not state.storyboard or not state.storyboard.shots:
@@ -1719,7 +1842,8 @@ async def export_project(project_id: str, format_type: str) -> Response:
             content=zip_bytes,
             media_type="application/zip",
             headers={
-                "Content-Disposition": f'attachment; filename="{project_id}_video_gen.zip"'
+                **review_headers,
+                "Content-Disposition": f'attachment; filename="{project_id}_video_gen.zip"',
             },
         )
     else:
