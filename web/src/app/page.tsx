@@ -12,6 +12,11 @@ import CardEditDrawer, {
   CardKind,
   SaveCardResult,
 } from "./components/CardEditDrawer";
+import ReviewPanel, {
+  ConfirmReviewResult,
+  ReviewPanelSession,
+  ReviewSelection,
+} from "./components/ReviewPanel";
 
 const API = "/api";
 
@@ -87,6 +92,14 @@ function buildReviewNoticeText(flags: any[], revision: number): string {
   );
 }
 
+// Where "查看" jumps for each flagged artifact: the 影像亮点 tab renders
+// both the storyboard and the visual highlights.
+const TAB_FOR_REVIEW_ARTIFACT: Record<string, string> = {
+  script: "script",
+  storyboard: "storyboard",
+  visual_highlights: "storyboard",
+};
+
 interface SessionNotice {
   epoch: number;
   text: string;
@@ -129,11 +142,21 @@ export default function HomePage() {
   // The exact (project, revision) whose banner the user dismissed; a newer
   // snapshot (any save bumps the revision) makes the status visible again.
   const [reviewHiddenFor, setReviewHiddenFor] = useState<{ projectId: string; revision: number } | null>(null);
+  // The open review panel's session (ticket #17): one seq per open/reload,
+  // keyed remount resets the checkbox selection; the revision inside is the
+  // confirm request's CAS basis.
+  const [reviewPanel, setReviewPanel] = useState<ReviewPanelSession | null>(null);
 
   // Late-response guard: async handlers compare against the project that is
   // open *now*, so a response for a previously selected project can never
   // overwrite the current one.
   const projectRef = useRef("");
+  // Monotonic id of the current project session: every open/new-project
+  // bumps it synchronously (event handler, no effect lag). The project id
+  // alone is NOT a session identity — A→B→A matches again — so export and
+  // review-panel results capture this value at launch and may only touch
+  // the UI while it is unchanged.
+  const projectSessionRef = useRef(0);
   const sessionEpochRef = useRef(0);
   // Monotonic token for history requests: every new view intent (open,
   // retry, snapshot load, close, project switch) supersedes the previous
@@ -153,6 +176,14 @@ export default function HomePage() {
   // Newest-wins token for conflict reloads (a remounted drawer must never be
   // replaced by an older reload response).
   const reloadReqRef = useRef(0);
+  // Newest-wins tokens for the review panel's confirm POST and its conflict
+  // reload: a late response may only write the UI of the panel session (and
+  // project session) it belongs to.
+  const reviewConfirmReqRef = useRef(0);
+  const reviewReloadReqRef = useRef(0);
+  // Monotonic id for review panel opens/reloads (the key remounts the panel,
+  // resetting its selection).
+  const reviewPanelSeqRef = useRef(0);
   // The snapshot the page currently displays: artifacts, revision and review
   // always come from THIS one adopted payload, never from mixed sources.
   const displayedSnapshotRef = useRef<{ projectId: string; revision: number }>({ projectId: "", revision: 0 });
@@ -226,6 +257,14 @@ export default function HomePage() {
     (id: string) => projectRef.current === id,
     [],
   );
+  // Ownership predicate for panel-bound results (exports, review confirms):
+  // true only while BOTH the project id and the open-session id are the
+  // ones the result was launched under.
+  const isProjectSessionActive = useCallback(
+    (id: string, session: number) =>
+      projectRef.current === id && projectSessionRef.current === session,
+    [],
+  );
 
   const refreshProjects = useCallback(async () => {
     try {
@@ -250,6 +289,16 @@ export default function HomePage() {
     }
   }, []);
 
+  // Closing the review panel (explicitly, via 查看, or through a project
+  // switch) must invalidate in-flight panel requests SYNCHRONOUSLY: bump
+  // the generation token here in the event handler — never only via a
+  // later-running effect. Declared before openProject, which calls it on
+  // every project switch.
+  const closeReviewPanel = useCallback(() => {
+    reviewPanelSeqRef.current += 1;
+    setReviewPanel(null);
+  }, []);
+
   const openProject = useCallback(async (id: string) => {
     if (projectRef.current === id) {
       // R5: clicking the CURRENT project keeps a live run observation
@@ -263,12 +312,14 @@ export default function HomePage() {
     setIsGenerating(false);
     setProjectId(id);
     projectRef.current = id;
+    projectSessionRef.current += 1; // a real switch: invalidate the old session's in-flight results
     setArtifactData({});
     setActiveTab("outline");
     setProjectStatus("idle");
     setHistoryPanel(HISTORY_CLOSED);
     resetDisplayedSnapshot(id);
     setEditSession(null);
+    closeReviewPanel();
     historyReqRef.current++; // in-flight history responses belong to the old project
     window.history.replaceState(null, "", `/?project=${encodeURIComponent(id)}`);
     nextNotice("📂 正在打开项目…");
@@ -305,6 +356,7 @@ export default function HomePage() {
     setIsGenerating(false);
     setProjectId("");
     projectRef.current = "";
+    projectSessionRef.current += 1;
     contentReqRef.current++;
     setArtifactData({});
     setActiveTab("outline");
@@ -312,10 +364,11 @@ export default function HomePage() {
     setHistoryPanel(HISTORY_CLOSED);
     resetDisplayedSnapshot("");
     setEditSession(null);
+    closeReviewPanel();
     historyReqRef.current++;
     window.history.replaceState(null, "", "/");
     nextNotice("🆕 已开始一个新项目，输入故事想法开始生成。");
-  }, [nextNotice, resetDisplayedSnapshot]);
+  }, [nextNotice, resetDisplayedSnapshot, closeReviewPanel]);
 
   // A generation that just created its project keeps the current chat
   // session; only the URL and the project list change.
@@ -323,6 +376,7 @@ export default function HomePage() {
     contentReqRef.current++;
     setProjectId(id);
     projectRef.current = id;
+    projectSessionRef.current += 1;
     window.history.replaceState(null, "", `/?project=${encodeURIComponent(id)}`);
     refreshProjects();
   }, [refreshProjects]);
@@ -576,6 +630,152 @@ export default function HomePage() {
     }
   }, [refreshProjectContent, nextNotice, adoptSnapshot]);
 
+  // ── Review confirm (ticket #17) ───────────────────
+
+  const handleOpenReviewPanel = useCallback(() => {
+    const pid = projectRef.current;
+    if (!pid || !reviewState || reviewState.projectId !== pid || reviewState.flags.length === 0) {
+      return;
+    }
+    reviewPanelSeqRef.current += 1;
+    setReviewPanel({
+      seq: reviewPanelSeqRef.current,
+      projectId: pid,
+      flags: reviewState.flags,
+      revision: reviewState.revision,
+    });
+  }, [reviewState]);
+
+  // Live mirror of reviewPanel for the async handlers' LAUNCH read (the
+  // panel is open and stable when its buttons are clicked); the guards
+  // below use reviewPanelSeqRef, which is bumped synchronously on every
+  // open/close/reload/switch.
+  const reviewPanelRef = useRef<ReviewPanelSession | null>(null);
+  useEffect(() => {
+    reviewPanelRef.current = reviewPanel;
+  }, [reviewPanel]);
+
+  // The confirm POST itself. A landed confirm supersedes every read issued
+  // before it (same rule as a card save) and adopts the transaction's exact
+  // snapshot; failures keep the panel's selection for the user to retry or
+  // re-read — never an automatic retry against a newer revision. Only the
+  // confirm launched for the CURRENT project session AND the CURRENT panel
+  // generation may react to a response — an abandoned POST may still land
+  // server-side (it is a real transaction); the UI then recovers through
+  // normal reads and CAS conflicts, never by retrying.
+  const handleConfirmReview = useCallback(
+    async (selections: ReviewSelection[]): Promise<ConfirmReviewResult> => {
+      const session = reviewPanelRef.current;
+      const pid = projectRef.current;
+      if (!session || !pid || session.projectId !== pid) return { type: "superseded" };
+      const atLaunch = {
+        projectSession: projectSessionRef.current,
+        panelSeq: reviewPanelSeqRef.current,
+      };
+      const token = ++reviewConfirmReqRef.current;
+      const isActive = () =>
+        token === reviewConfirmReqRef.current &&
+        projectRef.current === pid &&
+        projectSessionRef.current === atLaunch.projectSession &&
+        reviewPanelSeqRef.current === atLaunch.panelSeq;
+      try {
+        const res = await fetch(`${API}/projects/${pid}/review/confirm`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            expected_revision: session.revision,
+            selections,
+          }),
+        });
+        if (!isActive()) return { type: "superseded" };
+        const body = await res.json().catch(() => ({}));
+        // The body read is async too — re-check before ANY UI write.
+        if (!isActive()) return { type: "superseded" };
+        if (!res.ok) {
+          const message = extractError(body, `HTTP ${res.status}`);
+          const detail = body?.detail;
+          if (res.status === 409) {
+            return {
+              type: "conflict",
+              message,
+              currentRevision: typeof detail?.current_revision === "number"
+                ? detail.current_revision
+                : null,
+            };
+          }
+          if (res.status === 422) return { type: "invalid", message };
+          return { type: "error", message };
+        }
+        const confirmedCount = Array.isArray(body.confirmed) ? body.confirmed.length : selections.length;
+        contentReqRef.current++;
+        adoptSnapshot(body);
+        appendNotice(
+          `✅ 已确认沿用 ${confirmedCount} 项待复核内容（r${body.revision}，不再提示该范围）。`,
+        );
+        closeReviewPanel();
+        refreshProjects();
+        if (historyPanel.open) refreshHistory(pid);
+        return { type: "confirmed", payload: body, confirmedCount };
+      } catch (err: any) {
+        if (!isActive()) return { type: "superseded" };
+        return { type: "error", message: err?.message || "网络请求失败，确认未保存" };
+      }
+    },
+    [adoptSnapshot, appendNotice, refreshProjects, historyPanel.open, refreshHistory, closeReviewPanel],
+  );
+
+  // Conflict re-read, user-driven: adopt the fresh snapshot and re-base the
+  // panel on the CURRENT flags (new seq remounts it with a clean selection).
+  // Ownership is the same panel generation as the confirm's; a failure is
+  // APPENDED to the current chat session (no epoch bump — the chat history
+  // and the panel's selection survive), and an abandoned reload's failure
+  // is ignored entirely.
+  const handleReloadReviewPanel = useCallback(async () => {
+    const session = reviewPanelRef.current;
+    const pid = projectRef.current;
+    if (!session || !pid || session.projectId !== pid) return;
+    const atLaunch = {
+      projectSession: projectSessionRef.current,
+      panelSeq: reviewPanelSeqRef.current,
+    };
+    const token = ++reviewReloadReqRef.current;
+    const isActive = () =>
+      token === reviewReloadReqRef.current &&
+      projectRef.current === pid &&
+      projectSessionRef.current === atLaunch.projectSession &&
+      reviewPanelSeqRef.current === atLaunch.panelSeq;
+    try {
+      const fullState = await refreshProjectContent(pid);
+      if (!isActive()) return; // abandoned: must not rebuild the panel
+      if (!fullState) return;
+      if (!adoptSnapshot(fullState)) return;
+      const flags = reviewFlagsOf(fullState);
+      if (flags.length === 0) {
+        closeReviewPanel();
+        appendNotice("当前没有待复核内容。");
+        return;
+      }
+      reviewPanelSeqRef.current += 1;
+      setReviewPanel({
+        seq: reviewPanelSeqRef.current,
+        projectId: pid,
+        flags,
+        revision: fullState.revision,
+      });
+    } catch (err: any) {
+      if (!isActive()) return; // never surface an abandoned reload's failure
+      appendNotice(`❌ 重新读取待复核内容失败: ${err.message}`);
+    }
+  }, [refreshProjectContent, adoptSnapshot, appendNotice, closeReviewPanel]);
+
+  // 查看 jumps to the flagged artifact's tab (the panel closes; the banner
+  // stays for re-opening it).
+  const handleViewReviewArtifact = useCallback((artifact: string) => {
+    closeReviewPanel();
+    const tab = TAB_FOR_REVIEW_ARTIFACT[artifact];
+    if (tab) setActiveTab(tab);
+  }, [closeReviewPanel]);
+
   // On mount the URL decides which project is open, so a refresh restores it.
   useEffect(() => {
     if (typeof window !== "undefined" && window.innerWidth < 1280) {
@@ -676,6 +876,9 @@ export default function HomePage() {
             setReviewHiddenFor({ projectId: projectRef.current, revision: reviewState.revision });
           }
         }}
+        onOpenReviewPanel={projectId ? handleOpenReviewPanel : undefined}
+        projectSessionRef={projectSessionRef}
+        isProjectSessionActive={isProjectSessionActive}
         historyPanel={historyPanel}
         onOpenHistory={handleOpenHistory}
         onRefreshHistory={() => projectId && refreshHistory(projectId)}
@@ -694,6 +897,19 @@ export default function HomePage() {
           onSaved={handleCardSaved}
           onDiscard={() => setEditSession(null)}
           onReloadLatest={handleReloadLatestCard}
+        />
+      )}
+
+      {/* Review panel (ticket #17) — keyed per open/reload so a re-based
+          session starts with a clean selection. */}
+      {reviewPanel && reviewPanel.projectId === projectId && (
+        <ReviewPanel
+          key={reviewPanel.seq}
+          session={reviewPanel}
+          onConfirm={handleConfirmReview}
+          onReloadLatest={handleReloadReviewPanel}
+          onClose={closeReviewPanel}
+          onViewArtifact={handleViewReviewArtifact}
         />
       )}
     </div>

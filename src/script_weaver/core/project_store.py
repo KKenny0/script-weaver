@@ -686,6 +686,79 @@ class ProjectStore:
             updated_at=updated_at,
         )
 
+    def confirm_review(
+        self,
+        project_id: str,
+        *,
+        expected_revision: int,
+        selections: list[dict[str, Any]],
+    ) -> tuple[ProjectRecord, list[dict[str, Any]]]:
+        """CAS-confirm selected pending-review flags as kept as-is (ticket #17).
+
+        One write transaction: read the current project, verify every
+        selection's ``project_id`` names THIS project (two projects can hold
+        byte-identical flags — the ownership field is what binds a decision
+        to the project it was made in), check ``expected_revision``, match
+        every selection against the CURRENT review flags by its full
+        identity (artifact + reason + upstream kind/id + ``since_revision``
+        — never the artifact name alone, so an upstream re-trigger survives
+        an old confirm request), verify the flagged downstream artifacts
+        still exist, remove exactly the matched flags while preserving all
+        other review metadata, and append the new immutable version. The
+        project content is untouched — the save rides the normal history
+        mechanism (meta timestamps may refresh). Returns
+        ``(record, confirmed)`` where both come from the exact values this
+        transaction wrote (never a post-commit re-read). Any refusal —
+        unknown project, foreign/missing selection ownership, stale
+        revision, a selection that matches no current flag — raises before
+        a single row changes.
+        """
+        # Function-level import: card_edit imports this module's error base
+        # class, so a module-level import would be circular.
+        from script_weaver.core.card_edit import (
+            ARTIFACT_LABELS,
+            confirm_review_flags,
+            validate_review_selections,
+        )
+
+        with self._write_tx() as conn:
+            row = conn.execute(
+                "SELECT id, revision, title, state_json, review_json, auto_approve,"
+                " skill_bindings_json, created_at, updated_at"
+                " FROM projects WHERE id = ?",
+                (project_id,),
+            ).fetchone()
+            if row is None:
+                raise ProjectNotFoundError(f"Project '{project_id}' not found")
+            # Input validity precedes state comparison: a selection owned by
+            # another project is a 422-shaped refusal even when the revision
+            # is stale too — re-reading the target project could never fix it.
+            validate_review_selections(selections, project_id=project_id)
+            if row["revision"] != expected_revision:
+                raise RevisionConflictError(
+                    f"期望 revision {expected_revision} 已过期，当前为 {row['revision']}",
+                    current_revision=row["revision"],
+                )
+            state = ProjectState.model_validate_json(row["state_json"])
+            current_review = json.loads(row["review_json"] or "{}")
+            review, confirmed = confirm_review_flags(
+                current_review, selections, state
+            )
+            scope = "、".join(
+                dict.fromkeys(
+                    ARTIFACT_LABELS.get(f.get("artifact"), str(f.get("artifact")))
+                    for f in confirmed
+                )
+            )
+            new_revision, new_state_json, updated_at = self._write_new_state(
+                conn, project_id, state, expected_revision, row["title"],
+                json.dumps(review, ensure_ascii=False), "manual",
+                f"确认沿用待复核内容（{scope}，共 {len(confirmed)} 项）",
+            )
+            record = self._record_from_row(row, state, new_revision,
+                                           new_state_json, review, updated_at)
+            return record, confirmed
+
     # ── Generation runs (ticket #14) ──────────────────────
 
     _RUN_COLUMNS = (

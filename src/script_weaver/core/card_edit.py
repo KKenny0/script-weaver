@@ -21,7 +21,9 @@ for review; a shot edit recomputes the storyboard totals and marks existing
 highlights. No shot-reference analysis is claimed — the flag says "upstream
 content changed by hand", not "these downstream artifacts are provably
 stale". Missing downstream artifacts never grow flags or placeholder
-objects.
+objects. Ticket #17 adds the other half of the flag lifecycle here: the
+confirm-along selection (validated, matched by its full identity and
+removed atomically) and the compact per-artifact export warnings.
 
 All functions here are pure with respect to storage: they mutate (and
 validate) an in-memory ProjectState; the caller owns the transaction.
@@ -126,6 +128,30 @@ _ID_ATTRIBUTE = {"characters": "id", "scenes": "id", "shots": "shot_id"}
 
 # Reason recorded on every review flag produced by a manual upstream edit.
 REVIEW_REASON = "upstream_manual_edit"
+
+# Artifacts a manual edit can flag for review — and the only ones a
+# confirmation can target (ticket #17).
+CONFIRMABLE_ARTIFACTS = ("script", "storyboard", "visual_highlights")
+
+ARTIFACT_LABELS = {
+    "script": "剧本",
+    "storyboard": "分镜",
+    "visual_highlights": "影像亮点",
+}
+
+# The fields that identify one stored review flag for confirmation. Display
+# fields (upstream_label, created_at/updated_at) are never matched: a client
+# may hold a stale label, but its decision is bound to what happened, when.
+SELECTION_FIELDS = (
+    "artifact", "reason", "upstream_kind", "upstream_id", "since_revision",
+)
+
+# The ownership field every confirm selection must carry on top of the
+# identity: two projects can hold byte-identical flags, so the five stored
+# fields alone cannot bind a selection to the project it was decided in
+# (review round 2). Stored flags never grow this field — it is validated
+# against the target project and then dropped from the matching key.
+SELECTION_OWNERSHIP_FIELD = "project_id"
 
 # Largest float the platform can represent: beyond this a JSON integer is
 # not a usable duration (and math.isfinite would overflow converting it).
@@ -418,3 +444,175 @@ def merge_review_flags(
             flags.append(new_flag)
     merged["review_flags"] = flags
     return merged
+
+
+# ── Confirming flags as kept-as-is (ticket #17) ───────────
+
+
+class ReviewConfirmError(ProjectStoreError):
+    """Base class for confirm-along refusals (ticket #17)."""
+
+
+class InvalidReviewSelectionError(ReviewConfirmError):
+    """A confirm request carries a malformed, unknown or duplicated item."""
+
+
+class ReviewSelectionMismatchError(ReviewConfirmError):
+    """A selection matches no current flag of this project.
+
+    Raised inside the confirm transaction — the caller's basis is stale
+    (flags changed, another project's flag, or the upstream re-triggered
+    with a new ``since_revision``). Nothing has been written; the client
+    must re-read instead of retrying blindly.
+    """
+
+
+def selection_key(flag: Any) -> tuple[Any, ...]:
+    """The identity tuple of one review flag / one confirm selection."""
+    return tuple(flag.get(f) if isinstance(flag, dict) else None
+                 for f in SELECTION_FIELDS)
+
+
+def validate_review_selections(
+    selections: Any,
+    *,
+    project_id: str | None = None,
+) -> list[tuple[Any, ...]]:
+    """Validate request-shaped confirm selections; return their keys.
+
+    Accepts the API model's dicts (shape already type-checked there) and
+    still enforces the domain rules itself so every caller gets the same
+    refusals: confirmable artifacts only, non-empty string identity fields,
+    a positive integer ``since_revision``, and no duplicated selection.
+
+    With ``project_id`` given, every selection must also carry
+    ``project_id`` naming exactly that project — a missing field stays a
+    missing field (never backfilled from the URL, which would mask where
+    the decision came from) and a foreign owner refuses the WHOLE batch
+    before anything is matched: two projects can hold byte-identical flags,
+    so project A's selections must never clear project B's.
+    """
+    if not isinstance(selections, list) or not selections:
+        raise InvalidReviewSelectionError("selections 必须是非空列表")
+    keys: list[tuple[Any, ...]] = []
+    for i, sel in enumerate(selections):
+        where = f"第 {i + 1} 个选择"
+        if not isinstance(sel, dict):
+            raise InvalidReviewSelectionError(f"{where}必须是对象")
+        if project_id is not None:
+            owner = sel.get(SELECTION_OWNERSHIP_FIELD)
+            if not isinstance(owner, str) or not owner:
+                raise InvalidReviewSelectionError(
+                    f"{where}缺少所属项目 {SELECTION_OWNERSHIP_FIELD}"
+                )
+            if owner != project_id:
+                raise InvalidReviewSelectionError(
+                    f"{where}属于项目「{owner}」，不能提交给项目「{project_id}」"
+                )
+        artifact = sel.get("artifact")
+        if artifact not in CONFIRMABLE_ARTIFACTS:
+            raise InvalidReviewSelectionError(
+                f"{where}的产物非法：{artifact!r}"
+                f"（允许：{'、'.join(CONFIRMABLE_ARTIFACTS)}）"
+            )
+        for f in ("reason", "upstream_kind", "upstream_id"):
+            value = sel.get(f)
+            if not isinstance(value, str) or not value:
+                raise InvalidReviewSelectionError(
+                    f"{where}的 {f} 必须是非空字符串"
+                )
+        since = sel.get("since_revision")
+        if isinstance(since, bool) or not isinstance(since, int) or since < 1:
+            raise InvalidReviewSelectionError(
+                f"{where}的 since_revision 必须是正整数"
+            )
+        keys.append(selection_key(sel))
+    if len(set(keys)) != len(keys):
+        raise InvalidReviewSelectionError(
+            "选择中存在重复项（产物、原因、上游与 since_revision 完全相同），"
+            "每条待复核标记只能确认一次。"
+        )
+    return keys
+
+
+def confirm_review_flags(
+    review: dict[str, Any] | None,
+    selections: list[dict[str, Any]],
+    state: ProjectState,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Match selections against the CURRENT flags and remove exactly those.
+
+    Identity is the full :data:`SELECTION_FIELDS` tuple — never the artifact
+    name alone — so an upstream re-trigger (same artifact, new
+    ``since_revision``) survives an old confirm request untouched. The
+    flagged downstream artifact must still exist; a flag pointing at
+    nothing is an anomaly to re-read, not to wave through. Pure: returns
+    ``(new_review, confirmed_flags)`` and mutates nothing; the caller owns
+    persistence and rolls the whole transaction back on any error.
+    """
+    new_review: dict[str, Any] = dict(review) if isinstance(review, dict) else {}
+    flags = [
+        f for f in new_review.get("review_flags") or [] if isinstance(f, dict)
+    ]
+    confirmed: list[dict[str, Any]] = []
+    for sel in selections:
+        key = selection_key(sel)
+        index = next(
+            (i for i, flag in enumerate(flags) if selection_key(flag) == key),
+            None,
+        )
+        if index is None:
+            raise ReviewSelectionMismatchError(
+                "所选待复核标记已变化或不存在（可能已被确认或上游再次修改），"
+                "请重新读取后重试。"
+            )
+        flag = flags[index]
+        if not _artifact_exists(state, flag.get("artifact")):
+            raise ReviewSelectionMismatchError(
+                "标记对应的下游产物已不存在，请重新读取后重试。"
+            )
+        confirmed.append(flags.pop(index))
+    new_review["review_flags"] = flags
+    return new_review, confirmed
+
+
+def summarize_review_warnings(
+    review: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    """Compact, fixed-shape export warnings, one per (artifact, reason).
+
+    The header form of the pending-review facts: artifact, stable reason
+    code and the revision that triggered the flag. Labels, timestamps and
+    free text stay out (headers cannot grow unboundedly) — full detail
+    remains in the project GET's ``review`` metadata. Unknown or corrupt
+    flag shapes are the GET's job to surface; the header only reports
+    well-formed flags of the three conservative artifacts. When a duplicate
+    (artifact, reason) pair somehow exists, the earliest
+    ``since_revision`` wins — the longest-pending fact.
+    """
+    flags = (
+        review.get("review_flags") if isinstance(review, dict) else None
+    )
+    merged: dict[tuple[str, str], dict[str, Any]] = {}
+    for flag in flags or []:
+        if not isinstance(flag, dict):
+            continue
+        artifact, reason = flag.get("artifact"), flag.get("reason")
+        since = flag.get("since_revision")
+        if (
+            artifact not in CONFIRMABLE_ARTIFACTS
+            or not isinstance(reason, str)
+            or not reason
+            or isinstance(since, bool)
+            or not isinstance(since, int)
+            or since < 1
+        ):
+            continue
+        key = (artifact, reason)
+        if key not in merged or since < merged[key]["since_revision"]:
+            merged[key] = {
+                "artifact": artifact,
+                "reason": reason,
+                "since_revision": since,
+            }
+    return [merged[key] for key in sorted(merged)]
