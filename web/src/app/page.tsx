@@ -172,6 +172,15 @@ export default function HomePage() {
     setSessionNotice({ epoch: sessionEpochRef.current, text });
   }, []);
 
+  // Same-epoch follow-up (round 3): ChatPanel APPENDS a notice whose epoch
+  // matches the one it last showed, and only a bumped epoch starts a new
+  // session. Card saves (and similar in-place acknowledgements) must not
+  // reset the conversation — run outcomes, errors and growth warnings stay
+  // — while project switches keep using nextNotice for a real session reset.
+  const appendNotice = useCallback((text: string) => {
+    setSessionNotice({ epoch: sessionEpochRef.current, text });
+  }, []);
+
   // ── Snapshot adoption (single entry, round 2) ────
   //
   // EVERY path that shows project content on this page funnels through
@@ -509,14 +518,15 @@ export default function HomePage() {
     // would otherwise pair old artifacts with the new revision).
     contentReqRef.current++;
     if (adoptSnapshot(payload)) {
-      // The save acknowledgement is a chat message; the persisted
-      // pending-review status lives in the banner (adoptSnapshot above).
-      nextNotice(`✅ 已保存为 r${payload.revision}。`);
+      // Acknowledge in the CURRENT chat session (append, no epoch bump) —
+      // the pending-review status lives in the banner from the adopted
+      // snapshot above.
+      appendNotice(`✅ 已保存为 r${payload.revision}。`);
     }
     setEditSession(null);
     refreshProjects();
     if (historyPanel.open) refreshHistory(pid);
-  }, [adoptSnapshot, nextNotice, refreshProjects, historyPanel.open, refreshHistory]);
+  }, [adoptSnapshot, appendNotice, refreshProjects, historyPanel.open, refreshHistory]);
 
   const handleReloadLatestCard = useCallback(async (kind: CardKind, id: string) => {
     const pid = projectRef.current;

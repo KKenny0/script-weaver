@@ -229,6 +229,7 @@ export default function ChatPanel({
       content_complete?: boolean;
       growth_status?: string | null;
       growth_error?: string | null;
+      last_progress?: { message?: string } | null;
     },
     source: "done" | "restore",
     origin?: { seq: number; evtSource: EventSource | null },
@@ -249,21 +250,32 @@ export default function ChatPanel({
     // The run has ended even if a newer content read supersedes this one.
     setProjectStatus(status === "succeeded" ? "complete" : status === "cancelled" ? "idle" : "error");
     let fullState: any = null;
-    let superseded = false;
+    let contentReadFailed = false;
     try {
       fullState = await refreshProjectContent(pid);
-      if (fullState === null) superseded = true; // a newer refresh owns the UI
     } catch (fetchErr) {
       console.error("Failed to fetch final state:", fetchErr);
+      contentReadFailed = true;
     }
-    if (superseded) return false;
+    // Round 3: content adoption and outcome presentation are SEPARATE
+    // judgments. A null read only means a newer refresh or a landed card
+    // save now owns the content view — the run outcome still belongs to
+    // this session and must be presented (failure reason, growth warning,
+    // resume entry). Only a dead session/view drops it.
     if (!stillOwns()) return false; // async continuation returned into another session/view
     if (fullState) {
-      applyFullState(fullState);
+      applyFullState(fullState); // adoptSnapshot refuses stale snapshots
       onProjectMutated();
       setContentRefreshPending(false);
+    } else if (contentReadFailed) {
+      // A REAL refresh failure is retryable; a superseded read is not —
+      // whatever superseded it already adopted newer content, so no retry
+      // chip and no failure note for that case.
+      setContentRefreshPending(true);
     }
-    const refreshFailNote = fullState ? "" : "\n（内容刷新失败，已保留当前显示；可点击「刷新内容」重试。）";
+    const refreshFailNote = contentReadFailed
+      ? "\n（内容刷新失败，已保留当前显示；可点击「刷新内容」重试。）"
+      : "";
     // Ticket #15: which stages survived and where a resume would continue.
     const resumeNote = formatResumeProgress(outcome);
     // Offer the resume entry only for unfinished content on a terminal
@@ -285,8 +297,7 @@ export default function ChatPanel({
           else if (fullState.characters) onTabSwitch("characters");
           else if (fullState.script) onTabSwitch("script");
         }
-      } else {
-        setContentRefreshPending(true);
+      } else if (contentReadFailed) {
         setMessages((prev) => [...prev, {
           role: "assistant",
           content: source === "done"
@@ -294,10 +305,20 @@ export default function ChatPanel({
             : "✅ 上次生成已完成，但内容刷新失败。已保留当前显示的内容，可点击下方「刷新内容」重试。",
           timestamp: Date.now(),
         }]);
+      } else {
+        // Superseded read: the newer operation already adopted the content
+        // view — acknowledge without a stale summary or a retry entry.
+        setMessages((prev) => [...prev, {
+          role: "assistant",
+          content: source === "done"
+            ? "✅ 生成已完成；内容视图已由最新操作同步。"
+            : "✅ 上次生成已完成；当前内容已是最新。",
+          timestamp: Date.now(),
+        }]);
       }
     } else if (status === "cancelled") {
       setProjectStatus(fullState ? "complete" : "idle");
-      if (!fullState) setContentRefreshPending(true);
+      if (contentReadFailed) setContentRefreshPending(true);
       setResumeOffer(resumable ? { runId: outcome.run_id! } : null);
       setMessages((prev) => [...prev, {
         role: "assistant",
@@ -308,15 +329,21 @@ export default function ChatPanel({
       }]);
     } else {
       // failed / interrupted
-      if (!fullState) setContentRefreshPending(true);
+      if (contentReadFailed) setContentRefreshPending(true);
       setResumeOffer(resumable ? { runId: outcome.run_id! } : null);
       const reason = outcome.error
         || (status === "interrupted" ? "服务在生成期间重启，运行已中断" : "生成失败");
+      // The run's last known progress (restore responses carry it) shows
+      // where it actually died — the error text alone often says less.
+      const lastProgress = outcome.last_progress?.message;
+      const progressNote = source === "restore" && lastProgress && lastProgress !== reason
+        ? `\n最后进度：${lastProgress}。`
+        : "";
       setMessages((prev) => [...prev, {
         role: "assistant",
         content: source === "done"
-          ? `❌ 生成未完成：${reason}${resumeNote}${fullState ? "\n已完成的阶段已保存，可从中断处继续或重新生成。" : refreshFailNote}`
-          : `ℹ️ 上次生成未完成（${reason}）。已同步已保存的阶段。${resumeNote}${refreshFailNote}`,
+          ? `❌ 生成未完成：${reason}${progressNote}${resumeNote}${fullState ? "\n已完成的阶段已保存，可从中断处继续或重新生成。" : refreshFailNote}`
+          : `ℹ️ 上次生成未完成（${reason}）。${progressNote}已同步已保存的阶段。${resumeNote}${refreshFailNote}`,
         timestamp: Date.now(),
       }]);
     }

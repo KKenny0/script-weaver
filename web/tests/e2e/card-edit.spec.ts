@@ -1,16 +1,18 @@
-import { expect, test, type Page } from "@playwright/test";
+import { expect, test, type Page, type Route } from "@playwright/test";
 
 import {
   fetchProject,
   gate,
   gateRespond,
   installGate,
+  installSSEStub,
   modelEgressWatcher,
   openApp,
   release,
   seedCardsProject,
   seedProject,
   seedRun,
+  sseCount,
   ungate,
   waitForHeld,
 } from "./helpers";
@@ -653,4 +655,128 @@ test("old content GET must not overwrite a successful card save", async ({ page,
   await expect(page.getByTestId("field-name")).toHaveValue("JUST SAVED", { timeout: 1500 });
   // The editor's basis is the saved revision, not the stale snapshot's.
   await expect(page.getByTestId("drawer-basis")).toContainText(`r${old.revision + 1}`);
+});
+
+
+// ── Review round 3: save feedback vs chat session, run outcome vs adoption ──
+
+
+test("card save appends to the chat session and keeps run messages", async ({ page, request }) => {
+  const p = await seedProject(request, "保存保消息");
+  await seedCardsProject(p.project_id);
+  await seedRun(p.project_id, "succeeded");
+  await installSSEStub(page);
+  await openApp(page, `/?project=${p.project_id}`);
+  // The terminal run's outcome was restored into the chat.
+  await expect(page.getByText(/已恢复上次生成的结果/)).toBeVisible();
+
+  await page.locator(".segment-tab", { hasText: "主角列表" }).click();
+  await openEditor(page, "edit-card-characters-char_e2e_01");
+  await page.getByTestId("field-name").fill("SAVED");
+  const sseBefore = await sseCount(page);
+  await page.getByTestId("save-card").click();
+  await expect(page.getByTestId("card-edit-drawer")).toHaveCount(0);
+
+  // The restored outcome survives the save; the acknowledgement is appended
+  // exactly once — the session was NOT reset.
+  await expect(page.getByText(/已恢复上次生成的结果/)).toBeVisible({ timeout: 1500 });
+  await expect(page.getByText("✅ 已保存为 r3。")).toHaveCount(1);
+  // Saving never rebuilds a generation subscription nor opens a run stream.
+  expect(await sseCount(page)).toBe(sseBefore);
+
+  // Consecutive saves answer with their own revisions, both kept.
+  await page.getByTestId("edit-card-characters-char_e2e_01").click();
+  await expect(page.getByTestId("drawer-basis")).toContainText("r3");
+  await page.getByTestId("field-appearance").fill("守灯人，眼神坚定");
+  await page.getByTestId("save-card").click();
+  await expect(page.getByTestId("card-edit-drawer")).toHaveCount(0);
+  await expect(page.getByText("✅ 已保存为 r4。")).toBeVisible();
+  await expect(page.getByText("✅ 已保存为 r3。")).toBeVisible();
+  await expect(page.getByText(/已恢复上次生成的结果/)).toBeVisible();
+});
+
+
+test("card save must not swallow a pending failed-run outcome", async ({ page, request }) => {
+  const p = await seedProject(request, "保存不吞失败");
+  await seedCardsProject(p.project_id);
+  await seedRun(p.project_id, "failed", { message: "UNIQUE FAILURE", completedSteps: ["idea_refiner"] });
+  const old = await (await request.get(`http://127.0.0.1:8310/api/projects/${p.project_id}`)).json();
+
+  // Hold the restore flow's content GET — it will resolve only after the
+  // card save has landed, i.e. its snapshot is stale by then.
+  let n = 0;
+  let held: Route | undefined;
+  let notify!: () => void;
+  const pending = new Promise<void>((r) => (notify = r));
+  await page.route(`**/api/projects/${p.project_id}`, async (route) => {
+    if (++n === 2) {
+      held = route;
+      notify();
+      return;
+    }
+    await route.continue();
+  });
+  await openApp(page, `/?project=${p.project_id}`);
+  await pending;
+
+  await page.locator(".segment-tab", { hasText: "主角列表" }).click();
+  await page.getByTestId("edit-card-characters-char_e2e_01").click();
+  await page.getByTestId("field-name").fill("SAVED");
+  await page.getByTestId("save-card").click();
+  await expect(page.getByTestId("card-edit-drawer")).toHaveCount(0);
+
+  // Release the stale GET: the FAILED-run outcome must still be presented
+  // (reason, last progress, resume entry) while the SAVED content stays.
+  await held!.fulfill({ json: old });
+  await expect(page.getByText(/UNIQUE FAILURE/)).toBeVisible({ timeout: 1500 });
+  await expect(page.getByText(/种子运行预先写好的失败原因/)).toBeVisible();
+  await expect(page.getByRole("button", { name: "从中断处继续生成" })).toBeVisible();
+  await expect(page.locator(".character-card", { hasText: "SAVED" })).toBeVisible();
+  // A superseded read is not a failed refresh: no retry chip appears.
+  await expect(page.getByText(/内容刷新失败/)).toHaveCount(0);
+  // And the failure is announced exactly once.
+  await expect(page.getByText(/UNIQUE FAILURE/)).toHaveCount(1);
+});
+
+
+test("a pending failed-run outcome from project A never leaks into project B", async ({ page, request }) => {
+  const pa = await seedProject(request, "失败隔离甲");
+  await seedCardsProject(pa.project_id);
+  await seedRun(pa.project_id, "failed", { message: "甲的失败原因", completedSteps: ["idea_refiner"] });
+  const pb = await seedProject(request, "失败隔离乙");
+  await seedCardsProject(pb.project_id);
+
+  let n = 0;
+  let held: Route | undefined;
+  let notify!: () => void;
+  const pending = new Promise<void>((r) => (notify = r));
+  await page.route(`**/api/projects/${pa.project_id}`, async (route) => {
+    if (++n === 2) {
+      held = route;
+      notify();
+      return;
+    }
+    await route.continue();
+  });
+  await openApp(page, `/?project=${pa.project_id}`);
+  await pending;
+
+  // Save a card on A, then leave for B while A's outcome GET is still held.
+  await page.locator(".segment-tab", { hasText: "主角列表" }).click();
+  await page.getByTestId("edit-card-characters-char_e2e_01").click();
+  await page.getByTestId("field-name").fill("甲的保存");
+  await page.getByTestId("save-card").click();
+  await expect(page.getByTestId("card-edit-drawer")).toHaveCount(0);
+  await page.locator('button[title^="打开项目"]', { hasText: pb.title }).click();
+  await expect(page.locator('button[title^="打开项目"][aria-current="true"]')).toHaveText(new RegExp(pb.title));
+
+  // The stale outcome continuation belongs to project A's session: it must
+  // write nothing into B's chat or content.
+  await held!.fulfill({ json: await (await request.get(`http://127.0.0.1:8310/api/projects/${pa.project_id}`)).json() });
+  await page.waitForTimeout(300);
+  await expect(page.getByText(/甲的失败原因/)).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "从中断处继续生成" })).toHaveCount(0);
+  // B's own content is intact.
+  await page.locator(".segment-tab", { hasText: "主角列表" }).click();
+  await expect(page.locator(".character-card", { hasText: "阿芸" }).first()).toBeVisible();
 });
