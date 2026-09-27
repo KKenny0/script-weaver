@@ -198,6 +198,7 @@ class BaseAgent:
 
             # Branch: tool calls vs. final response
             if response.tool_calls:
+                self._validate_tool_calls(response.tool_calls)
                 # Execute each tool call and append results as tool-role messages
                 for tool_call in response.tool_calls:
                     logger.debug(
@@ -254,6 +255,9 @@ class BaseAgent:
         logger.warning(f"[{self.name}] Max iterations ({self._max_iterations}) reached.")
         return {"error": "max_iterations_exceeded", "raw_response": last_content,
                 "last_error": last_error}
+
+    def _validate_tool_calls(self, calls: list[ToolCall]) -> None:
+        """Optional scope restriction before processing any tool output."""
 
     def _validate_artifact(self, data: Any) -> None:
         """Validate generated output without weakening the saved project schema."""

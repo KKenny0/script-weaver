@@ -616,3 +616,19 @@ def summarize_review_warnings(
                 "since_revision": since,
             }
     return [merged[key] for key in sorted(merged)]
+
+
+def card_snapshot(state: ProjectState, kind: str, target_id: str) -> dict:
+    apply_card_changes(state, kind, target_id, {})
+    return next(obj.model_dump(mode="json") for obj in _card_collection(state, kind)
+                if getattr(obj, _ID_ATTRIBUTE[kind]) == target_id)
+
+
+def validate_candidate_output(state: ProjectState, kind: str, target_id: str, output: Any) -> None:
+    """Validate exactly one addressed change, then apply to a private snapshot."""
+    if not isinstance(output, dict) or set(output) != {"kind", "target_id", "changes"}:
+        raise InvalidCardChangeError("候选必须恰好包含 kind、target_id、changes。")
+    if output["kind"] != kind or output["target_id"] != target_id:
+        raise InvalidCardChangeError("候选目标与请求不一致。")
+    if not apply_card_changes(state, kind, target_id, output["changes"]).changed:
+        raise InvalidCardChangeError("候选没有实际修改。")

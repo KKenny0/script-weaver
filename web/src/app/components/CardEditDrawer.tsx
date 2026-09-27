@@ -1,5 +1,6 @@
 "use client";
 
+import CardCandidates from "./CardCandidates";
 import React, { useEffect, useRef, useState } from "react";
 import { AlertTriangle, Loader2, Plus, Trash2, X } from "lucide-react";
 
@@ -552,6 +553,10 @@ export default function CardEditDrawer({
               没有需要保存的修改。
             </div>
           )}
+
+          <CardCandidates session={session} dirty={dirty} onAccepted={onSaved}
+            onReload={() => onReloadLatest(kind, id)}
+            fieldLabels={Object.fromEntries(FIELD_DEFS[kind].map(f => [f.name, f.label]))} />
 
           <div className="ced-ro" data-testid="drawer-readonly">
             {READ_ONLY_ROWS[kind].map((row) => (
