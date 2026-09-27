@@ -7,6 +7,11 @@ import ArtifactPanel from "./components/ArtifactPanel";
 import ProjectList, { ProjectSummary } from "./components/ProjectList";
 import { HistoryPanelState, VersionSnapshot } from "./components/VersionHistory";
 import { ArtifactData } from "./components/ArtifactContent";
+import CardEditDrawer, {
+  CardEditSession,
+  CardKind,
+  SaveCardResult,
+} from "./components/CardEditDrawer";
 
 const API = "/api";
 
@@ -46,6 +51,42 @@ function projectHasArtifacts(s: any): boolean {
   );
 }
 
+// ── Card editing (ticket #16) ────────────────────
+
+function findCard(
+  data: ArtifactData | any,
+  kind: CardKind,
+  id: string,
+): Record<string, any> | null {
+  if (kind === "characters")
+    return (data.characters || []).find((c: any) => c.id === id) ?? null;
+  if (kind === "scenes")
+    return (data.scenes || []).find((s: any) => s.id === id) ?? null;
+  return ((data.storyboard as any)?.shots || []).find((s: any) => s.shot_id === id) ?? null;
+}
+
+const REVIEW_ARTIFACT_LABELS: Record<string, string> = {
+  script: "剧本",
+  storyboard: "分镜",
+  visual_highlights: "影像亮点",
+};
+
+/** The persisted pending-review facts of the adopted snapshot (round 2:
+ * read from data on every adoption, never a transient save-only message). */
+function reviewFlagsOf(fullState: any): any[] {
+  const flags = fullState?.review?.review_flags;
+  return Array.isArray(flags) ? flags : [];
+}
+
+function buildReviewNoticeText(flags: any[], revision: number): string {
+  const artifacts = [...new Set(flags.map((f) => REVIEW_ARTIFACT_LABELS[f.artifact] || f.artifact))];
+  if (artifacts.length === 0) return "";
+  return (
+    `当前有待复核内容：${artifacts.join("、")}。原因：上游内容被手工修改` +
+    `（保守影响范围，自 r${revision} 起生效）；是否沿用待后续确认，不会自动重新生成。`
+  );
+}
+
 interface SessionNotice {
   epoch: number;
   text: string;
@@ -75,6 +116,19 @@ export default function HomePage() {
   // panel re-checks run state (keeping a live observation intact).
   const [projectOpenEpoch, setProjectOpenEpoch] = useState(0);
   const [historyPanel, setHistoryPanel] = useState<HistoryPanelState>(HISTORY_CLOSED);
+  // The revision of the content currently DISPLAYED — the basis every card
+  // edit session opens from.
+  const [projectRevision, setProjectRevision] = useState(0);
+  const [editSession, setEditSession] = useState<CardEditSession | null>(null);
+  // Persisted pending-review facts of the adopted snapshot (round 2): shown
+  // until handled, restored from every read — not tied to one save message.
+  // Project-scoped so another project's flags can never render here.
+  const [reviewState, setReviewState] = useState<{
+    projectId: string; flags: any[]; revision: number;
+  } | null>(null);
+  // The exact (project, revision) whose banner the user dismissed; a newer
+  // snapshot (any save bumps the revision) makes the status visible again.
+  const [reviewHiddenFor, setReviewHiddenFor] = useState<{ projectId: string; revision: number } | null>(null);
 
   // Late-response guard: async handlers compare against the project that is
   // open *now*, so a response for a previously selected project can never
@@ -90,6 +144,24 @@ export default function HomePage() {
   // Set by ChatPanel; closing the stream ends the subscription only (the
   // backend owns the task).
   const closeStreamRef = useRef<() => void>(() => {});
+  // Every editor open mints a fresh session id: a remounted drawer can never
+  // inherit a previous session's draft, basis or in-flight save.
+  const editOpenSeqRef = useRef(0);
+  // Newest-wins token for card saves: a late response may only ever write
+  // the UI of the save intent (and project session) it belongs to.
+  const cardSaveReqRef = useRef(0);
+  // Newest-wins token for conflict reloads (a remounted drawer must never be
+  // replaced by an older reload response).
+  const reloadReqRef = useRef(0);
+  // The snapshot the page currently displays: artifacts, revision and review
+  // always come from THIS one adopted payload, never from mixed sources.
+  const displayedSnapshotRef = useRef<{ projectId: string; revision: number }>({ projectId: "", revision: 0 });
+  // Live mirror of editSession for async guards (A→B→A makes a plain project
+  // check insufficient: the id matches again while the session does not).
+  const editSessionRef = useRef<CardEditSession | null>(null);
+  useEffect(() => {
+    editSessionRef.current = editSession;
+  }, [editSession]);
 
   useEffect(() => {
     projectRef.current = projectId;
@@ -98,6 +170,47 @@ export default function HomePage() {
   const nextNotice = useCallback((text: string) => {
     sessionEpochRef.current += 1;
     setSessionNotice({ epoch: sessionEpochRef.current, text });
+  }, []);
+
+  // Same-epoch follow-up (round 3): ChatPanel APPENDS a notice whose epoch
+  // matches the one it last showed, and only a bumped epoch starts a new
+  // session. Card saves (and similar in-place acknowledgements) must not
+  // reset the conversation — run outcomes, errors and growth warnings stay
+  // — while project switches keep using nextNotice for a real session reset.
+  const appendNotice = useCallback((text: string) => {
+    setSessionNotice({ epoch: sessionEpochRef.current, text });
+  }, []);
+
+  // ── Snapshot adoption (single entry, round 2) ────
+  //
+  // EVERY path that shows project content on this page funnels through
+  // here: the displayed artifacts, revision and review flags always come
+  // from one adopted snapshot, never assembled from mixed sources. Within
+  // one project session a snapshot older than the displayed one is refused
+  // (edits only ever move the revision forward), so a stale GET can no
+  // longer overwrite a landed card save. Callers keep their own session
+  // guards (epoch/openSeq) on top of this.
+
+  const adoptSnapshot = useCallback((fullState: any): boolean => {
+    const pid = fullState?.project_id;
+    if (!pid || pid !== projectRef.current) return false;
+    const revision = typeof fullState.revision === "number" ? fullState.revision : 0;
+    const shown = displayedSnapshotRef.current;
+    if (shown.projectId === pid && revision < shown.revision) return false;
+    displayedSnapshotRef.current = { projectId: pid, revision };
+    setProjectRevision(revision);
+    setArtifactData(pickArtifactData(fullState));
+    const flags = reviewFlagsOf(fullState);
+    setReviewState(flags.length > 0 ? { projectId: pid, flags, revision } : null);
+    return true;
+  }, []);
+
+  // Reset what the page displays when the project session changes.
+  const resetDisplayedSnapshot = useCallback((pid: string) => {
+    displayedSnapshotRef.current = { projectId: pid, revision: 0 };
+    setProjectRevision(0);
+    setReviewState(null);
+    setReviewHiddenFor(null);
   }, []);
 
   // Parent-owned liveness checks. ChatPanel is conditionally unmounted (chat
@@ -124,6 +237,8 @@ export default function HomePage() {
 
   // Page opens and chat refreshes share ownership, including failed reads.
   // A superseded response returns null; only the newest read can write UI.
+  // Pure reader on purpose (round 2): adoption happens in ONE place —
+  // never a bare revision write ahead of the caller's decision.
   const refreshProjectContent = useCallback(async (id: string) => {
     const token = ++contentReqRef.current;
     try {
@@ -152,6 +267,8 @@ export default function HomePage() {
     setActiveTab("outline");
     setProjectStatus("idle");
     setHistoryPanel(HISTORY_CLOSED);
+    resetDisplayedSnapshot(id);
+    setEditSession(null);
     historyReqRef.current++; // in-flight history responses belong to the old project
     window.history.replaceState(null, "", `/?project=${encodeURIComponent(id)}`);
     nextNotice("📂 正在打开项目…");
@@ -164,7 +281,7 @@ export default function HomePage() {
       const fullState = await refreshProjectContent(id);
       if (fullState === null) return;
       if (projectRef.current !== id || !isSessionActive(epochAtStart)) return; // superseded open
-      setArtifactData(pickArtifactData(fullState));
+      if (!adoptSnapshot(fullState)) return; // stale for this project session
       // The backend reports "running" while a generation run is active for
       // the project — the run outlives any page view (ticket #14).
       setProjectStatus(
@@ -181,7 +298,7 @@ export default function HomePage() {
       nextNotice(`❌ 打开项目失败: ${err.message}`);
     }
     refreshProjects();
-  }, [nextNotice, refreshProjects, isSessionActive, refreshProjectContent]);
+  }, [nextNotice, refreshProjects, isSessionActive, refreshProjectContent, adoptSnapshot]);
 
   const startNewProject = useCallback(() => {
     closeStreamRef.current();
@@ -193,10 +310,12 @@ export default function HomePage() {
     setActiveTab("outline");
     setProjectStatus("idle");
     setHistoryPanel(HISTORY_CLOSED);
+    resetDisplayedSnapshot("");
+    setEditSession(null);
     historyReqRef.current++;
     window.history.replaceState(null, "", "/");
     nextNotice("🆕 已开始一个新项目，输入故事想法开始生成。");
-  }, [nextNotice]);
+  }, [nextNotice, resetDisplayedSnapshot]);
 
   // A generation that just created its project keeps the current chat
   // session; only the URL and the project list change.
@@ -211,6 +330,17 @@ export default function HomePage() {
   const handleProjectMutated = useCallback(() => {
     refreshProjects();
   }, [refreshProjects]);
+
+  // ChatPanel content refreshes funnel through the same adoption rule as
+  // everything else (round 2): a payload carrying a project_id is a full
+  // snapshot and must win only if it is the session's current content.
+  const handleArtifactUpdate = useCallback((data: Record<string, any>) => {
+    if (data && typeof data === "object" && data.project_id) {
+      adoptSnapshot(data);
+      return;
+    }
+    setArtifactData(data);
+  }, [adoptSnapshot]);
 
   // Collapsing the chat unmounts ChatPanel, which closes its progress view.
   // The run itself keeps running in the backend (ticket #14) and the status
@@ -309,6 +439,143 @@ export default function HomePage() {
     setHistoryPanel(HISTORY_CLOSED);
   }, []);
 
+  // ── Card editing (ticket #16) ────────────────────
+
+  const handleEditCard = useCallback((kind: CardKind, id: string) => {
+    const pid = projectRef.current;
+    if (!pid) return;
+    const card = findCard(artifactData, kind, id);
+    if (!card) return;
+    editOpenSeqRef.current += 1;
+    setEditSession({
+      seq: editOpenSeqRef.current,
+      projectId: pid,
+      kind,
+      id,
+      // The draft's immutable basis: what the user sees is what they edit.
+      // Opening/cancelling an editor never touches the pending-review state.
+      revision: projectRevision,
+      snapshot: card,
+    });
+  }, [artifactData, projectRevision]);
+
+  const handleSaveCard = useCallback(
+    async (
+      kind: CardKind,
+      id: string,
+      changes: Record<string, unknown>,
+      expectedRevision: number,
+    ): Promise<SaveCardResult> => {
+      const pid = projectRef.current;
+      if (!pid) return { type: "superseded" };
+      const token = ++cardSaveReqRef.current;
+      try {
+        const res = await fetch(
+          `${API}/projects/${pid}/artifacts/${kind}/${encodeURIComponent(id)}`,
+          {
+            method: "PATCH",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ changes, expected_revision: expectedRevision }),
+          },
+        );
+        // A→B→A guard: only the newest save of the CURRENT project session
+        // may react to a response — and only inside that session.
+        if (token !== cardSaveReqRef.current || projectRef.current !== pid) {
+          return { type: "superseded" };
+        }
+        const body = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          const message = extractError(body, `HTTP ${res.status}`);
+          const detail = body?.detail;
+          if (res.status === 409) {
+            return {
+              type: "conflict",
+              message,
+              currentRevision: typeof detail?.current_revision === "number"
+                ? detail.current_revision
+                : null,
+            };
+          }
+          if (res.status === 422) return { type: "invalid", message };
+          return { type: "error", message };
+        }
+        return { type: "saved", changed: !!body.changed, payload: body };
+      } catch (err: any) {
+        if (token !== cardSaveReqRef.current || projectRef.current !== pid) {
+          return { type: "superseded" };
+        }
+        return { type: "error", message: err?.message || "网络请求失败，修改未保存" };
+      }
+    },
+    [],
+  );
+
+  const handleCardSaved = useCallback((payload: any) => {
+    const pid = projectRef.current;
+    if (!pid || payload?.project_id !== pid) return;
+    // A landed save supersedes every read issued before it: bump the
+    // content token so in-flight GETs can no longer adopt (their responses
+    // would otherwise pair old artifacts with the new revision).
+    contentReqRef.current++;
+    if (adoptSnapshot(payload)) {
+      // Acknowledge in the CURRENT chat session (append, no epoch bump) —
+      // the pending-review status lives in the banner from the adopted
+      // snapshot above.
+      appendNotice(`✅ 已保存为 r${payload.revision}。`);
+    }
+    setEditSession(null);
+    refreshProjects();
+    if (historyPanel.open) refreshHistory(pid);
+  }, [adoptSnapshot, appendNotice, refreshProjects, historyPanel.open, refreshHistory]);
+
+  const handleReloadLatestCard = useCallback(async (kind: CardKind, id: string) => {
+    const pid = projectRef.current;
+    if (!pid) return;
+    // Capture WHO launched this reload: project session, edit session, the
+    // target card, and the reload order. Any of close / project switch /
+    // editor reopen / a newer reload invalidates it — the project id alone
+    // is NOT enough (A→B→A makes it match again).
+    const launchedFromSeq = editSessionRef.current?.seq ?? null;
+    const token = ++reloadReqRef.current;
+    try {
+      const fullState = await refreshProjectContent(pid);
+      if (token !== reloadReqRef.current) return; // a newer reload supersedes this one
+      if (projectRef.current !== pid) return; // project switched
+      if ((editSessionRef.current?.seq ?? null) !== launchedFromSeq || launchedFromSeq === null) {
+        return; // drawer closed, reopened, or moved to another card meanwhile
+      }
+      if (!fullState) return; // superseded read
+      const card = findCard(fullState, kind, id);
+      if (!card) {
+        // The card vanished from the latest content — nothing to edit.
+        setEditSession(null);
+        nextNotice("该卡片在最新内容中已不存在，已关闭编辑面板。");
+        return;
+      }
+      // The reload adopts the snapshot for the whole page (artifacts,
+      // revision, review from the SAME payload) and remounts the editor on
+      // that basis — an explicit user action, never an automatic draft
+      // retry. The old drawer's draft dies with its session here.
+      if (!adoptSnapshot(fullState)) return;
+      editOpenSeqRef.current += 1;
+      setEditSession({
+        seq: editOpenSeqRef.current,
+        projectId: pid,
+        kind,
+        id,
+        revision: fullState.revision,
+        snapshot: card,
+      });
+    } catch (err: any) {
+      if (token !== reloadReqRef.current) return;
+      if (projectRef.current !== pid) return;
+      if ((editSessionRef.current?.seq ?? null) !== launchedFromSeq || launchedFromSeq === null) {
+        return; // never surface an abandoned reload's failure to a new session
+      }
+      nextNotice(`❌ 载入最新内容失败: ${err.message}`);
+    }
+  }, [refreshProjectContent, nextNotice, adoptSnapshot]);
+
   // On mount the URL decides which project is open, so a refresh restores it.
   useEffect(() => {
     if (typeof window !== "undefined" && window.innerWidth < 1280) {
@@ -342,7 +609,7 @@ export default function HomePage() {
           setIsGenerating={setIsGenerating}
           projectStatus={projectStatus}
           setProjectStatus={setProjectStatus}
-          onArtifactUpdate={setArtifactData}
+          onArtifactUpdate={handleArtifactUpdate}
           refreshProjectContent={refreshProjectContent}
           onTabSwitch={setActiveTab}
           onCollapse={collapseChat}
@@ -393,6 +660,22 @@ export default function HomePage() {
         activeTab={activeTab}
         onTabChange={setActiveTab}
         onCollapse={collapseChat}
+        onEditCard={projectId ? handleEditCard : undefined}
+        reviewNotice={
+          reviewState &&
+          reviewState.projectId === projectId &&
+          reviewState.flags.length > 0 && !(
+            reviewHiddenFor?.projectId === projectId &&
+            reviewHiddenFor.revision >= reviewState.revision
+          )
+            ? buildReviewNoticeText(reviewState.flags, reviewState.revision)
+            : null
+        }
+        onDismissReviewNotice={() => {
+          if (reviewState) {
+            setReviewHiddenFor({ projectId: projectRef.current, revision: reviewState.revision });
+          }
+        }}
         historyPanel={historyPanel}
         onOpenHistory={handleOpenHistory}
         onRefreshHistory={() => projectId && refreshHistory(projectId)}
@@ -400,6 +683,19 @@ export default function HomePage() {
         onBackToHistoryList={handleBackToHistoryList}
         onCloseHistory={handleCloseHistory}
       />
+
+      {/* Card edit drawer — keyed per open so a new session never inherits a
+          previous draft, basis or in-flight save. */}
+      {editSession && editSession.projectId === projectId && (
+        <CardEditDrawer
+          key={editSession.seq}
+          session={editSession}
+          onSave={handleSaveCard}
+          onSaved={handleCardSaved}
+          onDiscard={() => setEditSession(null)}
+          onReloadLatest={handleReloadLatestCard}
+        />
+      )}
     </div>
   );
 }

@@ -5,9 +5,9 @@ import {
   FileText, Users, Map, Palette, Film, Eye,
   Download, ChevronRight, History,
   CheckCircle2, AlertCircle, Loader2,
-  Sun, Moon,
+  Sun, Moon, TriangleAlert, X,
 } from "lucide-react";
-import { ArtifactData, renderArtifactContent } from "./ArtifactContent";
+import { ArtifactData, EditCardHandler, renderArtifactContent } from "./ArtifactContent";
 import VersionHistory, { HistoryPanelState } from "./VersionHistory";
 import { useTheme } from "./ThemeProvider";
 
@@ -29,6 +29,9 @@ interface ArtifactPanelProps {
   activeTab: string;
   onTabChange: (tab: string) => void;
   onCollapse: () => void;
+  onEditCard?: EditCardHandler;
+  reviewNotice: string | null;
+  onDismissReviewNotice: () => void;
   historyPanel: HistoryPanelState;
   onOpenHistory: () => void;
   onRefreshHistory: () => void;
@@ -52,6 +55,7 @@ function iconBtnStyle(enabled: boolean): React.CSSProperties {
 export default function ArtifactPanel({
   projectId, artifactData, projectStatus,
   activeTab, onTabChange, onCollapse,
+  onEditCard, reviewNotice, onDismissReviewNotice,
   historyPanel, onOpenHistory, onRefreshHistory,
   onSelectHistoryVersion, onBackToHistoryList, onCloseHistory,
 }: ArtifactPanelProps) {
@@ -156,7 +160,20 @@ export default function ArtifactPanel({
             onClose={onCloseHistory}
           />
         ) : (
-          renderArtifactContent(activeTab, artifactData)
+          <>
+            {reviewNotice && (
+              <div className="review-banner" data-testid="review-notice" role="status">
+                <TriangleAlert size={14} style={{ flexShrink: 0, color: "var(--warning)" }} />
+                <span style={{ flex: 1 }}>{reviewNotice}</span>
+                <button className="btn-ghost" data-testid="dismiss-review-notice"
+                  aria-label="关闭复核提示" onClick={onDismissReviewNotice}
+                  style={{ width: 26, height: 26, flexShrink: 0 }}>
+                  <X size={13} />
+                </button>
+              </div>
+            )}
+            {renderArtifactContent(activeTab, artifactData, onEditCard)}
+          </>
         )}
       </div>
 
