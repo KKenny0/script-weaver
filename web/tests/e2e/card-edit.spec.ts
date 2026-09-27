@@ -10,6 +10,7 @@ import {
   release,
   seedCardsProject,
   seedProject,
+  seedRun,
   ungate,
   waitForHeld,
 } from "./helpers";
@@ -451,4 +452,205 @@ test("light theme and a narrow viewport complete an edit", async ({ page, reques
 
   const after = await fetchProject(request, p.project_id);
   expect(after.characters.find((c: any) => c.id === "char_e2e_01").motivation).toBe("让灯永远不灭");
+});
+
+
+// ── Review round 2: async ordering, reload isolation, data-backed review ──
+
+
+/** Drive the editor into a conflict: the backend already holds a newer
+ * save (r3, name LATEST) while the drawer drafts on the r2 basis. */
+async function openConflictedEditor(page: Page, request: any, title: string) {
+  const p = await seedProject(request, title);
+  await seedCardsProject(p.project_id);
+  await installGate(page);
+  await openCardProject(page, p.project_id);
+  await request.patch(
+    `http://127.0.0.1:8310/api/projects/${p.project_id}/artifacts/characters/char_e2e_01`,
+    { data: { expected_revision: 2, changes: { name: "LATEST" } } },
+  );
+  await page.getByTestId("edit-card-characters-char_e2e_01").click();
+  await page.getByTestId("field-name").fill("OLD DRAFT");
+  await page.getByTestId("save-card").click();
+  await expect(page.getByTestId("drawer-conflict")).toBeVisible();
+  return p;
+}
+
+
+test("reload close reopen: name and basis both come from the latest snapshot", async ({ page, request }) => {
+  const p = await openConflictedEditor(page, request, "重载配对");
+
+  await page.getByTestId("reload-latest").click();
+  await expect(page.getByTestId("field-name")).toHaveValue("LATEST");
+  await expect(page.getByTestId("drawer-basis")).toContainText("r3");
+
+  // Close and reopen: the adopted snapshot (not a stale pair) feeds the editor.
+  await page.getByTestId("close-drawer").click();
+  await expect(page.getByTestId("card-edit-drawer")).toHaveCount(0);
+  await page.getByTestId("edit-card-characters-char_e2e_01").click();
+  await expect(page.getByTestId("drawer-basis")).toContainText("r3");
+  await expect(page.getByTestId("field-name")).toHaveValue("LATEST", { timeout: 1000 });
+  expect(await fetchProject(request, p.project_id)).toBeTruthy();
+});
+
+
+test("abandoned reload must not replace a newer draft or its basis", async ({ page, request }) => {
+  const p = await openConflictedEditor(page, request, "废弃重载");
+  const key = `GET /projects/${p.project_id}`;
+
+  await gate(page, key);
+  await page.getByTestId("reload-latest").click();
+  await waitForHeld(page, key);
+  // The reload is launched from THIS edit session; abandon it: close, then
+  // reopen the card and start a fresh draft.
+  await page.getByTestId("close-drawer").click();
+  await page.getByTestId("confirm-discard").click();
+  await expect(page.getByTestId("card-edit-drawer")).toHaveCount(0);
+  await page.getByTestId("edit-card-characters-char_e2e_01").click();
+  await page.getByTestId("field-name").fill("NEW DRAFT");
+
+  await release(page, key);
+  // The late reload belongs to a dead edit session: the fresh draft keeps
+  // its own open-time basis (r2) — the reload must not re-basis it to r3.
+  await page.waitForTimeout(300);
+  await expect(page.getByTestId("drawer-basis")).toContainText("r2");
+  await expect(page.getByTestId("field-name")).toHaveValue("NEW DRAFT", { timeout: 1000 });
+  await expect(page.getByTestId("drawer-error")).toHaveCount(0);
+  await expect(page.getByTestId("drawer-conflict")).toHaveCount(0);
+});
+
+
+test("a closed drawer is not reopened by a late reload response", async ({ page, request }) => {
+  const p = await openConflictedEditor(page, request, "迟到重载不开抽屉");
+  const key = `GET /projects/${p.project_id}`;
+
+  await gate(page, key);
+  await page.getByTestId("reload-latest").click();
+  await waitForHeld(page, key);
+  await page.getByTestId("close-drawer").click();
+  await page.getByTestId("confirm-discard").click();
+  await expect(page.getByTestId("card-edit-drawer")).toHaveCount(0);
+
+  await release(page, key);
+  await page.waitForTimeout(300);
+  await expect(page.getByTestId("card-edit-drawer")).toHaveCount(0);
+  await expect(page.getByTestId("drawer-error")).toHaveCount(0);
+});
+
+
+test("an abandoned reload's failure is not shown to the new session", async ({ page, request }) => {
+  const p = await openConflictedEditor(page, request, "重载失败隔离");
+  const key = `GET /projects/${p.project_id}`;
+
+  await gate(page, key);
+  await page.getByTestId("reload-latest").click();
+  await waitForHeld(page, key);
+  await page.getByTestId("close-drawer").click();
+  await page.getByTestId("confirm-discard").click();
+  await expect(page.getByTestId("card-edit-drawer")).toHaveCount(0);
+  await page.getByTestId("edit-card-characters-char_e2e_01").click();
+  await page.getByTestId("field-name").fill("新草稿不受旧失败影响");
+
+  await gateRespond(page, key, 500, { detail: { message: "模拟读取失败" } });
+  await release(page, key);
+  await page.waitForTimeout(300);
+  // The failure belonged to the abandoned reload — no error in this session.
+  await expect(page.getByTestId("drawer-error")).toHaveCount(0);
+  await expect(page.getByTestId("field-name")).toHaveValue("新草稿不受旧失败影响");
+});
+
+
+test("pending-review status survives reload (restored from persisted data)", async ({ page, request }) => {
+  const p = await seedProject(request, "复核状态持久");
+  await seedCardsProject(p.project_id);
+  await openCardProject(page, p.project_id);
+
+  await openEditor(page, "edit-card-characters-char_e2e_01");
+  await page.getByTestId("field-name").fill("CHANGED");
+  await page.getByTestId("save-card").click();
+  await expect(page.getByTestId("review-notice")).toContainText("待复核");
+
+  // A fresh load must restore the pending-review facts from the project GET.
+  await page.reload();
+  await page.locator(".segment-tab", { hasText: "主角列表" }).click();
+  await expect(page.getByTestId("review-notice")).toContainText("待复核", { timeout: 1500 });
+  await expect(page.getByTestId("review-notice")).toContainText("剧本");
+
+  // Opening an editor and cancelling must not hide the unhandled status.
+  await page.getByTestId("edit-card-characters-char_e2e_01").click();
+  await expect(page.getByTestId("card-edit-drawer")).toBeVisible();
+  await page.getByTestId("cancel-edit").click();
+  await expect(page.getByTestId("card-edit-drawer")).toHaveCount(0);
+  await expect(page.getByTestId("review-notice")).toBeVisible();
+});
+
+
+test("duplicate relationship names are refused and keep every row", async ({ page, request }) => {
+  const p = await seedProject(request, "关系重名");
+  await seedCardsProject(p.project_id);
+  await openCardProject(page, p.project_id);
+
+  await openEditor(page, "edit-card-characters-char_e2e_01");
+  const existingKey = await page.getByTestId("field-relationship_map-0-key").inputValue();
+  await page.getByTestId("add-relationship_map").click();
+  await page.getByTestId("field-relationship_map-1-key").fill(existingKey);
+  await page.getByTestId("field-relationship_map-1-value").fill("overwriting relation");
+  await page.getByTestId("save-card").click();
+
+  await expect(page.getByTestId("drawer-error")).toBeVisible({ timeout: 1200 });
+  await expect(page.getByTestId("drawer-error")).toContainText("重复");
+  // Both rows are still there for fixing, nothing was submitted.
+  await expect(page.getByTestId("field-relationship_map-0-key")).toHaveValue(existingKey);
+  await expect(page.getByTestId("field-relationship_map-1-value")).toHaveValue("overwriting relation");
+  const before = await fetchProject(request, p.project_id);
+  expect(before.review.review_flags ?? []).toEqual([]);
+
+  // Fixing the name unblocks the save.
+  await page.getByTestId("field-relationship_map-1-key").fill("小舟");
+  await page.getByTestId("save-card").click();
+  await expect(page.getByTestId("card-edit-drawer")).toHaveCount(0);
+  const after = await fetchProject(request, p.project_id);
+  expect(after.characters.find((c: any) => c.id === "char_e2e_01").relationship_map).toEqual({
+    [existingKey]: "师徒",
+    小舟: "overwriting relation",
+  });
+});
+
+
+test("old content GET must not overwrite a successful card save", async ({ page, request }) => {
+  const p = await seedProject(request, "旧GET不覆盖");
+  await seedCardsProject(p.project_id);
+  await seedRun(p.project_id, "succeeded");
+  const old = await (await request.get(`http://127.0.0.1:8310/api/projects/${p.project_id}`)).json();
+
+  // Hold the SECOND content GET (the chat's run-outcome refresh): it was
+  // issued before the save and must lose to it.
+  let n = 0;
+  let held: any;
+  let notify!: () => void;
+  const pending = new Promise<void>((r) => (notify = r));
+  await page.route(`**/api/projects/${p.project_id}`, async (route) => {
+    if (++n === 2) {
+      held = route;
+      notify();
+      return;
+    }
+    await route.continue();
+  });
+  await openApp(page, `/?project=${p.project_id}`);
+  await pending;
+
+  await page.locator(".segment-tab", { hasText: "主角列表" }).click();
+  await page.getByTestId("edit-card-characters-char_e2e_01").click();
+  await page.getByTestId("field-name").fill("JUST SAVED");
+  await page.getByTestId("save-card").click();
+  await expect(page.getByTestId("card-edit-drawer")).toHaveCount(0);
+
+  // Now the stale GET resolves with pre-save content.
+  await held.fulfill({ json: old });
+  await page.waitForTimeout(300);
+  await page.getByTestId("edit-card-characters-char_e2e_01").click();
+  await expect(page.getByTestId("field-name")).toHaveValue("JUST SAVED", { timeout: 1500 });
+  // The editor's basis is the saved revision, not the stale snapshot's.
+  await expect(page.getByTestId("drawer-basis")).toContainText(`r${old.revision + 1}`);
 });

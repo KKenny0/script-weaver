@@ -30,6 +30,7 @@ validate) an in-memory ProjectState; the caller owns the transaction.
 from __future__ import annotations
 
 import math
+import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
@@ -126,6 +127,10 @@ _ID_ATTRIBUTE = {"characters": "id", "scenes": "id", "shots": "shot_id"}
 # Reason recorded on every review flag produced by a manual upstream edit.
 REVIEW_REASON = "upstream_manual_edit"
 
+# Largest float the platform can represent: beyond this a JSON integer is
+# not a usable duration (and math.isfinite would overflow converting it).
+_MAX_FLOAT = sys.float_info.max
+
 
 class CardEditError(ProjectStoreError):
     """Base class for manual card-edit refusals."""
@@ -193,6 +198,12 @@ def _validate_value(field: str, spec: Any, value: Any) -> None:
         # bool is an int subclass — "true" is not a duration.
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             raise InvalidCardChangeError(f"{where}必须是数字", field=field)
+        # A JSON integer has arbitrary precision: converting an oversized one
+        # to float overflows, so bounds-check it before isfinite touches it.
+        if isinstance(value, int) and (
+            value > _MAX_FLOAT or value < -_MAX_FLOAT
+        ):
+            raise InvalidCardChangeError(f"{where}数值过大", field=field)
         if not math.isfinite(value):
             raise InvalidCardChangeError(f"{where}必须是有限数字", field=field)
         if value <= 0:
@@ -244,10 +255,13 @@ def _coerce_value(spec: Any, value: Any) -> Any:
     Canonical enum strings become enum members — a plain ``setattr`` of the
     string would leave a raw str where the model (and downstream readers of
     this state) expect the enum, even though the serialized JSON would look
-    identical.
+    identical. JSON integers become floats so derived computations (the
+    shot-total sum) stay in float space where overflow is observable.
     """
     if isinstance(spec, type) and issubclass(spec, Enum):
         return spec(value)
+    if spec is _POSITIVE_NUMBER:
+        return float(value)
     return value
 
 
@@ -325,6 +339,13 @@ def apply_card_changes(
 
     if kind == "shots" and state.storyboard is not None:
         state.storyboard.compute_totals()
+        # Each duration is finite, but their SUM may not be (1e308 + 1e308).
+        # Refuse before anything is written: the caller's transaction rolls
+        # back whole, leaving history and review metadata untouched.
+        if not math.isfinite(state.storyboard.total_estimated_duration):
+            raise InvalidCardChangeError(
+                "镜头时长合计溢出，无法保存；请检查各镜头时长是否过大。"
+            )
 
     return CardEditOutcome(
         changed=True,

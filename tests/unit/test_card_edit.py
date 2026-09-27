@@ -417,6 +417,35 @@ def flags_for(review: dict, artifact: str) -> list[dict]:
             if f.get("artifact") == artifact]
 
 
+async def test_project_get_returns_persisted_review_facts(client):
+    """GET must carry the same review facts the save wrote — before and
+    after a backend restart, and as an empty set for flagless projects
+    (review round 2: the pending-review display restores from data)."""
+    api, c = client
+    p = await seed_card_project(c, api)
+    pid = p["project_id"]
+
+    # Before any manual edit: no flags, but the field exists and is empty.
+    before = (await c.get(f"/api/projects/{pid}")).json()
+    assert before.get("review", {}).get("review_flags", []) == []
+
+    r = await patch_card(c, pid, "characters", "char_a", {"name": "阿云"}, 2)
+    assert r.status_code == 200
+    saved_review = r.json()["review"]
+    assert len(saved_review["review_flags"]) == 3
+
+    after = (await c.get(f"/api/projects/{pid}")).json()
+    assert after["review"] == saved_review
+
+    restarted = restart_store(api).get_required(pid)
+    assert restarted.review == saved_review
+
+    # A second project never sees the first one's flags.
+    other = await create_project(c, "别的项目", "隔离项目")
+    other_body = (await c.get(f"/api/projects/{other['project_id']}")).json()
+    assert other_body.get("review", {}).get("review_flags", []) == []
+
+
 async def test_review_flags_cover_existing_downstream_only(client):
     api, c = client
     p = await seed_card_project(c, api)
@@ -522,6 +551,50 @@ async def test_review_merge_preserves_other_flags_and_refreshes_retriggered(clie
 
 
 # ── Coexistence with generation runs (#14/#15 behaviour) ───
+
+
+async def test_shot_total_overflow_rejected_before_commit(client):
+    """Two 1e308 shots overflow the total: the second save is a controlled
+    422 and the transaction rolls back — the project, its history and its
+    review metadata all stay readable and unchanged (review round 2)."""
+    api, c = client
+    p = await seed_card_project(c, api)
+    pid = p["project_id"]
+
+    # A single 1e308 duration is a finite positive number — allowed.
+    r = await patch_card(c, pid, "shots", "shot_01", {"duration_seconds": 1e308}, 2)
+    assert r.status_code == 200, r.text
+    assert r.json()["changed"] is True
+    baseline = await write_facts(api, pid)
+
+    # The second one overflows the SUM: refuse before the tx commits.
+    r = await patch_card(c, pid, "shots", "shot_02", {"duration_seconds": 1e308}, 3)
+    assert r.status_code == 422, r.text
+    assert r.json()["detail"]["code"] == "invalid_card_change"
+    await assert_zero_writes(api, c, pid, baseline)
+
+    # The database reopens fine and the stored total is still finite.
+    restarted = restart_store(api).get_required(pid)
+    assert restarted.state.storyboard.total_estimated_duration == 1e308 + 2
+    after = (await c.get(f"/api/projects/{pid}")).json()
+    assert after["storyboard"]["total_estimated_duration"] == 1e308 + 2
+
+
+async def test_huge_integer_duration_is_controlled_422_not_500(client):
+    """An oversized JSON integer must be refused by the value check itself —
+    never via a float-conversion OverflowError escaping as a 500."""
+    api, c = client
+    p = await seed_card_project(c, api)
+    pid = p["project_id"]
+    baseline = await write_facts(api, pid)
+
+    r = await c.patch(
+        patch_url(pid, "shots", "shot_01"),
+        json={"changes": {"duration_seconds": 10 ** 400}, "expected_revision": 2},
+    )
+    assert r.status_code == 422, r.text
+    assert r.json()["detail"]["code"] == "invalid_card_change"
+    await assert_zero_writes(api, c, pid, baseline)
 
 
 async def test_manual_save_wins_over_late_generation_result(client):

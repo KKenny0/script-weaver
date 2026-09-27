@@ -202,16 +202,10 @@ export default function ChatPanel({
   // ── Handlers ──────────────────────────────────
 
   const applyFullState = useCallback((fullState: any) => {
-    onArtifactUpdate({
-      refined_idea: fullState.refined_idea,
-      outline: fullState.outline,
-      characters: fullState.characters,
-      scenes: fullState.scenes,
-      art_style: fullState.art_style,
-      script: fullState.script,
-      storyboard: fullState.storyboard,
-      visual_highlights: fullState.visual_highlights,
-    });
+    // Hand the WHOLE snapshot to the parent: the page adopts artifacts,
+    // revision and review flags from one payload (round 2) instead of the
+    // panel re-picking a subset that could pair with a newer revision.
+    onArtifactUpdate(fullState);
   }, [onArtifactUpdate]);
 
   // ── Unified run-outcome presentation (review R3: one path, no drift) ──

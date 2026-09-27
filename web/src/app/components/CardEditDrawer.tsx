@@ -230,16 +230,33 @@ function buildChanges(
       }
     } else if (f.type === "pairs") {
       const rows = dv as { key: string; value: string }[];
-      const built: Record<string, string> = {};
+      // Exact-name duplicates are refused BEFORE building the object: a
+      // plain object build would let the later row silently overwrite the
+      // earlier one (round 2 review). All rows stay on screen for fixing.
+      const seen = new Set<string>();
+      let duplicate: string | null = null;
       for (const row of rows) {
-        if (!row.key && row.value) {
-          errors.push(`「${f.label}」有一行缺少关系名称`);
-        } else if (row.key) {
-          built[row.key] = row.value;
+        if (!row.key) {
+          if (row.value) errors.push(`「${f.label}」有一行缺少关系名称`);
+          continue;
         }
+        if (seen.has(row.key) && duplicate === null) duplicate = row.key;
+        seen.add(row.key);
       }
+      if (duplicate !== null) {
+        errors.push(
+          `「${f.label}」存在重复的名称「${duplicate}」，保存会覆盖已有关系，请先修正后再保存`,
+        );
+      }
+      // Object.fromEntries defines own properties only, so plain-string keys
+      // like "__proto__" stay data — a literal build would not.
+      const built: Record<string, string> = Object.fromEntries(
+        rows.filter((r) => r.key).map((r) => [r.key, r.value]),
+      );
       const base = current ?? {};
-      if (JSON.stringify(built) !== JSON.stringify(base)) changes[f.name] = built;
+      if (errors.length === 0 && JSON.stringify(built) !== JSON.stringify(base)) {
+        changes[f.name] = built;
+      }
     } else if (f.type === "duration") {
       const text = String(dv).trim();
       if (!text) {

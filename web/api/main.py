@@ -1233,6 +1233,7 @@ async def get_project(project_id: str) -> dict:
         created_at=record.created_at,
         updated_at=record.updated_at,
         status="running" if active_run is not None else record.state.meta.status.value,
+        review=record.review,
     )
 
 
@@ -1320,9 +1321,9 @@ async def edit_card(
         created_at=record.created_at,
         updated_at=record.updated_at,
         status=record.state.meta.status.value,
+        review=record.review,
     )
     body["changed"] = changed
-    body["review"] = record.review
     return body
 
 
@@ -1749,8 +1750,15 @@ def _serialize_project(
     status: str,
     source: str | None = None,
     summary: str | None = None,
+    review: dict[str, Any] | None = None,
 ) -> dict:
-    """Serialize a ProjectState for the frontend (field contract preserved)."""
+    """Serialize a ProjectState for the frontend (field contract preserved).
+
+    ``review`` carries the persisted pending-review metadata (ticket #16
+    round 2): present whenever the caller has a record at hand, so the
+    pending-review display restores from data on open/refresh. Projects
+    without flags answer an empty set — never fabricated ones.
+    """
     result = {
         "project_id": project_id,
         "status": status,
@@ -1782,6 +1790,8 @@ def _serialize_project(
         result["source"] = source
     if summary is not None:
         result["summary"] = summary
+    if review is not None:
+        result["review"] = review
     return result
 
 
