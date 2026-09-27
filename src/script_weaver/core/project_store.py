@@ -34,7 +34,7 @@ from typing import Any
 from script_weaver.core.resume import update_checkpoint_envelope
 from script_weaver.core.types import ProjectState
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # Run statuses that mean "an in-memory task may still be driving this run".
 RUN_ACTIVE_STATUSES = ("running", "stopping")
@@ -97,6 +97,23 @@ _SCHEMA_STATEMENTS = (
     CREATE INDEX IF NOT EXISTS idx_generation_runs_project
         ON generation_runs (project_id, created_at DESC)
     """,
+    """
+    CREATE TABLE IF NOT EXISTS card_candidates (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        run_id TEXT NOT NULL UNIQUE REFERENCES generation_runs(id) ON DELETE CASCADE,
+        kind TEXT NOT NULL,
+        target_id TEXT NOT NULL,
+        base_revision INTEGER NOT NULL,
+        original_json TEXT NOT NULL,
+        proposed_json TEXT NOT NULL,
+        changes_json TEXT NOT NULL,
+        status TEXT NOT NULL CHECK(status IN ('ready','stale','accepted','rejected')),
+        accepted_revision INTEGER,
+        created_at TEXT NOT NULL
+    )
+    """,
+
 )
 
 
@@ -615,6 +632,13 @@ class ProjectStore:
         ``changed=False`` the project is returned untouched — still fully
         validated, but without a new revision, version or review flag.
         """
+        with self._write_tx() as conn:
+            return self._save_card_edit(conn, project_id, kind, target_id, changes, expected_revision)
+
+    def _save_card_edit(
+        self, conn: sqlite3.Connection, project_id: str, kind: str,
+        target_id: str, changes: dict[str, Any], expected_revision: int,
+    ) -> tuple[ProjectRecord, bool]:
         # Function-level import: card_edit imports this module's error base
         # class, so a module-level import would be circular.
         from script_weaver.core.card_edit import (
@@ -624,44 +648,43 @@ class ProjectStore:
             merge_review_flags,
         )
 
-        with self._write_tx() as conn:
-            row = conn.execute(
-                "SELECT id, revision, title, state_json, review_json, auto_approve,"
-                " skill_bindings_json, created_at, updated_at"
-                " FROM projects WHERE id = ?",
-                (project_id,),
-            ).fetchone()
-            if row is None:
-                raise ProjectNotFoundError(f"Project '{project_id}' not found")
-            if row["revision"] != expected_revision:
-                raise RevisionConflictError(
-                    f"期望 revision {expected_revision} 已过期，当前为 {row['revision']}",
-                    current_revision=row["revision"],
-                )
-            state = ProjectState.model_validate_json(row["state_json"])
-            outcome = apply_card_changes(state, kind, target_id, changes)
-            current_review = json.loads(row["review_json"] or "{}")
-            if not outcome.changed:
-                record = self._record_from_row(row, state, row["revision"],
-                                               row["state_json"], current_review,
-                                               row["updated_at"])
-                return record, False
-            review = merge_review_flags(
-                current_review,
-                build_review_flags(
-                    kind, target_id, outcome.label,
-                    since_revision=expected_revision + 1,
-                    affected_artifacts=outcome.affected_artifacts,
-                ),
+        row = conn.execute(
+            "SELECT id, revision, title, state_json, review_json, auto_approve,"
+            " skill_bindings_json, created_at, updated_at"
+            " FROM projects WHERE id = ?",
+            (project_id,),
+        ).fetchone()
+        if row is None:
+            raise ProjectNotFoundError(f"Project '{project_id}' not found")
+        if row["revision"] != expected_revision:
+            raise RevisionConflictError(
+                f"期望 revision {expected_revision} 已过期，当前为 {row['revision']}",
+                current_revision=row["revision"],
             )
-            new_revision, new_state_json, updated_at = self._write_new_state(
-                conn, project_id, state, expected_revision, row["title"],
-                json.dumps(review, ensure_ascii=False), "manual",
-                f"编辑{KIND_LABELS[kind]}：{outcome.label}",
-            )
-            record = self._record_from_row(row, state, new_revision,
-                                           new_state_json, review, updated_at)
-            return record, True
+        state = ProjectState.model_validate_json(row["state_json"])
+        outcome = apply_card_changes(state, kind, target_id, changes)
+        current_review = json.loads(row["review_json"] or "{}")
+        if not outcome.changed:
+            record = self._record_from_row(row, state, row["revision"],
+                                           row["state_json"], current_review,
+                                           row["updated_at"])
+            return record, False
+        review = merge_review_flags(
+            current_review,
+            build_review_flags(
+                kind, target_id, outcome.label,
+                since_revision=expected_revision + 1,
+                affected_artifacts=outcome.affected_artifacts,
+            ),
+        )
+        new_revision, new_state_json, updated_at = self._write_new_state(
+            conn, project_id, state, expected_revision, row["title"],
+            json.dumps(review, ensure_ascii=False), "manual",
+            f"编辑{KIND_LABELS[kind]}：{outcome.label}",
+        )
+        record = self._record_from_row(row, state, new_revision,
+                                       new_state_json, review, updated_at)
+        return record, True
 
     @staticmethod
     def _record_from_row(
@@ -872,6 +895,14 @@ class ProjectStore:
                         "同一 request_key 已绑定其他输入，提交被拒绝。", run=run
                     )
                 return run, False
+            if kind == "card_candidate":
+                from script_weaver.core.card_edit import card_snapshot
+                project = conn.execute("SELECT revision, state_json FROM projects WHERE id = ?", (project_id,)).fetchone()
+                if project is None:
+                    raise ProjectNotFoundError(f"Project '{project_id}' not found")
+                if project["revision"] != base_revision or project["state_json"] != base_state_json:
+                    raise RevisionConflictError("项目已变化，请载入最新内容后重新发起。", project["revision"])
+                card_snapshot(ProjectState.model_validate_json(project["state_json"]), request["kind"], request["target_id"])
             if request.get("resume_of") is not None:
                 project = conn.execute(
                     "SELECT revision, state_json FROM projects WHERE id = ?", (project_id,)
@@ -1106,11 +1137,11 @@ class ProjectStore:
         return run
 
     def latest_generation_run(self, project_id: str) -> GenerationRun | None:
-        """The project's most recent run of any status."""
+        """The latest full-generation run; card candidates have their own history."""
         with self._lock:
             row = self._conn.execute(
                 f"SELECT {self._RUN_COLUMNS} FROM generation_runs"
-                " WHERE project_id = ? ORDER BY created_at DESC, rowid DESC"
+                " WHERE project_id = ? AND kind = 'generate' ORDER BY created_at DESC, rowid DESC"
                 " LIMIT 1",
                 (project_id,),
             ).fetchone()
@@ -1216,6 +1247,76 @@ class ProjectStore:
                     )
             return len(stale)
 
+    def list_card_candidates(self, project_id: str) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute("SELECT * FROM card_candidates WHERE project_id = ? ORDER BY created_at DESC, rowid DESC", (project_id,)).fetchall()
+        return [self._candidate_dict(row) for row in rows]
+
+    @staticmethod
+    def _candidate_dict(row) -> dict:
+        result = dict(row)
+        for field in ("original", "proposed", "changes"):
+            result[field] = json.loads(result.pop(field + "_json"))
+        return result
+
+    def candidate_runs(self, project_id: str) -> list[GenerationRun]:
+        with self._lock:
+            rows = self._conn.execute(f"SELECT {self._RUN_COLUMNS} FROM generation_runs WHERE project_id = ? AND kind = 'card_candidate' ORDER BY created_at DESC, rowid DESC", (project_id,)).fetchall()
+        return [self._row_to_run(row) for row in rows]
+
+    def complete_card_candidate(self, run_id: str, output: dict) -> dict:
+        from script_weaver.core.card_edit import card_snapshot, validate_candidate_output
+        with self._write_tx() as conn:
+            row = conn.execute(f"SELECT {self._RUN_COLUMNS} FROM generation_runs WHERE id = ?", (run_id,)).fetchone()
+            if row is None or row["kind"] != "card_candidate" or row["status"] != "running":
+                raise RunStageRejectedError("候选运行已停止，结果未保存。")
+            run = self._row_to_run(row)
+            state = ProjectState.model_validate_json(run.base_state_json)
+            kind, target_id = run.request["kind"], run.request["target_id"]
+            original = card_snapshot(state, kind, target_id)
+            validate_candidate_output(state, kind, target_id, output)
+            proposed = card_snapshot(state, kind, target_id)
+            revision = conn.execute("SELECT revision FROM projects WHERE id = ?", (run.project_id,)).fetchone()[0]
+            candidate_id = str(uuid.uuid4())
+            conn.execute("INSERT INTO card_candidates VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)", (
+                candidate_id, run.project_id, run_id, kind, target_id, run.base_revision,
+                json.dumps(original, ensure_ascii=False), json.dumps(proposed, ensure_ascii=False),
+                json.dumps(output["changes"], ensure_ascii=False),
+                "ready" if revision == run.base_revision else "stale", _utcnow(),
+            ))
+            conn.execute("UPDATE generation_runs SET status = 'succeeded', result_summary_json = ?, updated_at = ? WHERE id = ?", (json.dumps({"candidate_id": candidate_id}), _utcnow(), run_id))
+            return self._candidate_dict(conn.execute("SELECT * FROM card_candidates WHERE id = ?", (candidate_id,)).fetchone())
+
+    def decide_card_candidate(self, project_id: str, candidate_id: str, *, accept: bool) -> tuple[dict, ProjectRecord | None]:
+        from script_weaver.core.card_edit import card_snapshot
+        with self._write_tx() as conn:
+            row = conn.execute("SELECT * FROM card_candidates WHERE id = ? AND project_id = ?", (candidate_id, project_id)).fetchone()
+            if row is None:
+                raise ProjectNotFoundError("候选不存在于此项目。")
+            candidate = self._candidate_dict(row)
+            if candidate["status"] == "accepted":
+                if not accept:
+                    raise ProjectStoreError("候选已采用，不能放弃。")
+                # Return the original adoption snapshot even after subsequent saves.
+                version = conn.execute("SELECT v.*, p.auto_approve, p.skill_bindings_json, p.id, v.created_at AS updated_at FROM project_versions v JOIN projects p ON p.id = v.project_id WHERE v.project_id = ? AND v.revision = ?", (project_id, candidate["accepted_revision"])).fetchone()
+                return candidate, self._row_to_record(version)
+            if not accept:
+                conn.execute("UPDATE card_candidates SET status = 'rejected' WHERE id = ?", (candidate_id,))
+                candidate["status"] = "rejected"
+                return candidate, None
+            project = conn.execute("SELECT revision, state_json FROM projects WHERE id = ?", (project_id,)).fetchone()
+            if candidate["status"] != "ready" or project["revision"] != candidate["base_revision"]:
+                raise RevisionConflictError("候选已过期或已放弃；项目发生变化，请重新发起。", project["revision"])
+            state = ProjectState.model_validate_json(project["state_json"])
+            if card_snapshot(state, candidate["kind"], candidate["target_id"]) != candidate["original"]:
+                raise RevisionConflictError("候选依据与当前卡片不一致，请重新发起。", project["revision"])
+            record, changed = self._save_card_edit(conn, project_id, candidate["kind"], candidate["target_id"], candidate["changes"], candidate["base_revision"])
+            if not changed or card_snapshot(record.state, candidate["kind"], candidate["target_id"]) != candidate["proposed"]:
+                raise ProjectStoreError("候选内容校验失败，未采用。")
+            conn.execute("UPDATE card_candidates SET status = 'accepted', accepted_revision = ? WHERE id = ?", (record.revision, candidate_id))
+            candidate.update(status="accepted", accepted_revision=record.revision)
+            return candidate, record
+
     # ── Internals ─────────────────────────────────────────
 
     def _save(
@@ -1293,4 +1394,5 @@ class ProjectStore:
             (project_id, new_revision, title, state_json, review_json,
              source, summary, now),
         )
+        conn.execute("UPDATE card_candidates SET status = 'stale' WHERE project_id = ? AND status = 'ready'", (project_id,))
         return new_revision, state_json, now

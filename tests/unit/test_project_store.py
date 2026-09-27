@@ -481,7 +481,7 @@ def test_version_one_database_migrates_to_runs_schema(tmp_path):
     try:
         assert store.interrupt_stale_generation_runs() == 0  # table usable
         version = store._conn.execute("PRAGMA user_version").fetchone()[0]
-        assert version == 2
+        assert version == 3
     finally:
         store.close()
 

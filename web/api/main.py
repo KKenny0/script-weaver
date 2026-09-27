@@ -240,6 +240,13 @@ class ReviewConfirmRequest(BaseModel):
     selections: list[ReviewFlagSelection] = Field(min_length=1, max_length=100)
 
 
+class CandidateRequest(BaseModel):
+    model_config = {"extra": "forbid"}
+    expected_revision: int = Field(strict=True, ge=1)
+    instruction: str = Field(min_length=1, max_length=10000)
+    request_key: str = Field(min_length=1, max_length=200)
+
+
 class GenerateRequest(BaseModel):
     """POST /generate body (ticket #14).
 
@@ -542,6 +549,28 @@ class _RunManager:
         )
         return run, True
 
+    async def submit_candidate(self, project_id, kind, target_id, req):
+        from script_weaver.core.card_edit import card_snapshot
+        request = {"kind": kind, "target_id": target_id, "instruction": req.instruction,
+                   "expected_revision": req.expected_revision}
+        if not req.instruction.strip():
+            raise InvalidCardChangeError("修改要求不能为空。")
+        async with self._project_lock(project_id):
+            if project_id in self._refine_projects:
+                raise RunSubmitConflict("run_active", "项目正在生成，请稍后重试。")
+            record = await asyncio.to_thread(self.store.get_required, project_id)
+            card_snapshot(record.state, kind, target_id)
+            run, created = await asyncio.to_thread(
+                self.store.admit_generation_run, project_id, kind="card_candidate",
+                request_key=req.request_key, request=request,
+                request_hash=hash_run_request({"run_kind": "card_candidate", **request}),
+                base_revision=req.expected_revision, base_state_json=record.state_json,
+                checkpoint_json=None,
+            )
+            if created:
+                self._spawn(run.run_id)
+        return run, created
+
     async def resume(
         self, project_id: str, run_id: str, request_key: str | None
     ) -> tuple[GenerationRun, bool]:
@@ -581,6 +610,8 @@ class _RunManager:
             )
             if original is None or original.project_id != project_id:
                 raise ProjectNotFoundError(f"Run '{run_id}' not found")
+            if original.kind != "generate":
+                raise RunSubmitConflict("not_resumable", "卡片候选不能恢复，请重新发起定向修改。", run=original)
             if original.status in RUN_ACTIVE_STATUSES:
                 raise RunSubmitConflict(
                     "run_active",
@@ -787,6 +818,25 @@ class _RunManager:
                 # The run ended before this task got its turn: converge
                 # without ever touching the model.
                 await self._converge_revoked_run(run)
+                return
+            if run.kind == "card_candidate":
+                from script_weaver.agents.card_revision import CardRevisionAgent
+                agent = CardRevisionAgent(run.request["kind"], run.request["target_id"])
+                progress = {"stage": "candidate", "message": "正在生成卡片候选；仍可手工编辑。"}
+                await asyncio.to_thread(self.store.update_generation_run, run_id, last_progress=progress)
+                self.broadcast(run_id, "progress", progress)
+                result = await asyncio.wait_for(
+                    agent.execute(ProjectState.model_validate_json(run.base_state_json), run.request["instruction"]),
+                    timeout=get_settings().agent_timeout_seconds,
+                )
+                if result.get("status") != "success":
+                    raise ValueError(result.get("last_error") or result.get("error") or "候选生成失败")
+                try:
+                    await asyncio.to_thread(self.store.complete_card_candidate, run_id, result["data"])
+                except RunStageRejectedError:
+                    raise PipelineStopped() from None
+                run = await asyncio.to_thread(self.store.get_generation_run_required, run_id)
+                self.broadcast(run_id, "done", _run_done_payload(run))
                 return
             # Engine initialization belongs to the server-owned task: from
             # admission to the terminal state a cancellable task is
@@ -1010,7 +1060,7 @@ class _RunManager:
         except Exception as exc:
             logger.exception("Generation run %s failed", run_id)
             run = await self._settle_terminal(
-                run_id, status="failed", error=f"生成失败：{exc}"
+                run_id, status="failed", error=f"生成失败：{str(exc) or type(exc).__name__}"
             )
             self.broadcast(run_id, "done", _run_done_payload(run))
 
@@ -1185,12 +1235,13 @@ def _serialize_run(run: GenerationRun) -> dict:
     would continue from. Pure local computation — no store or model work.
     """
     completed = run.completed_steps
-    pending = [s for s in GENERATION_STEPS if s not in completed]
+    pending = [s for s in GENERATION_STEPS if s not in completed] if run.kind == "generate" else []
     next_step = pending[0] if pending else None
     return {
         "run_id": run.run_id,
         "project_id": run.project_id,
         "kind": run.kind,
+        "target": {"kind": run.request.get("kind"), "id": run.request.get("target_id")} if run.kind == "card_candidate" else None,
         "request_key": run.request_key,
         "status": run.status,
         "base_revision": run.base_revision,
@@ -1200,7 +1251,7 @@ def _serialize_run(run: GenerationRun) -> dict:
         ],
         "next_step": next_step,
         "next_step_label": GENERATION_STEP_LABELS.get(next_step, next_step) if next_step else None,
-        "content_complete": "finalize" in completed,
+        "content_complete": run.kind == "generate" and "finalize" in completed,
         "last_progress": run.last_progress,
         "error": run.error,
         "result_summary": run.result_summary,
@@ -1212,10 +1263,11 @@ def _serialize_run(run: GenerationRun) -> dict:
 
 def _run_done_payload(run: GenerationRun) -> dict:
     completed = run.completed_steps
-    pending = [s for s in GENERATION_STEPS if s not in completed]
+    pending = [s for s in GENERATION_STEPS if s not in completed] if run.kind == "generate" else []
     next_step = pending[0] if pending else None
     return {
         "run_id": run.run_id,
+        "kind": run.kind,
         "status": run.status,
         "error": run.error,
         "completed_steps": completed,
@@ -1226,7 +1278,7 @@ def _run_done_payload(run: GenerationRun) -> dict:
         "next_step_label": (
             GENERATION_STEP_LABELS.get(next_step, next_step) if next_step else None
         ),
-        "content_complete": "finalize" in completed,
+        "content_complete": run.kind == "generate" and "finalize" in completed,
         "result_summary": run.result_summary,
         **_growth_outcome(run),
     }
@@ -1369,6 +1421,48 @@ async def edit_card(
         review=record.review,
     )
     body["changed"] = changed
+    return body
+
+
+@app.post("/api/projects/{project_id}/artifacts/{kind}/{target_id}/candidates")
+async def submit_card_candidate(project_id: str, kind: Literal["characters", "scenes", "shots"], target_id: str, req: CandidateRequest):
+    try:
+        run, created = await _runs().submit_candidate(project_id, kind, target_id, req)
+    except (RunSubmitConflict, ActiveRunConflictError, RequestKeyConflictError) as exc:
+        raise HTTPException(409, detail={"code": "candidate_run_conflict", "message": str(exc)}) from exc
+    except (InvalidCardChangeError, DuplicateTargetIdError) as exc:
+        raise HTTPException(422, detail={"message": str(exc)}) from exc
+    except ProjectStoreError as exc:
+        raise _store_error(exc) from exc
+    return {"run": _serialize_run(run), "created": created}
+
+
+@app.get("/api/projects/{project_id}/candidates")
+async def list_card_candidates(project_id: str):
+    try:
+        await asyncio.to_thread(_store().get_required, project_id)
+        candidates = await asyncio.to_thread(_store().list_card_candidates, project_id)
+        runs = await asyncio.to_thread(_store().candidate_runs, project_id)
+    except ProjectStoreError as exc:
+        raise _store_error(exc) from exc
+    return {"candidates": candidates, "runs": [_serialize_run(run) for run in runs]}
+
+
+@app.post("/api/projects/{project_id}/candidates/{candidate_id}/{decision}")
+async def decide_card_candidate(project_id: str, candidate_id: str, decision: Literal["accept", "reject"]):
+    try:
+        candidate, record = await asyncio.to_thread(_store().decide_card_candidate, project_id, candidate_id, accept=decision == "accept")
+    except RevisionConflictError as exc:
+        raise _store_error(exc) from exc
+    except ProjectNotFoundError as exc:
+        raise _store_error(exc) from exc
+    except ProjectStoreError as exc:
+        raise HTTPException(422, detail={"message": str(exc)}) from exc
+    body = {"candidate": candidate}
+    if record:
+        body.update(_serialize_project(record.project_id, record.state, revision=record.revision,
+                    created_at=record.created_at, updated_at=record.updated_at,
+                    status=record.state.meta.status.value, review=record.review))
     return body
 
 
