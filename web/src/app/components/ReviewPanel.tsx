@@ -25,6 +25,10 @@ export interface ReviewPanelSession {
 }
 
 export interface ReviewSelection {
+  /** Mandatory ownership (review round 2): two projects can hold
+   * byte-identical flags, so the decision states the project it was made
+   * in — taken from this panel's session, never guessed. */
+  project_id: string;
   artifact: string;
   reason: string;
   upstream_kind: string;
@@ -77,8 +81,9 @@ function selectionKeyOf(flag: any): string {
   ]);
 }
 
-function toSelection(flag: any): ReviewSelection {
+function toSelection(flag: any, projectId: string): ReviewSelection {
   return {
+    project_id: projectId,
     artifact: String(flag.artifact),
     reason: String(flag.reason),
     upstream_kind: String(flag.upstream_kind ?? ""),
@@ -102,7 +107,7 @@ export default function ReviewPanel({
   onClose,
   onViewArtifact,
 }: ReviewPanelProps) {
-  const { flags, revision } = session;
+  const { flags, revision, projectId } = session;
   const [selected, setSelected] = useState<Set<string>>(
     () => new Set(flags.map(selectionKeyOf)),
   );
@@ -160,7 +165,7 @@ export default function ReviewPanel({
     setConflict(null);
     const selections = flags
       .filter((f) => selected.has(selectionKeyOf(f)))
-      .map(toSelection);
+      .map((f) => toSelection(f, projectId));
     const result = await onConfirm(selections);
     if (result.type === "superseded") return; // session moved on; the panel is already gone
     setPhase("idle");

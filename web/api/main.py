@@ -209,11 +209,16 @@ class ReviewFlagSelection(BaseModel):
     new artifacts, rewrites flags or sends a whole ``review`` object.
     ``extra="forbid"`` keeps unknown fields out, and the confirmable
     artifacts are a closed set: the three conservative downstream artifacts
-    a manual edit can flag.
+    a manual edit can flag. ``project_id`` is mandatory ownership (review
+    round 2): two projects can hold byte-identical flags, so the decision
+    must state which project it was made in — a missing field is never
+    backfilled from the URL, and a foreign owner is a 422 for the whole
+    batch.
     """
 
     model_config = ConfigDict(extra="forbid")
 
+    project_id: str = Field(min_length=1, max_length=64)
     artifact: Literal["script", "storyboard", "visual_highlights"]
     reason: str = Field(min_length=1, max_length=100)
     upstream_kind: str = Field(min_length=1, max_length=40)
@@ -1381,22 +1386,25 @@ async def delete_project(project_id: str) -> dict:
 async def confirm_review(project_id: str, req: ReviewConfirmRequest) -> dict:
     """Confirm selected pending-review artifacts as kept as-is (ticket #17).
 
-    One store transaction performs the revision CAS, the exact matching of
-    every selection against the CURRENT review flags (full identity:
-    artifact + reason + upstream kind/id + ``since_revision``), the
-    downstream-existence check and the removal of exactly the matched flags
-    — content is never rewritten and no model is ever called. The response
-    carries the complete project snapshot this transaction wrote, the
-    remaining ``review`` metadata and the ``confirmed`` scope. Refusals:
-    unknown project 404; a stale revision or a selection that no longer
-    matches (already confirmed, foreign project, or the upstream
-    re-triggered the flag) 409 with nothing written — the client must
-    re-read, and the same stale request never clears a newer flag; empty,
-    duplicated or malformed selections 422.
+    One store transaction performs the ownership check (every selection's
+    ``project_id`` must name THIS project — identical flags in two projects
+    must never cross-clear), the revision CAS, the exact matching of every
+    selection against the CURRENT review flags (full identity: artifact +
+    reason + upstream kind/id + ``since_revision``), the downstream
+    existence check and the removal of exactly the matched flags — content
+    is never rewritten and no model is ever called. The response carries
+    the complete project snapshot this transaction wrote, the remaining
+    ``review`` metadata and the ``confirmed`` scope. Refusals: unknown
+    project 404; selections missing their project or owned by another
+    project (whole batch, mixed or not) 422; a stale revision or a
+    selection that no longer matches (already confirmed, foreign flag, or
+    the upstream re-triggered the flag) 409 with nothing written — the
+    client must re-read, and the same stale request never clears a newer
+    flag; empty, duplicated or malformed selections 422.
     """
     selections = [s.model_dump() for s in req.selections]
     try:
-        validate_review_selections(selections)
+        validate_review_selections(selections, project_id=project_id)
     except InvalidReviewSelectionError as exc:
         raise HTTPException(
             422, detail={"code": "invalid_review_selection", "message": str(exc)}
@@ -1408,6 +1416,12 @@ async def confirm_review(project_id: str, req: ReviewConfirmRequest) -> dict:
             expected_revision=req.expected_revision,
             selections=selections,
         )
+    except InvalidReviewSelectionError as exc:
+        # Defense in depth: the transaction re-checks ownership under the
+        # write lock, so a race or a direct store caller gets the same 422.
+        raise HTTPException(
+            422, detail={"code": "invalid_review_selection", "message": str(exc)}
+        ) from exc
     except ReviewSelectionMismatchError as exc:
         raise HTTPException(
             409, detail={"code": "review_changed", "message": str(exc)}

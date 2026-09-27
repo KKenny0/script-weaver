@@ -6,6 +6,7 @@ import path from "node:path";
 import {
   fetchProject,
   gate,
+  gateRespond,
   inspectZip,
   installGate,
   installSSEStub,
@@ -15,6 +16,7 @@ import {
   seedCardsProject,
   seedExportableProject,
   seedProject,
+  releaseAll,
   ungate,
   waitForHeld,
 } from "./helpers";
@@ -98,6 +100,8 @@ test("shows reasons, confirms a partial scope, keeps the rest", async ({ page, r
   expect(body.selections.map((s: any) => s.artifact).sort())
     .toEqual(["script", "storyboard"]);
   expect(body.selections[0].since_revision).toBe(3);
+  // Ownership rides every selection (review round 2).
+  expect(body.selections.every((s: any) => s.project_id === p.project_id)).toBe(true);
 
   await expect(page.getByTestId("review-panel")).toHaveCount(0);
   // The chat session acknowledges without resetting; the banner narrows to
@@ -402,4 +406,266 @@ test("light theme and a narrow window complete a warned export via keyboard", as
     page.keyboard.press("Enter"),
   ]);
   expect(download.suggestedFilename()).toBe(`${p.project_id}.json`);
+});
+
+// ── Review round 2: ownership, abandoned results, chat preservation ──
+
+
+/** Wait until at least `count` requests are held for this gate key (the
+ * plain waitForHeld passes as soon as ANY older request is held). */
+async function waitForHeldCount(page: Page, key: string, count: number) {
+  await page.waitForFunction(
+    ({ k, n }) => {
+      const q = (window as any).__gatePending.get(k);
+      return Array.isArray(q) && q.length >= n;
+    },
+    { k: key, n: count },
+    { timeout: 5_000 },
+  );
+}
+
+
+test("reviewer: abandoned export after A B A stays silent, new busy kept", async ({
+  page,
+  request,
+}) => {
+  const a = await seedFlaggedProject(request, "reviewer export A");
+  const b = await seedFlaggedProject(request, "reviewer export B");
+  await installGate(page);
+  await openApp(page, `/?project=${a.project_id}`);
+  await expect(page.getByRole("button", { name: "导出 JSON" })).toBeEnabled();
+
+  await gate(page, "GET /export/json");
+  await page.getByRole("button", { name: "导出 JSON" }).click();
+  await waitForHeld(page, "GET /export/json");
+  for (const p of [b, a]) {
+    await page.locator('button[title^="打开项目"]', { hasText: p.title }).click();
+    await expect(page.locator('button[title^="打开项目"][aria-current="true"]')).toHaveText(new RegExp(p.title));
+    await expect(page.getByRole("button", { name: "导出 JSON" })).toBeEnabled();
+  }
+
+  // Overlap: launch a NEW export on the re-opened A session — both are now
+  // held; FIFO release answers the OLD one first.
+  await page.getByRole("button", { name: "导出 JSON" }).click();
+  await waitForHeldCount(page, "GET /export/json", 2);
+  await release(page, "GET /export/json");
+  await page.waitForTimeout(600);
+
+  // The abandoned response: no dialog, no download — and it must NOT
+  // release the new request's busy state.
+  await expect(page.getByTestId("export-confirm")).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "导出 JSON" })).toBeDisabled();
+
+  // The new response belongs here: the dialog opens for the new session.
+  await release(page, "GET /export/json");
+  await expect(page.getByTestId("export-confirm")).toBeVisible();
+  await expect(page.getByTestId("export-confirm-scope")).toContainText("即将导出 r3");
+  await page.getByTestId("export-confirm-cancel").click();
+  await expect(page.getByTestId("export-confirm")).toHaveCount(0);
+});
+
+
+test("reviewer: old confirm preserves reopened panel; the POST still lands", async ({
+  page,
+  request,
+}) => {
+  const p = await seedFlaggedProject(request, "reviewer confirm");
+  await installGate(page);
+  await openApp(page, `/?project=${p.project_id}`);
+  await openReviewPanel(page);
+  await page.getByTestId("review-select-2").uncheck();
+  await gate(page, "POST /review/confirm");
+  await page.getByTestId("confirm-review-keep").click();
+  await waitForHeld(page, "POST /review/confirm");
+
+  // Close, then reopen: a NEW panel generation with a fresh selection.
+  await page.getByTestId("review-close").click();
+  await expect(page.getByTestId("review-panel")).toHaveCount(0);
+  await openReviewPanel(page);
+  await page.getByTestId("review-select-0").uncheck();
+  await expect(page.getByTestId("review-selected-count")).toHaveText("已选 2/3 项");
+
+  // The old confirm's SUCCESS response lands: it must not close the new
+  // panel, not rewrite its selection and not append its notice.
+  await release(page, "POST /review/confirm");
+  await page.waitForTimeout(600);
+  await expect(page.getByTestId("review-panel")).toBeVisible();
+  await expect(page.getByTestId("review-select-0")).not.toBeChecked();
+  await expect(page.getByTestId("review-selected-count")).toHaveText("已选 2/3 项");
+  await expect(page.getByText(/已确认沿用/)).toHaveCount(0);
+
+  // Ignoring the response is not a rollback: the transaction landed with
+  // its own (partial) scope — script + storyboard cleared, the highlight
+  // remains pending at r4.
+  const after = await fetchProject(request, p.project_id);
+  expect(after.revision).toBe(4);
+  expect(after.review.review_flags.map((f: any) => f.artifact))
+    .toEqual(["visual_highlights"]);
+
+  // The stale panel recovers through the normal conflict → re-read path
+  // (the gate rule from the first confirm comes off first).
+  await ungate(page, "POST /review/confirm");
+  await page.getByTestId("confirm-review-keep").click();
+  await expect(page.getByTestId("review-conflict")).toBeVisible();
+  await page.getByTestId("review-reload").click();
+  await expect(page.getByTestId("review-conflict")).toHaveCount(0);
+  await expect(page.getByTestId("review-basis")).toContainText("依据 r4");
+  await expect(page.getByTestId("review-count")).toHaveText("1");
+  await page.getByTestId("confirm-review-keep").click();
+  await expect(page.getByTestId("review-panel")).toHaveCount(0);
+  await expect(page.getByTestId("review-notice")).toHaveCount(0);
+  const final = await fetchProject(request, p.project_id);
+  expect(final.review.review_flags).toEqual([]);
+  expect(final.revision).toBe(5);
+});
+
+
+test("old confirm response after A→B→A stays silent", async ({ page, request }) => {
+  const pa = await seedFlaggedProject(request, "确认隔离甲");
+  const pb = await seedFlaggedProject(request, "确认隔离乙");
+  await installGate(page);
+  await openApp(page, `/?project=${pa.project_id}`);
+  await openReviewPanel(page);
+  await gate(page, "POST /review/confirm");
+  await page.getByTestId("confirm-review-keep").click();
+  await waitForHeld(page, "POST /review/confirm");
+  // The modal panel blocks the sidebar; closing it also invalidates the
+  // panel generation, so the A→B→A legs exercise the session guard too.
+  await page.getByTestId("review-close").click();
+  await expect(page.getByTestId("review-panel")).toHaveCount(0);
+
+  for (const p of [pb, pa]) {
+    await page.locator('button[title^="打开项目"]', { hasText: p.title }).click();
+    await expect(page.locator('button[title^="打开项目"][aria-current="true"]')).toHaveText(new RegExp(p.title));
+  }
+  await release(page, "POST /review/confirm");
+  await page.waitForTimeout(600);
+
+  // The old success response (same project id again!) must reopen nothing,
+  // append nothing. The POST itself did land server-side.
+  await expect(page.getByTestId("review-panel")).toHaveCount(0);
+  await expect(page.getByText(/已确认沿用/)).toHaveCount(0);
+  const after = await fetchProject(request, pa.project_id);
+  expect(after.review.review_flags).toEqual([]);
+  expect(after.revision).toBe(4);
+});
+
+
+test("old confirm response after close stays silent and never reopens", async ({
+  page,
+  request,
+}) => {
+  const p = await seedFlaggedProject(request, "确认后关闭");
+  await installGate(page);
+  await openApp(page, `/?project=${p.project_id}`);
+  await openReviewPanel(page);
+  await gate(page, "POST /review/confirm");
+  await page.getByTestId("confirm-review-keep").click();
+  await waitForHeld(page, "POST /review/confirm");
+  await page.getByTestId("review-close").click();
+  await expect(page.getByTestId("review-panel")).toHaveCount(0);
+
+  await release(page, "POST /review/confirm");
+  await page.waitForTimeout(600);
+  // A closed panel must never be rebuilt by its own late response.
+  await expect(page.getByTestId("review-panel")).toHaveCount(0);
+  await expect(page.getByText(/已确认沿用/)).toHaveCount(0);
+  const after = await fetchProject(request, p.project_id);
+  expect(after.revision).toBe(4); // landed server-side regardless
+});
+
+
+test("reload failure appends to the chat and keeps the panel usable", async ({
+  page,
+  request,
+}) => {
+  const p = await seedFlaggedProject(request, "重读失败保聊天");
+  await installGate(page);
+  await openApp(page, `/?project=${p.project_id}`);
+  await openReviewPanel(page);
+
+  // Force a conflict: the upstream edits again while the panel is open.
+  const second = await request.patch(
+    `${API_BASE}/api/projects/${p.project_id}/artifacts/characters/char_e2e_02`,
+    { data: { expected_revision: 3, changes: { name: "陈叔·改" } } },
+  );
+  expect(second.ok()).toBe(true);
+  await page.getByTestId("confirm-review-keep").click();
+  await expect(page.getByTestId("review-conflict")).toBeVisible();
+
+  // The re-read FAILS (simulated 500): the error is appended to the CURRENT
+  // chat session — the earlier chat message must survive it.
+  await gateRespond(page, `GET /projects/${p.project_id}`, 500, {
+    detail: { message: "模拟读取失败" },
+  });
+  await page.getByTestId("review-reload").click();
+  await release(page, `GET /projects/${p.project_id}`);
+  await expect(page.getByText(/重新读取待复核内容失败/)).toBeVisible({ timeout: 3000 });
+  await expect(page.getByText(`已打开项目「${p.title}」`)).toBeVisible();
+  // The panel keeps its conflict box, selection and manual retry entry.
+  await expect(page.getByTestId("review-conflict")).toBeVisible();
+  await expect(page.getByTestId("review-select-0")).toBeChecked();
+  await expect(page.getByTestId("review-reload")).toBeEnabled();
+
+  // Retrying without the fault re-bases the panel on r4.
+  await ungate(page, `GET /projects/${p.project_id}`);
+  await page.getByTestId("review-reload").click();
+  await expect(page.getByTestId("review-basis")).toContainText("依据 r4", { timeout: 3000 });
+  await expect(page.getByTestId("review-conflict")).toHaveCount(0);
+  await page.getByTestId("confirm-review-keep").click();
+  await expect(page.getByTestId("review-panel")).toHaveCount(0);
+  await expect(page.getByTestId("review-notice")).toHaveCount(0);
+  const after = await fetchProject(request, p.project_id);
+  expect(after.review.review_flags).toEqual([]);
+  expect(after.revision).toBe(5);
+});
+
+
+test("abandoned reload after close and A→B→A never rebuilds the panel", async ({
+  page,
+  request,
+}) => {
+  const pa = await seedFlaggedProject(request, "重载隔离甲");
+  const pb = await seedFlaggedProject(request, "重载隔离乙");
+  await installGate(page);
+  await openApp(page, `/?project=${pa.project_id}`);
+  await openReviewPanel(page);
+
+  // Conflict → gated re-read (held).
+  const second = await request.patch(
+    `${API_BASE}/api/projects/${pa.project_id}/artifacts/characters/char_e2e_02`,
+    { data: { expected_revision: 3, changes: { name: "陈叔·改" } } },
+  );
+  expect(second.ok()).toBe(true);
+  await page.getByTestId("confirm-review-keep").click();
+  await expect(page.getByTestId("review-conflict")).toBeVisible();
+  await gate(page, `GET /projects/${pa.project_id}`);
+  await page.getByTestId("review-reload").click();
+  await waitForHeld(page, `GET /projects/${pa.project_id}`);
+
+  // Close the panel, then come back via B: the held reload belongs to a
+  // dead panel generation and a dead project session.
+  await page.getByTestId("review-close").click();
+  await expect(page.getByTestId("review-panel")).toHaveCount(0);
+  await page.locator('button[title^="打开项目"]', { hasText: pb.title }).click();
+  await expect(page.locator('button[title^="打开项目"][aria-current="true"]')).toHaveText(new RegExp(pb.title));
+  await page.locator('button[title^="打开项目"]', { hasText: pa.title }).click();
+  await expect(page.locator('button[title^="打开项目"][aria-current="true"]')).toHaveText(new RegExp(pa.title));
+
+  await release(page, `GET /projects/${pa.project_id}`);
+  await page.waitForTimeout(600);
+  // The late reload must rebuild nothing and append nothing.
+  await expect(page.getByTestId("review-panel")).toHaveCount(0);
+  await expect(page.getByText(/已确认沿用/)).toHaveCount(0);
+  await expect(page.getByText(/重新读取待复核内容失败/)).toHaveCount(0);
+
+  // Flush the re-open's own (still held) content GET: A settles with its
+  // unconfirmed flags — nothing the abandoned reload did changed that.
+  await ungate(page, `GET /projects/${pa.project_id}`);
+  await releaseAll(page, `GET /projects/${pa.project_id}`);
+  await expect(page.getByTestId("review-notice")).toBeVisible({ timeout: 3000 });
+  await expect(page.getByTestId("review-panel")).toHaveCount(0);
+  const after = await fetchProject(request, pa.project_id);
+  expect(after.revision).toBe(4);
+  expect(after.review.review_flags).toHaveLength(3);
 });

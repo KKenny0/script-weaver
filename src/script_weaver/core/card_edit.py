@@ -146,6 +146,13 @@ SELECTION_FIELDS = (
     "artifact", "reason", "upstream_kind", "upstream_id", "since_revision",
 )
 
+# The ownership field every confirm selection must carry on top of the
+# identity: two projects can hold byte-identical flags, so the five stored
+# fields alone cannot bind a selection to the project it was decided in
+# (review round 2). Stored flags never grow this field — it is validated
+# against the target project and then dropped from the matching key.
+SELECTION_OWNERSHIP_FIELD = "project_id"
+
 # Largest float the platform can represent: beyond this a JSON integer is
 # not a usable duration (and math.isfinite would overflow converting it).
 _MAX_FLOAT = sys.float_info.max
@@ -468,6 +475,8 @@ def selection_key(flag: Any) -> tuple[Any, ...]:
 
 def validate_review_selections(
     selections: Any,
+    *,
+    project_id: str | None = None,
 ) -> list[tuple[Any, ...]]:
     """Validate request-shaped confirm selections; return their keys.
 
@@ -475,6 +484,13 @@ def validate_review_selections(
     still enforces the domain rules itself so every caller gets the same
     refusals: confirmable artifacts only, non-empty string identity fields,
     a positive integer ``since_revision``, and no duplicated selection.
+
+    With ``project_id`` given, every selection must also carry
+    ``project_id`` naming exactly that project — a missing field stays a
+    missing field (never backfilled from the URL, which would mask where
+    the decision came from) and a foreign owner refuses the WHOLE batch
+    before anything is matched: two projects can hold byte-identical flags,
+    so project A's selections must never clear project B's.
     """
     if not isinstance(selections, list) or not selections:
         raise InvalidReviewSelectionError("selections 必须是非空列表")
@@ -483,6 +499,16 @@ def validate_review_selections(
         where = f"第 {i + 1} 个选择"
         if not isinstance(sel, dict):
             raise InvalidReviewSelectionError(f"{where}必须是对象")
+        if project_id is not None:
+            owner = sel.get(SELECTION_OWNERSHIP_FIELD)
+            if not isinstance(owner, str) or not owner:
+                raise InvalidReviewSelectionError(
+                    f"{where}缺少所属项目 {SELECTION_OWNERSHIP_FIELD}"
+                )
+            if owner != project_id:
+                raise InvalidReviewSelectionError(
+                    f"{where}属于项目「{owner}」，不能提交给项目「{project_id}」"
+                )
         artifact = sel.get("artifact")
         if artifact not in CONFIRMABLE_ARTIFACTS:
             raise InvalidReviewSelectionError(

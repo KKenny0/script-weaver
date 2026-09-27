@@ -695,25 +695,30 @@ class ProjectStore:
     ) -> tuple[ProjectRecord, list[dict[str, Any]]]:
         """CAS-confirm selected pending-review flags as kept as-is (ticket #17).
 
-        One write transaction: read the current project, check
-        ``expected_revision``, match every selection against the CURRENT
-        review flags by its full identity (artifact + reason + upstream
-        kind/id + ``since_revision`` — never the artifact name alone, so an
-        upstream re-trigger survives an old confirm request), verify the
-        flagged downstream artifacts still exist, remove exactly the matched
-        flags while preserving all other review metadata, and append the
-        new immutable version. The project content is untouched — the save
-        rides the normal history mechanism (meta timestamps may refresh).
-        Returns ``(record, confirmed)`` where both come from the exact
-        values this transaction wrote (never a post-commit re-read). Any
-        refusal — unknown project, stale revision, a selection that matches
-        no current flag — raises before a single row changes.
+        One write transaction: read the current project, verify every
+        selection's ``project_id`` names THIS project (two projects can hold
+        byte-identical flags — the ownership field is what binds a decision
+        to the project it was made in), check ``expected_revision``, match
+        every selection against the CURRENT review flags by its full
+        identity (artifact + reason + upstream kind/id + ``since_revision``
+        — never the artifact name alone, so an upstream re-trigger survives
+        an old confirm request), verify the flagged downstream artifacts
+        still exist, remove exactly the matched flags while preserving all
+        other review metadata, and append the new immutable version. The
+        project content is untouched — the save rides the normal history
+        mechanism (meta timestamps may refresh). Returns
+        ``(record, confirmed)`` where both come from the exact values this
+        transaction wrote (never a post-commit re-read). Any refusal —
+        unknown project, foreign/missing selection ownership, stale
+        revision, a selection that matches no current flag — raises before
+        a single row changes.
         """
         # Function-level import: card_edit imports this module's error base
         # class, so a module-level import would be circular.
         from script_weaver.core.card_edit import (
             ARTIFACT_LABELS,
             confirm_review_flags,
+            validate_review_selections,
         )
 
         with self._write_tx() as conn:
@@ -725,6 +730,10 @@ class ProjectStore:
             ).fetchone()
             if row is None:
                 raise ProjectNotFoundError(f"Project '{project_id}' not found")
+            # Input validity precedes state comparison: a selection owned by
+            # another project is a 422-shaped refusal even when the revision
+            # is stale too — re-reading the target project could never fix it.
+            validate_review_selections(selections, project_id=project_id)
             if row["revision"] != expected_revision:
                 raise RevisionConflictError(
                     f"期望 revision {expected_revision} 已过期，当前为 {row['revision']}",

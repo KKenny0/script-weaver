@@ -57,9 +57,13 @@ function parseReviewWarningsHeader(raw: string | null): ExportReviewWarning[] {
 
 /** An export response waiting for the user's still-export decision. The
  * blob is the exact bytes the server answered with — confirming downloads
- * THAT file, never a re-fetch (which could be a different snapshot). */
+ * THAT file, never a re-fetch (which could be a different snapshot). The
+ * projectId+projectSession pair binds it to the session that launched the
+ * request: an abandoned response never dialogs or downloads (A→B→A safe,
+ * since the session id changes on every project open). */
 interface PendingExport {
   projectId: string;
+  projectSession: number;
   format: string;
   blob: Blob;
   filename: string;
@@ -78,6 +82,12 @@ interface ArtifactPanelProps {
   reviewNotice: string | null;
   onDismissReviewNotice: () => void;
   onOpenReviewPanel?: () => void;
+  /** Page-owned session identity: the monotonic id of the currently open
+   * project session (bumped synchronously on every project open). */
+  projectSessionRef: { current: number };
+  /** True only while (projectId, session) is the page's CURRENT open
+   * project session — the ownership check every export result must pass. */
+  isProjectSessionActive: (projectId: string, session: number) => boolean;
   historyPanel: HistoryPanelState;
   onOpenHistory: () => void;
   onRefreshHistory: () => void;
@@ -102,23 +112,24 @@ export default function ArtifactPanel({
   projectId, artifactData, projectStatus,
   activeTab, onTabChange, onCollapse,
   onEditCard, reviewNotice, onDismissReviewNotice, onOpenReviewPanel,
+  projectSessionRef, isProjectSessionActive,
   historyPanel, onOpenHistory, onRefreshHistory,
   onSelectHistoryVersion, onBackToHistoryList, onCloseHistory,
 }: ArtifactPanelProps) {
   const { theme, toggleTheme } = useTheme();
-  // The export awaiting confirmation and the in-flight marker. Both belong
-  // to the project session that STARTED the request: switching projects
-  // clears them, and a late response for a previous project never opens a
-  // dialog, never downloads and never touches the new session's state
-  // (A→B→A included — the session check runs against the live ref).
+  // The export awaiting confirmation and the in-flight marker. Each result
+  // belongs to the (projectId, projectSession) that STARTED its request:
+  // the ownership predicate — page-owned, bumped synchronously on every
+  // project open — makes a late response for an abandoned session a no-op
+  // (no dialog, no download, no error, no busy release), so A→B→A cannot
+  // revive it and an old finally cannot unfreeze a newer request. The
+  // effect below only clears what the user sees right now on a switch.
   const [pendingExport, setPendingExport] = useState<PendingExport | null>(null);
   const [exportBusy, setExportBusy] = useState(false);
-  const projectIdRef = useRef(projectId);
   const exportDialogRef = useRef<HTMLDialogElement>(null);
   const previouslyFocusedRef = useRef<HTMLElement | null>(null);
 
   useEffect(() => {
-    projectIdRef.current = projectId;
     setPendingExport(null);
     setExportBusy(false);
   }, [projectId]);
@@ -169,6 +180,12 @@ export default function ArtifactPanel({
   const handleExport = async (format: string) => {
     if (!projectId || exportBusy) return;
     const pid = projectId;
+    // Capture WHO launched this export: project id AND open-session id.
+    // Every async continuation below re-checks this ownership before it
+    // may touch the UI — after the blob read, on errors and in the finally
+    // (an abandoned request must never release a newer request's busy).
+    const launchedSession = projectSessionRef.current;
+    const isMine = () => isProjectSessionActive(pid, launchedSession);
     setExportBusy(true);
     try {
       // The backend serves real files (JSON state / Fountain text / ZIP) with
@@ -186,7 +203,7 @@ export default function ArtifactPanel({
         throw new Error(message);
       }
       const blob = await res.blob();
-      if (pid !== projectIdRef.current) return; // session ended mid-flight
+      if (!isMine()) return; // session ended mid-flight: no dialog, no download
       const disposition = res.headers.get("Content-Disposition") ?? "";
       const filename = /filename="?([^";]+)"?/.exec(disposition)?.[1]
         ?? `${pid}.${format === "video_gen" ? "zip" : format}`;
@@ -196,12 +213,15 @@ export default function ArtifactPanel({
         triggerDownload(blob, filename);
         return;
       }
-      setPendingExport({ projectId: pid, format, blob, filename, revision, warnings });
+      setPendingExport({
+        projectId: pid, projectSession: launchedSession,
+        format, blob, filename, revision, warnings,
+      });
     } catch (err: any) {
-      if (pid !== projectIdRef.current) return; // no stale error in the new session
+      if (!isMine()) return; // no stale error in the new session
       alert(`导出失败: ${err.message}`);
     } finally {
-      if (pid === projectIdRef.current) setExportBusy(false);
+      if (isMine()) setExportBusy(false);
     }
   };
 
@@ -363,6 +383,15 @@ export default function ArtifactPanel({
                 onClick={() => {
                   const pending = pendingExport;
                   setPendingExport(null);
+                  // A stale dialog's confirm must never download (the
+                  // project switches already clear the dialog; this guards
+                  // any window the effect could miss).
+                  if (
+                    pending &&
+                    !isProjectSessionActive(pending.projectId, pending.projectSession)
+                  ) {
+                    return;
+                  }
                   if (pending) triggerDownload(pending.blob, pending.filename);
                 }}>
                 仍然导出

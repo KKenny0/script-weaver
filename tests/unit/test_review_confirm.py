@@ -20,6 +20,7 @@ from script_weaver.core.card_edit import (
     InvalidReviewSelectionError,
     ReviewSelectionMismatchError,
     confirm_review_flags,
+    selection_key,
     summarize_review_warnings,
     validate_review_selections,
 )
@@ -86,9 +87,11 @@ def reviewable_state(user_input: str) -> ProjectState:
     return state
 
 
-def make_selection(flag: dict) -> dict:
-    """The request shape for confirming one stored flag."""
+def make_selection(flag: dict, project_id: str) -> dict:
+    """The request shape for confirming one stored flag: the five identity
+    fields plus the mandatory project ownership (review round 2)."""
     return {
+        "project_id": project_id,
         "artifact": flag["artifact"],
         "reason": flag["reason"],
         "upstream_kind": flag["upstream_kind"],
@@ -132,7 +135,7 @@ def test_confirm_removes_only_selected_flags_and_keeps_content(store):
 
     record, confirmed = store.confirm_review(
         p.project_id, expected_revision=saved.revision,
-        selections=[make_selection(script_flag)],
+        selections=[make_selection(script_flag, p.project_id)],
     )
 
     # Only the selected flag is gone; siblings and foreign metadata stay.
@@ -157,7 +160,7 @@ def test_confirm_rejects_stale_revision_with_zero_writes(store):
     with pytest.raises(RevisionConflictError) as exc_info:
         store.confirm_review(
             p.project_id, expected_revision=saved.revision - 1,
-            selections=[make_selection(flag)],
+            selections=[make_selection(flag, p.project_id)],
         )
     assert exc_info.value.current_revision == saved.revision
 
@@ -174,9 +177,10 @@ def test_confirm_rejects_selections_that_match_no_current_flag(store):
 
     script_flag = next(f for f in saved.review["review_flags"]
                        if f["artifact"] == "script")
-    wrong_upstream = make_selection(script_flag) | {"upstream_id": "char_nobody"}
-    wrong_since = make_selection(script_flag) | {"since_revision": 99}
-    foreign = {"artifact": "script", "reason": "upstream_manual_edit",
+    wrong_upstream = make_selection(script_flag, p.project_id) | {"upstream_id": "char_nobody"}
+    wrong_since = make_selection(script_flag, p.project_id) | {"since_revision": 99}
+    foreign = {"project_id": p.project_id, "artifact": "script",
+               "reason": "upstream_manual_edit",
                "upstream_kind": "scenes", "upstream_id": "scene_x",
                "since_revision": 2}
 
@@ -212,7 +216,7 @@ def test_upstream_retrigger_invalidates_the_old_confirmation(store):
     with pytest.raises(ReviewSelectionMismatchError):
         store.confirm_review(
             p.project_id, expected_revision=retriggered.revision,
-            selections=[make_selection(old_flag)],
+            selections=[make_selection(old_flag, p.project_id)],
         )
     current = store.get_required(p.project_id)
     assert current.revision == retriggered.revision
@@ -221,7 +225,7 @@ def test_upstream_retrigger_invalidates_the_old_confirmation(store):
     # The current basis confirms cleanly.
     record, confirmed = store.confirm_review(
         p.project_id, expected_revision=retriggered.revision,
-        selections=[make_selection(fresh_flag)],
+        selections=[make_selection(fresh_flag, p.project_id)],
     )
     assert [f["artifact"] for f in confirmed] == ["script"]
     assert [f["artifact"] for f in record.review["review_flags"]] == [
@@ -231,7 +235,7 @@ def test_upstream_retrigger_invalidates_the_old_confirmation(store):
 def test_confirmed_flags_cannot_be_confirmed_again(store):
     """A repeated old request answers mismatch and never births a version."""
     p, saved = seeded_project_with_flags(store)
-    selections = [make_selection(f) for f in saved.review["review_flags"]]
+    selections = [make_selection(f, p.project_id) for f in saved.review["review_flags"]]
 
     record, confirmed = store.confirm_review(
         p.project_id, expected_revision=saved.revision, selections=selections,
@@ -251,14 +255,14 @@ def test_confirmed_flags_cannot_be_confirmed_again(store):
 
 
 def test_duplicate_store_selections_refuse_and_roll_back(store):
-    """One selection consumes the flag; the identical second one mismatches,
-    and the whole transaction rolls back instead of half-clearing."""
+    """The identical selection twice is refused up front (422-shaped) and
+    the transaction leaves everything untouched — never half-clearing."""
     p, saved = seeded_project_with_flags(store)
     flag = make_selection(
         next(f for f in saved.review["review_flags"]
-             if f["artifact"] == "script"))
+             if f["artifact"] == "script"), p.project_id)
 
-    with pytest.raises(ReviewSelectionMismatchError):
+    with pytest.raises(InvalidReviewSelectionError, match="重复"):
         store.confirm_review(
             p.project_id, expected_revision=saved.revision,
             selections=[flag, dict(flag)],
@@ -273,7 +277,7 @@ def test_failed_commit_rolls_back_confirmation(tmp_path, monkeypatch):
     db = tmp_path / "projects.sqlite3"
     store = ProjectStore(db)
     p, saved = seeded_project_with_flags(store)
-    selections = [make_selection(f) for f in saved.review["review_flags"][:1]]
+    selections = [make_selection(f, p.project_id) for f in saved.review["review_flags"][:1]]
 
     class _CommitFailProxy:
         def __init__(self, conn):
@@ -314,7 +318,7 @@ def test_confirmation_facts_survive_reopen(tmp_path):
     db = tmp_path / "projects.sqlite3"
     store = ProjectStore(db)
     p, saved = seeded_project_with_flags(store)
-    selections = [make_selection(f) for f in saved.review["review_flags"]]
+    selections = [make_selection(f, p.project_id) for f in saved.review["review_flags"]]
     record, _ = store.confirm_review(
         p.project_id, expected_revision=saved.revision, selections=selections,
     )
@@ -333,9 +337,44 @@ def test_confirm_unknown_project_404(store):
     with pytest.raises(ProjectNotFoundError):
         store.confirm_review(
             "nope", expected_revision=1,
-            selections=[{"artifact": "script", "reason": "upstream_manual_edit",
+            selections=[{"project_id": "nope", "artifact": "script",
+                         "reason": "upstream_manual_edit",
                          "upstream_kind": "characters", "upstream_id": "x",
                          "since_revision": 1}],
+        )
+
+
+def test_store_refuses_selections_owned_by_another_project(store):
+    """Two projects with byte-identical flags: A's selections must never
+    clear B's — ownership is verified in the transaction, before matching."""
+    pa, saved_a = seeded_project_with_flags(store)
+    pb, saved_b = seeded_project_with_flags(store)
+    # Same seed steps → same revision and identical five-field identities.
+    assert saved_a.revision == saved_b.revision
+    assert [selection_key(f) for f in saved_a.review["review_flags"]] == [
+        selection_key(f) for f in saved_b.review["review_flags"]]
+    selections_a = [make_selection(f, pa.project_id)
+                    for f in saved_a.review["review_flags"]]
+
+    baseline_json = store.get_required(pb.project_id).state_json
+    with pytest.raises(InvalidReviewSelectionError, match="不能提交给项目"):
+        store.confirm_review(
+            pb.project_id, expected_revision=saved_b.revision,
+            selections=selections_a,
+        )
+
+    current = store.get_required(pb.project_id)
+    assert current.revision == saved_b.revision
+    assert len(current.review["review_flags"]) == 3
+    assert current.state_json == baseline_json
+    assert [v.revision for v in store.list_versions(pb.project_id)] == [3, 2, 1]
+
+    # A missing ownership field is a missing field — never backfilled.
+    bare = [{k: v for k, v in selections_a[0].items() if k != "project_id"}]
+    with pytest.raises(InvalidReviewSelectionError, match="缺少所属项目"):
+        store.confirm_review(
+            pb.project_id, expected_revision=saved_b.revision,
+            selections=bare,
         )
 
 
@@ -365,6 +404,24 @@ def test_validate_review_selections_accepts_and_rejects():
     with pytest.raises(InvalidReviewSelectionError):
         validate_review_selections([good[0] | {"upstream_id": ""}])
 
+    # Ownership (review round 2): with a target project, every selection
+    # must name it — missing fields are never backfilled, foreign owners
+    # refuse the whole batch.
+    owned = validate_review_selections(
+        [good[0] | {"project_id": "p1"}], project_id="p1")
+    assert owned == keys
+    with pytest.raises(InvalidReviewSelectionError, match="缺少所属项目"):
+        validate_review_selections(good, project_id="p1")
+    with pytest.raises(InvalidReviewSelectionError, match="不能提交给项目"):
+        validate_review_selections(
+            [good[0] | {"project_id": "p2"}], project_id="p1")
+    # Mixed valid + foreign: the FIRST foreign item refuses everything.
+    with pytest.raises(InvalidReviewSelectionError, match="不能提交给项目"):
+        validate_review_selections(
+            [good[0] | {"project_id": "p1"}, good[0] | {"project_id": "p2"}],
+            project_id="p1",
+        )
+
 
 def test_confirm_review_flags_is_exact_and_preserving():
     from script_weaver.core.card_edit import merge_review_flags
@@ -385,7 +442,7 @@ def test_confirm_review_flags_is_exact_and_preserving():
     flags = review["review_flags"]
     state_json_before = serialize_state(state)
     new_review, confirmed = confirm_review_flags(
-        review, [make_selection(flags[0])], state)
+        review, [{k: v for k, v in make_selection(flags[0], "p").items() if k != "project_id"}], state)
     assert [f["artifact"] for f in confirmed] == ["script"]
     assert confirmed[0]["upstream_label"] == "阿芸"  # the stored flag, not the selection
     assert [f["artifact"] for f in new_review["review_flags"]] == ["storyboard"]
@@ -406,7 +463,7 @@ def test_confirm_review_flags_missing_downstream_is_a_mismatch():
         "created_at": "t1", "updated_at": "t1",
     }]}
     with pytest.raises(ReviewSelectionMismatchError, match="不存在"):
-        confirm_review_flags(review, [make_selection(review["review_flags"][0])], state)
+        confirm_review_flags(review, [{k: v for k, v in make_selection(review["review_flags"][0], "p").items() if k != "project_id"}], state)
 
 
 def test_summarize_review_warnings_shape_and_merging():
@@ -473,7 +530,7 @@ async def test_confirm_endpoint_roundtrip(client):
 
     r = await c.post(f"/api/projects/{pid}/review/confirm", json={
         "expected_revision": saved["revision"],
-        "selections": [make_selection(script_flag)],
+        "selections": [make_selection(script_flag, pid)],
     })
     assert r.status_code == 200, r.text
     body = r.json()
@@ -497,7 +554,7 @@ async def test_confirm_endpoint_validation_refusals(client):
     pid = p["project_id"]
     url = f"/api/projects/{pid}/review/confirm"
     baseline_revision = (await c.get(f"/api/projects/{pid}")).json()["revision"]
-    flag = make_selection(saved["review"]["review_flags"][0])
+    flag = make_selection(saved["review"]["review_flags"][0], pid)
 
     # Empty selection / unknown field / illegal artifact / duplicates / bad
     # revision: all 422, none of them writes anything.
@@ -535,7 +592,7 @@ async def test_confirm_endpoint_conflict_semantics(client):
     p, saved = await _seed_flagged(c, api)
     pid = p["project_id"]
     url = f"/api/projects/{pid}/review/confirm"
-    flag = make_selection(saved["review"]["review_flags"][0])
+    flag = make_selection(saved["review"]["review_flags"][0], pid)
 
     # Stale revision → 409 with the current revision, nothing written.
     r = await c.post(url, json={
@@ -545,18 +602,22 @@ async def test_confirm_endpoint_conflict_semantics(client):
     assert detail["code"] == "revision_conflict"
     assert detail["current_revision"] == saved["revision"]
 
-    # A flag of another project (never existed here) → 409 review_changed.
+    # A flag that never existed in THIS project (owned correctly, but no
+    # matching stored flag) → 409 review_changed, not an ownership 422.
     r = await c.post(url, json={
         "expected_revision": saved["revision"],
-        "selections": [{"artifact": "script", "reason": "upstream_manual_edit",
+        "selections": [{"project_id": pid, "artifact": "script",
+                        "reason": "upstream_manual_edit",
                         "upstream_kind": "scenes", "upstream_id": "scene_elsewhere",
                         "since_revision": 2}]})
     assert r.status_code == 409
     assert r.json()["detail"]["code"] == "review_changed"
 
-    # Unknown project → 404.
+    # Unknown project → 404 (self-consistent ownership so the request
+    # reaches the store's existence check).
     r = await c.post("/api/projects/nope/review/confirm", json={
-        "expected_revision": 1, "selections": [flag]})
+        "expected_revision": 1,
+        "selections": [dict(flag, project_id="nope")]})
     assert r.status_code == 404
     assert r.json()["detail"]["code"] == "project_not_found"
 
@@ -565,7 +626,52 @@ async def test_confirm_endpoint_conflict_semantics(client):
     assert len(after["review"]["review_flags"]) == 3
 
 
-# ── Export warnings headers ────────────────────────────────
+async def test_confirm_endpoint_rejects_foreign_and_mixed_selections(client):
+    """Identical flags in two projects: A's selections submitted to B must
+    422 and leave B byte-identical; mixed batches refuse whole; the correct
+    project's partial confirm still works."""
+    api, c = client
+    pa, saved_a = await _seed_flagged(c, api, title="归属甲")
+    pb, saved_b = await _seed_flagged(c, api, title="归属乙")
+    assert saved_a["revision"] == saved_b["revision"]
+    assert [selection_key(f) for f in saved_a["review"]["review_flags"]] == [
+        selection_key(f) for f in saved_b["review"]["review_flags"]]
+
+    url = f"/api/projects/{pb['project_id']}/review/confirm"
+    foreign = [make_selection(f, pa["project_id"])
+               for f in saved_b["review"]["review_flags"]]
+    versions_before = (await c.get(f"/api/projects/{pb['project_id']}/versions")).json()["versions"]
+
+    r = await c.post(url, json={
+        "expected_revision": saved_b["revision"], "selections": foreign})
+    assert r.status_code == 422
+    assert r.json()["detail"]["code"] == "invalid_review_selection"
+    assert "不能提交给项目" in r.json()["detail"]["message"]
+
+    # B untouched: revision, flags, artifacts and version count.
+    after = (await c.get(f"/api/projects/{pb['project_id']}")).json()
+    assert after["revision"] == saved_b["revision"]
+    assert len(after["review"]["review_flags"]) == 3
+    assert after["script"]["scenes"][0]["blocks"][0]["content"]["description"] == "阿芸握紧马灯。"
+    assert (await c.get(f"/api/projects/{pb['project_id']}/versions")).json()["versions"] == versions_before
+
+    # Mixed valid + foreign: whole batch refused, zero writes.
+    mixed = [make_selection(saved_b["review"]["review_flags"][0], pb["project_id"]),
+             make_selection(saved_b["review"]["review_flags"][1], pa["project_id"])]
+    r = await c.post(url, json={
+        "expected_revision": saved_b["revision"], "selections": mixed})
+    assert r.status_code == 422
+    assert (await c.get(f"/api/projects/{pb['project_id']}")).json()["revision"] == saved_b["revision"]
+
+    # The correct project confirms a partial scope normally.
+    r = await c.post(url, json={
+        "expected_revision": saved_b["revision"],
+        "selections": [make_selection(saved_b["review"]["review_flags"][0], pb["project_id"])]})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert [f["artifact"] for f in body["confirmed"]] == ["script"]
+    assert [f["artifact"] for f in body["review"]["review_flags"]] == [
+        "storyboard", "visual_highlights"]
 
 
 def _parse_warnings_header(raw: str) -> dict:
@@ -575,6 +681,9 @@ def _parse_warnings_header(raw: str) -> dict:
     for w in parsed["review_warnings"]:
         assert set(w) == {"artifact", "reason", "since_revision"}
     return parsed
+
+
+# ── Export warnings headers ────────────────────────────────
 
 
 async def test_export_headers_report_the_same_snapshot(client):
@@ -627,7 +736,7 @@ async def test_export_warnings_track_confirmations(client):
     partial = [f for f in flags if f["artifact"] in ("script", "storyboard")]
     r = await c.post(url, json={
         "expected_revision": saved["revision"],
-        "selections": [make_selection(f) for f in partial]})
+        "selections": [make_selection(f, pid) for f in partial]})
     assert r.status_code == 200, r.text
 
     # Only the unconfirmed scope remains warned, with its triggering revision.
