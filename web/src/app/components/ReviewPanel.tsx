@@ -184,17 +184,20 @@ export default function ReviewPanel({
       aria-label="复核下游内容">
       <div className="ced-shell">
         <header className="ced-header">
-          <div>
-            <h4 style={{ fontSize: 15, fontWeight: 600, margin: 0 }}>
-              待复核内容
-              <span className="badge" style={{ marginLeft: 8 }} data-testid="review-count">
-                {flags.length}
+          <div style={{ minWidth: 0 }}>
+            <div className="ced-header-title">
+              <h4 style={{ fontSize: 14, fontWeight: 600, margin: 0 }}>
+                待复核内容
+                <span className="badge warning" style={{ marginLeft: 8 }} data-testid="review-count">
+                  {flags.length}
+                </span>
+              </h4>
+            </div>
+            <div className="ced-header-sub">
+              <span className="badge mono" data-testid="review-basis">
+                依据 r{revision} · 保守影响范围
               </span>
-            </h4>
-            <p style={{ fontSize: 12, color: "var(--text-tertiary)", margin: "2px 0 0" }}
-              data-testid="review-basis">
-              依据 r{revision} · 保守影响范围，未自动重新生成
-            </p>
+            </div>
           </div>
           <button type="button" className="btn-ghost" data-testid="review-close"
             aria-label="关闭复核面板" onClick={onClose} style={{ width: 28, height: 28, flexShrink: 0 }}>

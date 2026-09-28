@@ -3,7 +3,7 @@
 import React, { useState, useEffect, useRef, useCallback } from "react";
 import {
   Send, Sparkles, Wand2, PanelLeftClose,
-  Loader2, Square,
+  Square,
 } from "lucide-react";
 
 interface Message {
@@ -759,41 +759,48 @@ export default function ChatPanel({
 
   return (
     <div style={{
-      width: 420, minWidth: 0, maxWidth: 600, flexShrink: 0,
+      width: "clamp(320px, 30vw, 400px)", minWidth: 0, flexShrink: 0,
       borderRight: "1px solid var(--border-default)",
       display: "flex", flexDirection: "column",
       background: "var(--bg-sidebar)",
-      transition: "width 0.25s ease, background-color 0.3s ease",
       overflow: "hidden",
     }}>
       {/* Header */}
       <div style={{
-        padding: "16px 20px",
+        padding: "12px 16px",
         borderBottom: "1px solid var(--border-default)",
         display: "flex",
         alignItems: "center",
         gap: 10,
         flexShrink: 0,
       }}>
-        <Sparkles size={22} style={{ color: "var(--brand-primary)" }} />
-        <span style={{ fontWeight: 600, fontSize: 15 }}>Script-Weaver</span>
+        <span style={{
+          width: 30, height: 30, borderRadius: 9, flexShrink: 0,
+          background: "var(--brand-soft)", color: "var(--brand-primary)",
+          display: "inline-flex", alignItems: "center", justifyContent: "center",
+        }}>
+          <Sparkles size={16} />
+        </span>
+        <span style={{ fontWeight: 600, fontSize: 14, letterSpacing: "0.01em" }}>Script-Weaver</span>
         <button onClick={() => setShowSkillsPanel(!showSkillsPanel)} style={{
-          marginLeft: "auto", padding: "4px 10px", borderRadius: 20,
+          marginLeft: "auto", padding: "4px 11px", borderRadius: 999,
           border: showSkillsPanel ? "1px solid var(--brand-primary)" : "1px solid var(--border-default)",
           background: showSkillsPanel ? "var(--brand-soft)" : "transparent",
           color: showSkillsPanel ? "var(--brand-primary)" : "var(--text-secondary)",
-          cursor: "pointer", fontSize: 12, transition: "all 0.15s ease",
+          cursor: "pointer", fontSize: 12, fontWeight: 500,
+          display: "inline-flex", alignItems: "center", gap: 4,
+          transition: "color 0.12s ease, background-color 0.12s ease, border-color 0.12s ease",
         }}>
-          <Wand2 size={12} style={{ display: "inline", marginRight: 4 }} />Skills
+          <Wand2 size={12} />Skills
         </button>
-        <button onClick={onCollapse} className="btn-ghost" style={{ width: 32, height: 32 }} title="折叠对话面板" aria-label="折叠对话面板">
+        <button onClick={onCollapse} className="btn-ghost" style={{ width: 30, height: 30 }} title="折叠对话面板" aria-label="折叠对话面板">
           <PanelLeftClose size={16} />
         </button>
       </div>
 
       {/* Skills panel */}
       {showSkillsPanel && (
-        <div style={{ padding: "8px 16px", borderBottom: "1px solid var(--border-default)", flexShrink: 0 }}>
+        <div style={{ padding: "8px 14px", borderBottom: "1px solid var(--border-default)", flexShrink: 0 }}>
           <div style={{ fontSize: 11, color: "var(--text-tertiary)", marginBottom: 6 }}>激活的 Skills ({activeSkillIds.size})</div>
           <div style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
             {availableSkills.map((skill: any) => (
@@ -806,29 +813,27 @@ export default function ChatPanel({
       )}
 
       {/* Messages area */}
-      <div ref={messagesEndRef} style={{ flex: 1, overflowY: "auto", padding: "16px 20px", display: "flex", flexDirection: "column", gap: 12 }}>
+      <div ref={messagesEndRef} style={{ flex: 1, overflowY: "auto", padding: "16px 16px", display: "flex", flexDirection: "column", gap: 12 }}>
         {messages.length === 0 && (
-          <div style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", color: "var(--text-tertiary)", textAlign: "center", gap: 12 }}>
-            <div style={{ width: 80, height: 80, borderRadius: 20, background: "var(--bg-surface-3)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 32 }}>✨</div>
-            <p style={{ fontSize: 15, fontWeight: 500, color: "var(--text-primary)" }}>开始编织这一集的故事</p>
-            <p style={{ fontSize: 13 }}>输入 idea、梗概或分集大纲，ScriptWeaver 将生成完整剧本结构与分镜脚本</p>
-            <div style={{ display: "flex", gap: 8, marginTop: 8, justifyContent: "center" }}>
+          <div style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", textAlign: "center", gap: 12 }}>
+            <div className="chat-empty-mark"><Sparkles size={26} strokeWidth={1.6} /></div>
+            <p className="chat-empty-title">开始编织这一集的故事</p>
+            <p style={{ fontSize: 12.5, color: "var(--text-tertiary)", lineHeight: 1.7, maxWidth: 260 }}>
+              输入 idea、梗概或分集大纲，ScriptWeaver 将生成完整剧本结构与分镜脚本
+            </p>
+            <div style={{ display: "flex", gap: 8, marginTop: 6, justifyContent: "center", flexWrap: "wrap" }}>
               {["从一句 idea 开始", "从分集大纲开始", "从已有剧本改写"].map((t) => (
-                <span key={t} className="tag">{t}</span>
+                <button key={t} type="button" className="chip-btn" onClick={() => setInputValue(t === "从一句 idea 开始" ? "一个关于守灯人与逃债青年在雾夜渡轮上相遇的故事" : t)}>
+                  {t}
+                </button>
               ))}
             </div>
           </div>
         )}
 
         {messages.map((msg, i) => (
-          <div key={i} style={{ alignSelf: msg.role === "user" ? "flex-end" : "flex-start", maxWidth: "85%", animation: "fadeIn 0.3s ease" }}>
-            <div style={{
-              padding: "10px 14px",
-              borderRadius: msg.role === "user" ? "16px 16px 4px 16px" : "4px 16px 16px 16px",
-              background: msg.role === "user" ? "linear-gradient(135deg, var(--brand-primary), var(--brand-active))" : "var(--bg-surface-3)",
-              color: msg.role === "user" ? "#fff" : "var(--text-primary)",
-              fontSize: 14, lineHeight: 1.6, whiteSpace: "pre-wrap", wordBreak: "break-word",
-            }}>
+          <div key={i} className={`chat-msg chat-msg-${msg.role}`}>
+            <div className="chat-bubble">
               {msg.content.split("\n").map((line, li) => (
                 <React.Fragment key={li}>{line}{li < msg.content.split("\n").length - 1 && <br />}</React.Fragment>
               ))}
@@ -837,19 +842,18 @@ export default function ChatPanel({
         ))}
 
         {isGenerating && (
-          <div style={{ alignSelf: "flex-start", padding: "10px 14px", borderRadius: "4px 16px 16px 16px", background: "var(--bg-surface-3)", display: "flex", alignItems: "center", gap: 8, fontSize: 13, color: "var(--text-secondary)" }}>
-            <Loader2 size={14} className="spin" />{stopRequested ? "正在停止…" : "正在生成..."}
+          <div className="chat-live">
+            <span className="chat-live-dot pulse-dot" />
+            {stopRequested ? "正在停止…" : "正在生成..."}
             {activeRunId && (
               <button
                 onClick={handleStop}
                 disabled={stopRequested}
-                className="btn-ghost"
+                className="btn-secondary"
                 style={{
                   display: "inline-flex", alignItems: "center", gap: 4,
-                  padding: "2px 10px", borderRadius: 12, fontSize: 12,
-                  border: "1px solid var(--border-default)",
-                  cursor: stopRequested ? "default" : "pointer",
-                  opacity: stopRequested ? 0.5 : 1,
+                  padding: "3px 10px", borderRadius: 999, fontSize: 12,
+                  marginLeft: 4,
                 }}
                 title="停止生成（已完成阶段将保留）"
                 aria-label="停止生成"
@@ -864,12 +868,7 @@ export default function ChatPanel({
           <div style={{ alignSelf: "flex-start", padding: "2px 6px" }}>
             <button
               onClick={handleRefreshContent}
-              className="btn-ghost"
-              style={{
-                display: "inline-flex", alignItems: "center", gap: 4,
-                padding: "4px 12px", borderRadius: 12, fontSize: 12,
-                border: "1px solid var(--border-default)", cursor: "pointer",
-              }}
+              className="chip-btn"
               title="仅重新读取项目内容，不会重新生成"
               aria-label="刷新内容"
             >
@@ -879,17 +878,12 @@ export default function ChatPanel({
         )}
 
         {resumeOffer && !isGenerating && (
-          <div style={{ alignSelf: "flex-start", padding: "2px 6px", display: "flex", gap: 8 }}>
+          <div className="chat-chip-row">
             <button
               onClick={handleResume}
               disabled={resumeBusy}
               className="btn-primary"
-              style={{
-                display: "inline-flex", alignItems: "center", gap: 4,
-                padding: "4px 12px", borderRadius: 12, fontSize: 12,
-                cursor: resumeBusy ? "default" : "pointer",
-                opacity: resumeBusy ? 0.6 : 1,
-              }}
+              style={{ padding: "5px 14px", fontSize: 12 }}
               title="从上次未完成的阶段继续生成（复用已成功的阶段）"
               aria-label="从中断处继续生成"
             >
@@ -898,13 +892,7 @@ export default function ChatPanel({
             <button
               onClick={handleRegenerate}
               disabled={resumeBusy}
-              className="btn-ghost"
-              style={{
-                display: "inline-flex", alignItems: "center", gap: 4,
-                padding: "4px 12px", borderRadius: 12, fontSize: 12,
-                border: "1px solid var(--border-default)",
-                cursor: resumeBusy ? "default" : "pointer",
-              }}
+              className="chip-btn"
               title="丢弃未完成的进度，为当前项目重新完整生成（历史版本保留）"
               aria-label="从头生成"
             >
@@ -914,33 +902,36 @@ export default function ChatPanel({
         )}
       </div>
 
-      {/* Input area — Composer per Design Spec */}
-      <div style={{ padding: "12px 16px", borderTop: "1px solid var(--border-default)", flexShrink: 0, display: "flex", gap: 8, background: "var(--bg-surface)" }}>
-        <textarea
-          value={inputValue}
-          onChange={(e) => setInputValue(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === "Enter" && !e.shiftKey) {
-              e.preventDefault();
-              if (projectId && projectStatus !== "running") handleRefine();
-              else handleGenerate();
-            }
-          }}
-          placeholder={projectId ? "输入修改指令，按 Enter 发送..." : "输入你的故事想法，按 Enter 开始生成..."}
-          rows={2} maxLength={2000}
-          className="composer-input"
-        />
-        <button
-          onClick={projectId && projectStatus !== "running" ? handleRefine : handleGenerate}
-          disabled={!inputValue.trim() || isGenerating}
-          className="btn-primary"
-          style={{
-            width: 48, height: 48, borderRadius: 14, flexShrink: 0,
-            opacity: inputValue.trim() && !isGenerating ? 1 : 0.4,
-          }}
-        >
-          <Send size={18} />
-        </button>
+      {/* Input area — Composer */}
+      <div style={{ padding: "12px 14px 10px", borderTop: "1px solid var(--border-default)", flexShrink: 0, background: "var(--bg-surface)" }}>
+        <div className="composer-shell">
+          <textarea
+            value={inputValue}
+            onChange={(e) => setInputValue(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && !e.shiftKey) {
+                e.preventDefault();
+                if (projectId && projectStatus !== "running") handleRefine();
+                else handleGenerate();
+              }
+            }}
+            placeholder={projectId ? "输入修改指令，按 Enter 发送..." : "输入你的故事想法，按 Enter 开始生成..."}
+            rows={2} maxLength={2000}
+            className="composer-input"
+          />
+          <button
+            onClick={projectId && projectStatus !== "running" ? handleRefine : handleGenerate}
+            disabled={!inputValue.trim() || isGenerating}
+            className="btn-primary composer-send"
+            aria-label="发送"
+          >
+            <Send size={17} />
+          </button>
+        </div>
+        <div className="composer-hint">
+          <span><kbd className="kbd">Enter</kbd> 发送</span>
+          <span><kbd className="kbd">Shift + Enter</kbd> 换行</span>
+        </div>
       </div>
     </div>
   );

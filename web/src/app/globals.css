@@ -10,43 +10,62 @@
   --bg-surface-2: #151E36;
   --bg-surface-3: #1A2440;
   --bg-elevated: #1E2845;
+  --bg-inset: #0C1326;
 
   /* Text */
   --text-primary: #F2F5FB;
   --text-secondary: #B7C0D4;
-  --text-tertiary: #8591AA;
+  --text-tertiary: #98A3B8;
   --text-disabled: #5E6982;
 
   /* Border */
   --border-default: #25314F;
   --border-strong: #334166;
+  --hairline: rgba(179, 191, 214, 0.10);
 
   /* Brand */
   --brand-primary: #7C7CFF;
   --brand-hover: #9292FF;
   --brand-active: #6666F2;
   --brand-soft: rgba(124, 124, 255, 0.14);
+  --brand-soft-strong: rgba(124, 124, 255, 0.22);
 
   /* Accent */
   --accent-gold: #E0AE57;
+  --accent-gold-soft: rgba(224, 174, 87, 0.12);
   --accent-rose: #E07A92;
   --accent-cyan: #56B7D1;
 
   /* Semantic */
   --success: #35B779;
+  --success-soft: rgba(53, 183, 121, 0.12);
   --warning: #E3A53F;
+  --warning-soft: rgba(227, 165, 63, 0.10);
   --error: #F06A7A;
+  --error-soft: rgba(240, 106, 122, 0.10);
   --info: #6FA8FF;
 
-  /* Shadow */
-  --shadow-sm: 0 2px 10px rgba(0, 0, 0, 0.18);
-  --shadow-md: 0 8px 28px rgba(0, 0, 0, 0.24);
-  --shadow-lg: 0 18px 48px rgba(0, 0, 0, 0.30);
+  /* Shadow — layered, never decorative on flat surfaces */
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.25), 0 2px 8px rgba(0, 0, 0, 0.18);
+  --shadow-md: 0 2px 6px rgba(0, 0, 0, 0.28), 0 10px 28px rgba(0, 0, 0, 0.24);
+  --shadow-lg: 0 4px 12px rgba(0, 0, 0, 0.30), 0 20px 52px rgba(0, 0, 0, 0.34);
 
   /* Radius */
   --radius-sm: 6px;
   --radius-md: 10px;
-  --radius-lg: 16px;
+  --radius-lg: 14px;
+  --radius-pill: 999px;
+
+  /* Typography */
+  --font-ui: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Noto Sans SC",
+    "Microsoft YaHei", sans-serif;
+  --font-serif: Georgia, "Songti SC", "STSong", "Noto Serif CJK SC", "Source Han Serif SC",
+    SimSun, serif;
+  --font-mono: ui-monospace, "Cascadia Code", "SF Mono", Consolas, "Courier New", monospace;
+
+  /* Motion — small, fast, purposeful */
+  --motion-fast: 120ms ease;
+  --motion-base: 180ms ease;
 
   /* Legacy aliases (for gradual migration) */
   --bg-primary: var(--bg-app);
@@ -61,47 +80,56 @@
   --accent-red: var(--error);
 }
 
-/* Light Theme (Paper Studio) */
+/* Light Theme (Paper Studio) — warm paper, cool ink */
 :root[data-theme="light"] {
   /* Background */
-  --bg-app: #F6F7FB;
-  --bg-sidebar: #F8F5EF;
+  --bg-app: #F3F1EC;
+  --bg-sidebar: #F8F6F1;
   --bg-surface: #FFFFFF;
-  --bg-surface-2: #F2F4F8;
-  --bg-surface-3: #ECEFF5;
-  --bg-elevated: #F0F2F7;
+  --bg-surface-2: #F6F4EE;
+  --bg-surface-3: #EDEAE1;
+  --bg-elevated: #FFFFFF;
+  --bg-inset: #F1EEE7;
 
   /* Text */
-  --text-primary: #151A23;
-  --text-secondary: #5B6472;
-  --text-tertiary: #8A93A3;
-  --text-disabled: #B2B8C3;
+  --text-primary: #1F232B;
+  --text-secondary: #59616E;
+  --text-tertiary: #6E7683;
+  --text-disabled: #B4BAC4;
 
   /* Border */
-  --border-default: #E2E7F0;
-  --border-strong: #CDD5E3;
+  --border-default: #E2DFD6;
+  --border-strong: #CFCABB;
+  --hairline: rgba(31, 35, 43, 0.08);
 
   /* Brand */
   --brand-primary: #5B5BD6;
   --brand-hover: #4D4DCA;
   --brand-active: #3F40B8;
-  --brand-soft: #EEF0FF;
+  --brand-soft: #ECECFB;
+  --brand-soft-strong: #DFE0F8;
 
   /* Accent */
-  --accent-gold: #C6923D;
-  --accent-rose: #D46A7E;
-  --accent-cyan: #3E9FB8;
+  --accent-gold: #A8762A;
+  --accent-gold-soft: rgba(168, 118, 42, 0.10);
+  --accent-rose: #A84459;
+  --accent-cyan: #2E8299;
 
   /* Semantic */
-  --success: #2E9B62;
-  --warning: #D68A1F;
-  --error: #D14B57;
-  --info: #4C7CF0;
+  --success: #25845A;
+  --success-soft: rgba(37, 132, 90, 0.10);
+  --warning: #A96F14;
+  --warning-soft: rgba(169, 111, 20, 0.10);
+  --error: #C13A49;
+  --error-soft: rgba(193, 58, 73, 0.09);
+  --info: #3D6FE0;
 
   /* Shadow */
-  --shadow-sm: 0 2px 8px rgba(20, 28, 45, 0.05);
-  --shadow-md: 0 6px 24px rgba(20, 28, 45, 0.06);
-  --shadow-lg: 0 14px 40px rgba(20, 28, 45, 0.08);
+  --shadow-sm: 0 1px 2px rgba(30, 25, 12, 0.06), 0 2px 8px rgba(30, 25, 12, 0.05);
+  --shadow-md: 0 2px 6px rgba(30, 25, 12, 0.07), 0 10px 26px rgba(30, 25, 12, 0.07);
+  --shadow-lg: 0 4px 12px rgba(30, 25, 12, 0.08), 0 20px 48px rgba(30, 25, 12, 0.10);
+
+  /* Radius / type / motion: inherit from :root */
 
   /* Legacy aliases (for gradual migration) */
   --bg-primary: var(--bg-app);
@@ -126,15 +154,62 @@
 
 html, body {
   height: 100%;
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Noto Sans SC", sans-serif;
+  font-family: var(--font-ui);
   background: var(--bg-app);
   color: var(--text-primary);
   overflow: hidden;
-  transition: background-color 0.3s ease, color 0.3s ease, border-color 0.3s ease;
+  transition: background-color 0.3s ease, color 0.3s ease;
 }
 
-/* Scrollbar */
-::-webkit-scrollbar { width: 6px; }
-::-webkit-scrollbar-track { background: var(--bg-surface-2); }
-::-webkit-scrollbar-thumb { background: var(--border-default); border-radius: 3px; }
-::-webkit-scrollbar-thumb:hover { background: var(--text-disabled); }
+/* Serif display — story content and editorial headings */
+.font-serif,
+.serif-display {
+  font-family: var(--font-serif);
+}
+
+/* Monospace — ids, revisions, prompts */
+.mono {
+  font-family: var(--font-mono);
+}
+
+/* Micro label — small tracked captions above sections */
+.micro-label {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  color: var(--text-tertiary);
+}
+
+/* ── Focus visibility (global baseline) ──────── */
+
+button:focus-visible,
+[role="button"]:focus-visible,
+a:focus-visible,
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible,
+[tabindex]:focus-visible {
+  outline: 2px solid var(--brand-primary);
+  outline-offset: 2px;
+  border-radius: var(--radius-sm);
+}
+
+/* ── Scrollbar ───────────────────────────────── */
+
+::-webkit-scrollbar { width: 9px; height: 9px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: var(--border-default);
+  border-radius: var(--radius-pill);
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+::-webkit-scrollbar-thumb:hover { background-color: var(--text-disabled); }
+
+/* Reduced motion: keep layout transitions, drop everything decorative */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}

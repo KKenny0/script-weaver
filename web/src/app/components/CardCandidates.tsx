@@ -1,14 +1,23 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
+import { Loader2, RefreshCw, Sparkles } from "lucide-react";
 import type { CardEditSession } from "./CardEditDrawer";
 
 const labels: Record<string, string> = { ready: "待采用", stale: "已过期 · 项目发生变化，请重新发起", accepted: "已采用", rejected: "已放弃" };
 
+/** Render a candidate value readably: strings as-is, others as compact JSON. */
+function previewValue(v: unknown): string {
+  if (v == null) return "";
+  if (typeof v === "string") return v;
+  return JSON.stringify(v);
+}
+
 /** Each mounted drawer owns its requests. No response can survive cleanup,
  * including delayed JSON parsing, catch and finally. Runs live on the server. */
 export default function CardCandidates({ session, dirty, onAccepted, onReload, fieldLabels }: {
-  session: CardEditSession; dirty: boolean; fieldLabels: Record<string, string>; onAccepted: (snapshot: any) => void; onReload: () => void;
+  session: CardEditSession; dirty: boolean; onAccepted: (snapshot: any) => void; onReload: () => void;
+  fieldLabels: Record<string, string>;
 }) {
   const [instruction, setInstruction] = useState("");
   const [data, setData] = useState<{ candidates: any[]; runs: any[] }>({ candidates: [], runs: [] });
@@ -81,37 +90,43 @@ export default function CardCandidates({ session, dirty, onAccepted, onReload, f
     void act(`/candidates/${id}/accept`, undefined, true);
   };
 
-  return <section className="ced-ro" aria-label="AI 定向修改" data-testid="card-candidates">
-    <h4>AI 定向修改</h4>
-    <p style={{ fontSize: 12 }}>候选采用前不会改变当前内容。生成期间仍可手工编辑。</p>
-    <button type="button" className="btn-ghost" onClick={() => {
-      if (!dirty || window.confirm("载入最新内容将丢弃未保存的手工草稿，继续吗？")) onReload();
-    }}>载入最新内容后重新发起</button>
-    <label htmlFor={`candidate-instruction-${session.seq}`}>修改要求</label>
+  return <section className="ced-ai" aria-label="AI 定向修改" data-testid="card-candidates">
+    <div className="ced-ai-title"><Sparkles size={13} /> AI 定向修改</div>
+    <p className="ced-ai-hint">候选采用前不会改变当前内容。生成期间仍可手工编辑。</p>
+    <label htmlFor={`candidate-instruction-${session.seq}`} className="ced-label">修改要求</label>
     <textarea id={`candidate-instruction-${session.seq}`} className="ced-textarea" value={instruction}
-      onChange={e => setInstruction(e.target.value)} rows={2} />
-    <button type="button" className="btn-secondary" disabled={busy || !!active || !instruction.trim()}
-      onClick={() => void act(`/artifacts/${session.kind}/${encodeURIComponent(session.id)}/candidates`, {
-        instruction, expected_revision: session.revision, request_key: crypto.randomUUID(),
-      })}>生成候选</button>
-    {active && <div role="status">
+      onChange={e => setInstruction(e.target.value)} rows={2}
+      placeholder="例如：把这一镜改成手持跟拍，增强紧迫感" />
+    <div className="ced-ai-toolbar">
+      <button type="button" className="btn-secondary" style={{ fontSize: 12, padding: "6px 12px" }} disabled={busy || !!active || !instruction.trim()}
+        onClick={() => void act(`/artifacts/${session.kind}/${encodeURIComponent(session.id)}/candidates`, {
+          instruction, expected_revision: session.revision, request_key: crypto.randomUUID(),
+        })}>生成候选</button>
+      <button type="button" className="btn-ghost" style={{ width: "auto", padding: "0 10px", fontSize: 12, gap: 4 }} onClick={() => {
+        if (!dirty || window.confirm("载入最新内容将丢弃未保存的手工草稿，继续吗？")) onReload();
+      }}><RefreshCw size={12} />载入最新内容后重新发起</button>
+    </div>
+    {active && <div className="ced-ai-status" role="status">
+      <Loader2 size={12} className="spin" />
       {active.last_progress?.message || "正在生成候选…"}
-      <button type="button" className="btn-secondary" disabled={busy || active.status === "stopping"}
+      <button type="button" className="btn-secondary" style={{ fontSize: 12, padding: "4px 10px" }} disabled={busy || active.status === "stopping"}
         onClick={() => void act(`/runs/${active.run_id}/stop`)}>停止候选生成</button>
     </div>}
-    {error && <p role="alert">{error}</p>}
+    {error && <p className="ced-ai-error" role="alert">{error}</p>}
     {runs.filter(r => ["failed", "cancelled", "interrupted"].includes(r.status)).map(run =>
-      <p key={run.run_id} role="status">{run.error || "候选生成已停止"}；原内容保留，可重新发起。</p>)}
-    {data.candidates.filter(relevant).map(candidate => <details key={candidate.id} open={candidate.status === "ready"}>
+      <p key={run.run_id} className="ced-ai-note" role="status">{run.error || "候选生成已停止"}；原内容保留，可重新发起。</p>)}
+    {data.candidates.filter(relevant).map(candidate => <details key={candidate.id} className="ced-candidate" open={candidate.status === "ready"}>
       <summary>{labels[candidate.status]} · 依据 r{candidate.base_revision}{candidate.accepted_revision ? ` → r${candidate.accepted_revision}` : ""}</summary>
-      {Object.keys(candidate.changes).map(field => <div key={field} style={{ margin: "8px 0", overflowWrap: "anywhere" }}>
+      {Object.keys(candidate.changes).map(field => <div key={field} className="ced-diff-field">
         <strong>{fieldLabels[field] ?? field}</strong>
-        <div>原值：{JSON.stringify(candidate.original[field])}</div>
-        <div>候选：{JSON.stringify(candidate.proposed[field])}</div>
+        <div className="ced-diff-row before"><span className="ced-diff-label">原值</span>{previewValue(candidate.original[field])}</div>
+        <div className="ced-diff-row after"><span className="ced-diff-label">候选</span>{previewValue(candidate.proposed[field])}</div>
       </div>)}
-      {candidate.status === "ready" && <button type="button" className="btn-primary" disabled={busy} onClick={() => accept(candidate.id)}>采用候选</button>}
-      {["ready", "stale"].includes(candidate.status) && <button type="button" className="btn-secondary" disabled={busy}
-        onClick={() => void act(`/candidates/${candidate.id}/reject`)}>放弃候选</button>}
+      {candidate.status === "ready" && <div className="ced-candidate-actions">
+        <button type="button" className="btn-primary" style={{ fontSize: 12, padding: "5px 12px" }} disabled={busy} onClick={() => accept(candidate.id)}>采用候选</button>
+        {["ready", "stale"].includes(candidate.status) && <button type="button" className="btn-secondary" style={{ fontSize: 12, padding: "5px 12px" }} disabled={busy}
+          onClick={() => void act(`/candidates/${candidate.id}/reject`)}>放弃候选</button>}
+      </div>}
     </details>)}
     {confirmId && <div className="ced-confirm" role="alertdialog" aria-label="采用候选前确认丢弃草稿">
       <div className="ced-confirm-card">
