@@ -57,15 +57,32 @@ function cameraMovementLabel(movement: string): string {
   return map[movement] || movement;
 }
 
+function transitionLabel(transition: string): string {
+  const map: Record<string, string> = {
+    cut: "硬切", fade_in: "淡入", fade_out: "淡出", dissolve: "叠化",
+    smash_cut: "碎切", match_cut: "匹配剪辑", jump_cut: "跳切",
+    cross_dissolve: "交叉叠化", hard_cut: "硬切", wipe: "划像",
+  };
+  return transition ? (map[transition] || transition) : "";
+}
+
+const ROLE_LABELS: Record<string, string> = {
+  protagonist: "主角",
+  antagonist: "反派",
+  supporting: "配角",
+  extra: "龙套",
+};
+
 // ── Sub-components ───────────────────────────────
 
 function EmptyState({ text }: { text: string }) {
+  const isOutline = text.includes("大纲");
   return (
-    <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", height: "100%", color: "var(--text-tertiary)", gap: 12, padding: 40 }}>
-      <FileText size={40} opacity={0.3} />
-      <p style={{ fontSize: 14 }}>{text}</p>
-      <p style={{ fontSize: 12 }}>
-        {text.includes("大纲") ? "先在左侧输入故事想法并点击生成" : "该部分内容将在 Pipeline 完成后显示"}
+    <div className="empty-state">
+      <div className="empty-state-mark"><FileText size={26} strokeWidth={1.5} /></div>
+      <p className="empty-state-title">{text}</p>
+      <p className="empty-state-hint">
+        {isOutline ? "先在左侧输入故事想法并点击生成" : "该部分内容将在 Pipeline 完成后显示"}
       </p>
     </div>
   );
@@ -74,9 +91,30 @@ function EmptyState({ text }: { text: string }) {
 function InfoRow({ label, value, highlight }: { label: string; value: string; highlight?: boolean }) {
   if (!value) return null;
   return (
-    <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13, padding: "4px 0", borderBottom: "1px solid var(--border-default)" }}>
-      <span style={{ color: "var(--text-secondary)" }}>{label}</span>
-      <span style={{ color: highlight ? "var(--brand-primary)" : "var(--text-primary)", fontWeight: highlight ? 500 : 400 }}>{value}</span>
+    <div className="info-row">
+      <span className="info-row-label">{label}</span>
+      <span className={`info-row-value${highlight ? " highlight" : ""}`}>{value}</span>
+    </div>
+  );
+}
+
+/** Card field row: muted label inline with the value text. */
+function FieldLine({ label, value }: { label: string; value?: string | null }) {
+  if (!value) return null;
+  return (
+    <div className="field-line">
+      <span className="field-line-label">{label}</span>
+      <span className="field-line-value">{value}</span>
+    </div>
+  );
+}
+
+/** Prompt block with a tracked micro label; clamped via CSS, full text on hover title. */
+function PromptBlock({ label, text, lines = 3 }: { label: string; text: string; lines?: number }) {
+  return (
+    <div className="prompt-box" title={text}>
+      <span className="prompt-label">{label}</span>
+      <code style={{ WebkitLineClamp: lines }}>{text}</code>
     </div>
   );
 }
@@ -102,7 +140,7 @@ function CardEditButton({
       title={label}
       onClick={() => onEditCard(kind, id)}
     >
-      <Pencil size={12} /> 编辑
+      <Pencil size={11} /> 编辑
     </button>
   );
 }
@@ -126,16 +164,18 @@ function renderOutline(data: ArtifactData) {
       {o.plot_outline?.length > 0 && (
         <div className="info-card">
           <h4>情节节拍</h4>
-          {o.plot_outline.map((beat: any, i: number) => (
-            <div key={i} className="beat-item">
-              <span className="beat-num">{beat.sequence_number}</span>
-              <div className="beat-body">
-                <span className="beat-title">{beat.title}</span>
-                <p className="beat-synopsis">{beat.synopsis}</p>
-                {beat.emotional_arc && <span className="beat-emotion">情绪: {beat.emotional_arc}</span>}
+          <div className="beat-list">
+            {o.plot_outline.map((beat: any, i: number) => (
+              <div key={i} className="beat-item">
+                <span className="beat-num">{beat.sequence_number}</span>
+                <div className="beat-body">
+                  <span className="beat-title">{beat.title}</span>
+                  <p className="beat-synopsis">{beat.synopsis}</p>
+                  {beat.emotional_arc && <span className="beat-emotion">情绪: {beat.emotional_arc}</span>}
+                </div>
               </div>
-            </div>
-          ))}
+            ))}
+          </div>
         </div>
       )}
     </div>
@@ -149,18 +189,18 @@ function renderCharacters(data: ArtifactData, onEditCard?: EditCardHandler) {
       {data.characters.map((char: any) => (
         <div key={char.id} className="card character-card">
           <div className="card-header">
-            <Users size={16} />
-            <span>{char.name}</span>
-            <span className={`role-tag role-${char.role}`}>{char.role}</span>
+            <div className="char-identity">
+              <span className="char-disc">{(char.name || "?").slice(0, 1)}</span>
+              <span className="char-name">{char.name}</span>
+            </div>
+            <span className={`role-tag role-${char.role}`}>{ROLE_LABELS[char.role] || char.role}</span>
             <CardEditButton kind="characters" id={char.id} name={char.name} onEditCard={onEditCard} />
           </div>
           <div className="card-body">
-            {char.appearance && <p className="text-sm muted">{char.appearance}</p>}
-            {char.personality && <p className="text-sm"><strong>性格:</strong> {char.personality}</p>}
-            {char.motivation && <p className="text-sm"><strong>动机:</strong> {char.motivation}</p>}
-            {char.image_prompt && (
-              <div className="prompt-box"><code className="text-xs">{char.image_prompt.slice(0, 120)}...</code></div>
-            )}
+            {char.appearance && <p className="text-sm muted" title={char.appearance}>{char.appearance}</p>}
+            <FieldLine label="性格" value={char.personality} />
+            <FieldLine label="动机" value={char.motivation} />
+            {char.image_prompt && <PromptBlock label="Image Prompt" text={char.image_prompt} lines={2} />}
           </div>
         </div>
       ))}
@@ -175,7 +215,7 @@ function renderScenes(data: ArtifactData, onEditCard?: EditCardHandler) {
       {data.scenes.map((scene: any) => (
         <div key={scene.id} className="card scene-card">
           <div className="card-header">
-            <Map size={16} />
+            <Map size={15} />
             <span>{scene.name}</span>
             <CardEditButton kind="scenes" id={scene.id} name={scene.name} onEditCard={onEditCard} />
           </div>
@@ -183,11 +223,15 @@ function renderScenes(data: ArtifactData, onEditCard?: EditCardHandler) {
             <InfoRow label="类型" value={scene.location_type} />
             <InfoRow label="时间" value={scene.time_of_day} />
             <InfoRow label="氛围" value={scene.mood} highlight />
-            {scene.environment && <p className="text-sm muted mt-1">{scene.environment.slice(0, 150)}...</p>}
+            {scene.environment && (
+              <p className="text-sm muted mt-1" style={{
+                display: "-webkit-box", WebkitLineClamp: 3, WebkitBoxOrient: "vertical", overflow: "hidden",
+              }} title={scene.environment}>{scene.environment}</p>
+            )}
             {scene.color_palette?.length > 0 && (
               <div className="color-swatches">
                 {scene.color_palette.map((c: string, j: number) => (
-                  <span key={j} className="color-dot" style={{ background: c }} />
+                  <span key={j} className="color-dot" style={{ background: c }} title={c} />
                 ))}
               </div>
             )}
@@ -205,14 +249,14 @@ function renderArtStyle(data: ArtifactData) {
     <div className="artifact-content">
       <div className="info-card">
         <h4>整体风格</h4>
-        <p className="highlight-text">{s.overall_style}</p>
+        <p className="highlight-text" style={{ lineHeight: 1.7, fontSize: 13.5 }}>{s.overall_style}</p>
       </div>
       <div className="grid-2col">
         <div className="info-card">
           <h5>主色调</h5>
           <div className="color-swatches">
             {(s.color_palette_primary || []).map((c: string, i: number) => (
-              <span key={i} className="color-dot large" style={{ background: c }} />
+              <span key={i} className="color-dot large" style={{ background: c }} title={c} />
             ))}
           </div>
         </div>
@@ -220,12 +264,12 @@ function renderArtStyle(data: ArtifactData) {
           <h5>辅助色</h5>
           <div className="color-swatches">
             {(s.color_palette_secondary || []).map((c: string, i: number) => (
-              <span key={i} className="color-dot large" style={{ background: c }} />
+              <span key={i} className="color-dot large" style={{ background: c }} title={c} />
             ))}
           </div>
         </div>
       </div>
-      <div className="info-card"><h5>光影风格</h5><p>{s.lighting_style}</p></div>
+      <div className="info-card"><h5>光影风格</h5><p style={{ fontSize: 13, lineHeight: 1.7 }}>{s.lighting_style}</p></div>
       <div className="info-card">
         <h5>参考美学</h5>
         <div className="tag-list">
@@ -282,11 +326,12 @@ function renderStoryboard(data: ArtifactData, onEditCard?: EditCardHandler) {
   if (!data.visual_highlights?.length && !data.storyboard)
     return <EmptyState text="暂无影像亮点数据" />;
 
+  const sb = data.storyboard as any;
   return (
     <div className="artifact-content">
       {data.visual_highlights?.length > 0 && (
         <div className="info-card">
-          <h4><Eye size={16} style={{ display: "inline", marginRight: 6 }} />影像亮点</h4>
+          <h4><Eye size={15} />影像亮点</h4>
           {data.visual_highlights.map((vh: any, i: number) => (
             <div key={i} className="highlight-item">
               <span className="highlight-title">{vh.title}</span>
@@ -297,36 +342,36 @@ function renderStoryboard(data: ArtifactData, onEditCard?: EditCardHandler) {
         </div>
       )}
 
-      {data.storyboard && (
+      {sb && (
         <>
           <div className="sb-header">
-            <h4><Film size={16} style={{ display: "inline", marginRight: 6 }} />分镜脚本</h4>
-            <span className="badge">{(data.storyboard as any).total_shot_count} 镜头 · ~{Math.round((data.storyboard as any).total_estimated_duration)}s</span>
-            <span className="badge muted">{(data.storyboard as any).aspect_ratio} · {(data.storyboard as any).fps}fps</span>
+            <h4><Film size={15} />分镜脚本</h4>
+            <span className="badge">{sb.total_shot_count} 镜头 · ~{Math.round(sb.total_estimated_duration)}s</span>
+            <span className="badge mono">{sb.aspect_ratio} · {sb.fps}fps</span>
           </div>
           {/* Every shot stays reachable in a plain scrolling list — no cap,
               no virtualization (ticket #16). Stable ids key and locate cards. */}
           <div className="shots-grid">
-            {(data.storyboard as any).shots?.map((shot: any) => (
+            {sb.shots?.map((shot: any, i: number) => (
               <div key={shot.shot_id} className="shot-card">
-                <div className="shot-header-row">
-                  <span className="shot-id">{shot.shot_id?.slice(-6)}</span>
+                <div className="shot-slate">
+                  <span className="shot-index">{String(shot.sequence_number || i + 1).padStart(2, "0")}</span>
                   <span className="shot-size">{shotSizeLabel(shot.shot_size)}</span>
+                  <span className="shot-id-chip" title={shot.shot_id}>{shot.shot_id?.slice(-6)}</span>
                   <span className="shot-duration">{shot.duration_seconds}s</span>
                   <CardEditButton kind="shots" id={shot.shot_id} name={shot.shot_id} onEditCard={onEditCard} />
                 </div>
-                <p className="shot-desc">{shot.visual_description?.slice(0, 120)}</p>
-                <div className="shot-meta-row">
-                  <span>{cameraAngleLabel(shot.camera_angle)}</span>
-                  <span>{cameraMovementLabel(shot.camera_movement)}</span>
-                  <span>{shot.transition_to_next}</span>
-                </div>
-                {shot.video_prompt && (
-                  <div className="prompt-box">
-                    <span className="prompt-label">Video Prompt:</span>
-                    <code className="text-xs">{shot.video_prompt.slice(0, 150)}...</code>
+                <div className="shot-body">
+                  <p className="shot-desc" title={shot.visual_description}>{shot.visual_description}</p>
+                  <div className="shot-meta-row">
+                    <span className="shot-meta-chip">{cameraAngleLabel(shot.camera_angle)}</span>
+                    <span className="shot-meta-chip">{cameraMovementLabel(shot.camera_movement)}</span>
+                    {transitionLabel(shot.transition_to_next) && (
+                      <span className="shot-meta-chip">转场 · {transitionLabel(shot.transition_to_next)}</span>
+                    )}
                   </div>
-                )}
+                  {shot.video_prompt && <PromptBlock label="Video Prompt" text={shot.video_prompt} />}
+                </div>
               </div>
             ))}
           </div>

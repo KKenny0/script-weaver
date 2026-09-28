@@ -25,6 +25,13 @@ const STAGE_LABELS: Record<string, string> = {
   complete: "已完成",
 };
 
+/** Stage dot color — the rail's quiet status signal. */
+function stageTone(stage: string): string {
+  if (stage === "complete") return "complete";
+  if (stage === "reviewing" || stage === "designing" || stage === "scripting" || stage === "storyboarding") return "running";
+  return "";
+}
+
 function stageLabel(stage: string): string {
   return STAGE_LABELS[stage] || stage || "创意";
 }
@@ -101,7 +108,7 @@ export default function ProjectList({
 
   return (
     <nav aria-label="项目列表" style={{
-      width: 236, flexShrink: 0, borderRight: "1px solid var(--border-default)",
+      width: 232, flexShrink: 0, borderRight: "1px solid var(--border-default)",
       background: "var(--bg-sidebar)", display: "flex", flexDirection: "column",
       overflow: "hidden",
     }}>
@@ -112,8 +119,8 @@ export default function ProjectList({
       }}>
         <FolderOpen size={15} style={{ color: "var(--brand-primary)" }} />
         <span style={{ fontWeight: 600, fontSize: 13 }}>项目</span>
-        <span style={{ fontSize: 11, color: "var(--text-tertiary)" }}>{projects.length}</span>
-        <div style={{ marginLeft: "auto", display: "flex", gap: 4 }}>
+        <span className="badge" style={{ padding: "1px 8px", fontSize: 10.5 }}>{projects.length}</span>
+        <div style={{ marginLeft: "auto", display: "flex", gap: 2 }}>
           <button onClick={onRefresh} className="btn-ghost" style={{ width: 26, height: 26 }} title="刷新列表" aria-label="刷新项目列表">
             <RefreshCw size={13} />
           </button>
@@ -124,18 +131,18 @@ export default function ProjectList({
       </div>
 
       <div style={{ padding: "0 14px 10px", flexShrink: 0 }}>
-        <button onClick={onNew} className="btn-primary" style={{ width: "100%", padding: "7px 10px", fontSize: 12, borderRadius: 10, display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}>
+        <button onClick={onNew} className="btn-primary" style={{ width: "100%", padding: "7px 10px", fontSize: 12.5, display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}>
           <Plus size={13} />新建项目
         </button>
       </div>
 
       {/* List */}
       <ul style={{
-        flex: 1, overflowY: "auto", margin: 0, padding: "0 8px 12px", listStyle: "none",
-        display: "flex", flexDirection: "column", gap: 4,
+        flex: 1, overflowY: "auto", margin: 0, padding: "0 10px 12px", listStyle: "none",
+        display: "flex", flexDirection: "column", gap: 3,
       }}>
         {projects.length === 0 && (
-          <li style={{ padding: "16px 8px", fontSize: 12, color: "var(--text-tertiary)", textAlign: "center" }}>
+          <li style={{ padding: "16px 8px", fontSize: 12, color: "var(--text-tertiary)", textAlign: "center", lineHeight: 1.7 }}>
             还没有项目。输入一个故事想法开始创作。
           </li>
         )}
@@ -167,30 +174,21 @@ export default function ProjectList({
                       <X size={13} />
                     </button>
                   </div>
-                  {error && <span role="alert" style={{ fontSize: 11, color: "var(--danger, #e5484d)" }}>{error}</span>}
+                  {error && <span role="alert" style={{ fontSize: 11, color: "var(--error)" }}>{error}</span>}
                 </div>
               ) : (
                 <div style={{ display: "flex", alignItems: "stretch" }}>
                   <button
                     onClick={() => onSelect(p.project_id)}
                     aria-current={isCurrent ? "true" : undefined}
-                    style={{
-                      flex: 1, minWidth: 0, textAlign: "left", cursor: "pointer",
-                      padding: "8px 10px", borderRadius: 10,
-                      border: isCurrent ? "1px solid var(--brand-primary)" : "1px solid transparent",
-                      background: isCurrent ? "var(--brand-soft)" : "transparent",
-                      display: "flex", flexDirection: "column", gap: 3,
-                      transition: "all 0.15s ease",
-                    }}
+                    className={`rail-item${isCurrent ? " is-current" : ""}`}
                     title={`打开项目「${p.title}」`}
                   >
-                    <span style={{
-                      fontSize: 13, fontWeight: isCurrent ? 600 : 400, color: "var(--text-primary)",
-                      whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis",
-                    }}>
+                    <span className="rail-item-title">
                       {p.title || "未命名项目"}
                     </span>
-                    <span style={{ fontSize: 11, color: "var(--text-tertiary)" }}>
+                    <span className="rail-item-meta">
+                      <span className={`rail-stage-dot ${stageTone(p.stage)}`} />
                       {stageLabel(p.stage)} · 更新于 {formatTime(p.updated_at)}
                     </span>
                   </button>

@@ -122,6 +122,8 @@ export default function HomePage() {
   const [activeTab, setActiveTab] = useState<string>("outline");
   const [artifactData, setArtifactData] = useState<ArtifactData>({});
   const [projectStatus, setProjectStatus] = useState<"idle" | "running" | "complete" | "error">("idle");
+  // The display title of the open project (from the adopted snapshot's meta).
+  const [projectTitle, setProjectTitle] = useState<string>("");
   const [leftPanelCollapsed, setLeftPanelCollapsed] = useState(false);
   const [projectListOpen, setProjectListOpen] = useState(true);
   const [sessionNotice, setSessionNotice] = useState<SessionNotice | null>(null);
@@ -231,6 +233,7 @@ export default function HomePage() {
     displayedSnapshotRef.current = { projectId: pid, revision };
     setProjectRevision(revision);
     setArtifactData(pickArtifactData(fullState));
+    setProjectTitle(typeof fullState?.meta?.title === "string" ? fullState.meta.title : "");
     const flags = reviewFlagsOf(fullState);
     setReviewState(flags.length > 0 ? { projectId: pid, flags, revision } : null);
     return true;
@@ -240,6 +243,7 @@ export default function HomePage() {
   const resetDisplayedSnapshot = useCallback((pid: string) => {
     displayedSnapshotRef.current = { projectId: pid, revision: 0 };
     setProjectRevision(0);
+    setProjectTitle("");
     setReviewState(null);
     setReviewHiddenFor(null);
   }, []);
@@ -828,33 +832,19 @@ export default function HomePage() {
       {leftPanelCollapsed && (
         <button
           onClick={() => setLeftPanelCollapsed(false)}
-          style={{
-            position: "fixed",
-            left: projectListOpen ? 248 : 56,
-            top: "50%",
-            transform: "translateY(-50%)",
-            zIndex: 100,
-            width: 36,
-            height: 48,
-            borderRadius: 8,
-            border: "1px solid var(--border-default)",
-            background: "var(--bg-sidebar)",
-            color: "var(--text-secondary)",
-            cursor: "pointer",
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-          }}
+          className="chat-expand-handle"
+          style={{ left: projectListOpen ? 244 : 56 }}
           title="展开对话面板"
           aria-label="展开对话面板"
         >
-          <PanelLeftOpen size={18} />
+          <PanelLeftOpen size={15} />
         </button>
       )}
 
       {/* Right Panel: Structured Output */}
       <ArtifactPanel
         projectId={projectId}
+        projectTitle={projectTitle || projects.find((p) => p.project_id === projectId)?.title || ""}
         artifactData={artifactData}
         projectStatus={projectStatus}
         activeTab={activeTab}

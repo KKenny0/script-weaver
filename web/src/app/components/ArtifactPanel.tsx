@@ -73,6 +73,7 @@ interface PendingExport {
 
 interface ArtifactPanelProps {
   projectId: string;
+  projectTitle: string;
   artifactData: ArtifactData;
   projectStatus: "idle" | "running" | "complete" | "error";
   activeTab: string;
@@ -96,20 +97,8 @@ interface ArtifactPanelProps {
   onCloseHistory: () => void;
 }
 
-function iconBtnStyle(enabled: boolean): React.CSSProperties {
-  return {
-    width: 36, height: 36, borderRadius: 10,
-    border: "1px solid var(--border-default)",
-    background: enabled ? "var(--bg-surface-3)" : "transparent",
-    color: enabled ? "var(--text-primary)" : "var(--text-disabled)",
-    cursor: enabled ? "pointer" : "not-allowed",
-    display: "flex", alignItems: "center", justifyContent: "center",
-    transition: "all 0.15s ease",
-  };
-}
-
 export default function ArtifactPanel({
-  projectId, artifactData, projectStatus,
+  projectId, projectTitle, artifactData, projectStatus,
   activeTab, onTabChange, onCollapse,
   onEditCard, reviewNotice, onDismissReviewNotice, onOpenReviewPanel,
   projectSessionRef, isProjectSessionActive,
@@ -126,13 +115,23 @@ export default function ArtifactPanel({
   // effect below only clears what the user sees right now on a switch.
   const [pendingExport, setPendingExport] = useState<PendingExport | null>(null);
   const [exportBusy, setExportBusy] = useState(false);
+  // Export failures surface as an inline banner (auto-dismissed) instead of
+  // a blocking alert() — same visibility, calmer presentation.
+  const [exportError, setExportError] = useState<string | null>(null);
   const exportDialogRef = useRef<HTMLDialogElement>(null);
   const previouslyFocusedRef = useRef<HTMLElement | null>(null);
 
   useEffect(() => {
     setPendingExport(null);
     setExportBusy(false);
+    setExportError(null);
   }, [projectId]);
+
+  useEffect(() => {
+    if (!exportError) return;
+    const timer = setTimeout(() => setExportError(null), 6000);
+    return () => clearTimeout(timer);
+  }, [exportError]);
 
   // Native <dialog> for the export confirmation: showModal on open, Escape
   // cancels (nothing is downloaded), focus restored after close.
@@ -219,7 +218,7 @@ export default function ArtifactPanel({
       });
     } catch (err: any) {
       if (!isMine()) return; // no stale error in the new session
-      alert(`导出失败: ${err.message}`);
+      setExportError(`导出失败: ${err.message}`);
     } finally {
       if (isMine()) setExportBusy(false);
     }
@@ -228,53 +227,49 @@ export default function ArtifactPanel({
   return (
     <div style={{ flex: 1, display: "flex", flexDirection: "column", minWidth: 0, overflow: "hidden", background: "var(--bg-app)" }}>
       {/* Top bar */}
-      <div style={{
-        padding: "14px 24px",
-        borderBottom: "1px solid var(--border-default)",
-        display: "flex",
-        alignItems: "center",
-        gap: 12,
-        flexShrink: 0,
-        background: "var(--bg-surface)",
-      }}>
-        <div style={{ flex: 1, minWidth: 0 }}>
-          <h3 style={{ fontSize: 15, fontWeight: 600, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
-            {artifactData.outline ? ((artifactData.outline as any)?.basic_info?.title || "剧本概要") : "Script-Weaver"}
-          </h3>
-        </div>
+      <header className="wb-topbar">
+        <h3 className="wb-topbar-title" title={projectTitle || "Script-Weaver"}>
+          {projectTitle || "Script-Weaver"}
+        </h3>
 
-        <span className={`badge ${projectStatus === "complete" ? "success" : projectStatus === "error" ? "error" : projectStatus === "running" ? "running" : "default"}`}>
-          {projectStatus === "complete" && <CheckCircle2 size={12} style={{ marginRight: 4 }} />}
-          {projectStatus === "running" && <Loader2 size={12} className="spin" style={{ marginRight: 4 }} />}
-          {projectStatus === "error" && <AlertCircle size={12} style={{ marginRight: 4 }} />}
+        <span style={{ flex: 1 }} />
+
+        <span className={`badge ${projectStatus === "complete" ? "success" : projectStatus === "error" ? "error" : projectStatus === "running" ? "running" : ""}`}>
+          {projectStatus === "complete" && <CheckCircle2 size={12} />}
+          {projectStatus === "running" && <Loader2 size={12} className="spin" />}
+          {projectStatus === "error" && <AlertCircle size={12} />}
           {projectStatus === "idle" ? "等待生成" : projectStatus === "running" ? "生成中..." : projectStatus === "complete" ? "已完成" : "出错了"}
         </span>
 
-        <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+        <span className="wb-topbar-divider" />
+
+        <div style={{ display: "flex", gap: 2, alignItems: "center" }}>
           {/* Theme toggle */}
-          <button onClick={toggleTheme} className="btn-ghost" title={theme === "dark" ? "切换到亮色模式" : "切换到暗色模式"}>
-            {theme === "dark" ? <Sun size={16} /> : <Moon size={16} />}
+          <button onClick={toggleTheme} className="icon-btn" aria-label={theme === "dark" ? "切换到亮色模式" : "切换到暗色模式"} title={theme === "dark" ? "切换到亮色模式" : "切换到暗色模式"}>
+            {theme === "dark" ? <Sun size={15} /> : <Moon size={15} />}
           </button>
           <button
             onClick={onOpenHistory}
             disabled={!projectId}
-            style={iconBtnStyle(!!projectId)}
+            className={`icon-btn${historyPanel.open ? " is-on" : ""}`}
             title={historyPanel.open ? "关闭版本历史" : "查看版本历史"}
             aria-label={historyPanel.open ? "关闭版本历史" : "查看版本历史"}
           >
-            <History size={14} style={historyPanel.open ? { color: "var(--brand-primary)" } : undefined} />
+            <History size={15} />
           </button>
-          <button onClick={() => handleExport("json")} disabled={!projectId || exportBusy} style={iconBtnStyle(!!projectId)} title="导出 JSON"><Download size={14} /></button>
-          <button onClick={() => handleExport("fountain")} disabled={!projectId || !artifactData.script || exportBusy} style={iconBtnStyle(!!projectId && !!artifactData.script)} title="导出 Fountain 格式"><FileText size={14} /></button>
-          <button onClick={() => handleExport("video_gen")} disabled={!projectId || !artifactData.storyboard || exportBusy} style={iconBtnStyle(!!projectId && !!artifactData.storyboard)} title="导出 VideoGen 提示词"><Film size={14} /></button>
+          <button onClick={() => handleExport("json")} disabled={!projectId || exportBusy} className="icon-btn" title="导出 JSON" aria-label="导出 JSON">
+            <Download size={15} className={exportBusy ? "spin" : undefined} />
+          </button>
+          <button onClick={() => handleExport("fountain")} disabled={!projectId || !artifactData.script || exportBusy} className="icon-btn" title="导出 Fountain 格式" aria-label="导出 Fountain 格式"><FileText size={15} /></button>
+          <button onClick={() => handleExport("video_gen")} disabled={!projectId || !artifactData.storyboard || exportBusy} className="icon-btn" title="导出 VideoGen 提示词" aria-label="导出 VideoGen 提示词"><Film size={15} /></button>
         </div>
-      </div>
+      </header>
 
-      {/* Tab bar — Segment/Pill style per Design Spec */}
-      <div style={{ padding: "12px 24px", flexShrink: 0 }}>
-        <div className="segment-tabs">
+      {/* Tab bar — editorial underline tabs */}
+      <div className="wb-tabs-wrap" style={{ flexShrink: 0 }}>
+        <div className="wb-tabs" role="tablist">
           {ARTIFACT_TABS.map((tab) => (
-            <button key={tab.id} className={`segment-tab ${activeTab === tab.id ? "active" : ""}`} onClick={() => onTabChange(tab.id)}>
+            <button key={tab.id} role="tab" aria-selected={activeTab === tab.id} className={`segment-tab ${activeTab === tab.id ? "active" : ""}`} onClick={() => onTabChange(tab.id)}>
               <tab.icon size={14} />{tab.label}
             </button>
           ))}
@@ -283,7 +278,16 @@ export default function ArtifactPanel({
 
       {/* Content area — history view takes precedence while open; it renders
           read-only snapshots and never writes into the current artifacts. */}
-      <div style={{ flex: 1, overflowY: "auto", padding: "20px 24px" }}>
+      <div style={{ flex: 1, overflowY: "auto", padding: "18px 20px 28px" }}>
+        {exportError && (
+          <div className="panel-error-banner" role="alert">
+            <AlertCircle size={14} style={{ color: "var(--error)", flexShrink: 0 }} />
+            <span>{exportError}</span>
+            <button type="button" className="icon-btn" style={{ width: 26, height: 26 }} aria-label="关闭导出错误提示" onClick={() => setExportError(null)}>
+              <X size={13} />
+            </button>
+          </div>
+        )}
         {historyPanel.open ? (
           <VersionHistory
             state={historyPanel}
@@ -300,12 +304,12 @@ export default function ArtifactPanel({
                 <TriangleAlert size={14} style={{ flexShrink: 0, color: "var(--warning)" }} />
                 <span style={{ flex: 1 }}>{reviewNotice}</span>
                 {onOpenReviewPanel && (
-                  <button className="btn-ghost" data-testid="open-review-panel"
-                    onClick={onOpenReviewPanel} style={{ flexShrink: 0, fontSize: 12 }}>
+                  <button className="btn-secondary" data-testid="open-review-panel"
+                    onClick={onOpenReviewPanel} style={{ flexShrink: 0, fontSize: 12, padding: "5px 12px" }}>
                     去复核
                   </button>
                 )}
-                <button className="btn-ghost" data-testid="dismiss-review-notice"
+                <button className="icon-btn" data-testid="dismiss-review-notice"
                   aria-label="关闭复核提示" onClick={onDismissReviewNotice}
                   style={{ width: 26, height: 26, flexShrink: 0 }}>
                   <X size={13} />
@@ -320,25 +324,28 @@ export default function ArtifactPanel({
       {/* Bottom bar */}
       {artifactData.storyboard && (
         <div style={{
-          padding: "12px 24px",
+          padding: "10px 20px",
           borderTop: "1px solid var(--border-default)",
           display: "flex",
           alignItems: "center",
           justifyContent: "space-between",
+          flexWrap: "wrap",
+          gap: "8px 16px",
           flexShrink: 0,
           background: "var(--bg-surface)",
         }}>
-          <span style={{ fontSize: 12, color: "var(--text-tertiary)" }}>分镜配置</span>
-          <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-            <label style={{ fontSize: 12, color: "var(--text-secondary)" }}>分镜数量</label>
-            <select defaultValue="auto" style={{ padding: "4px 8px", borderRadius: 8, border: "1px solid var(--border-default)", background: "var(--bg-surface)", color: "var(--text-primary)", fontSize: 12 }}>
+          <span className="micro-label">分镜配置</span>
+          <div style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap", justifyContent: "flex-end" }}>
+            <span className="badge mono">{(artifactData.storyboard as any).aspect_ratio} · {(artifactData.storyboard as any).fps}fps</span>
+            <label style={{ fontSize: 12, color: "var(--text-secondary)" }}>细节密度</label>
+            <select defaultValue="auto" style={{ padding: "5px 8px", borderRadius: 8, border: "1px solid var(--border-default)", background: "var(--bg-surface)", color: "var(--text-primary)", fontSize: 12 }}>
               <option value="auto">一致性较强</option><option value="high">高细节</option>
             </select>
             <label style={{ fontSize: 12, color: "var(--text-secondary)" }}>画幅比</label>
-            <select defaultValue="16:9" style={{ padding: "4px 8px", borderRadius: 8, border: "1px solid var(--border-default)", background: "var(--bg-surface)", color: "var(--text-primary)", fontSize: 12 }}>
+            <select defaultValue="16:9" style={{ padding: "5px 8px", borderRadius: 8, border: "1px solid var(--border-default)", background: "var(--bg-surface)", color: "var(--text-primary)", fontSize: 12 }}>
               <option value="16:9">16:9</option><option value="9:16">9:16</option><option value="1:1">1:1</option>
             </select>
-            <button className="btn-primary" style={{ borderRadius: 10, padding: "7px 16px", fontSize: 13 }}>
+            <button className="btn-primary" style={{ padding: "7px 16px", fontSize: 13, whiteSpace: "nowrap" }}>
               去生成视频<ChevronRight size={14} />
             </button>
           </div>

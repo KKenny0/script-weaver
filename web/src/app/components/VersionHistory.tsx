@@ -84,17 +84,10 @@ export default function VersionHistory({
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [state.open, onClose]);
 
-  const bannerStyle: React.CSSProperties = {
-    display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap",
-    padding: "10px 14px", marginBottom: 14, borderRadius: 12,
-    border: "1px solid var(--border-default)", background: "var(--bg-surface-3)",
-    fontSize: 13, color: "var(--text-secondary)",
-  };
-
   if (state.viewing) {
     return (
       <div data-testid="version-history">
-        <div style={bannerStyle} role="status">
+        <div className="vh-banner" role="status">
           <History size={14} style={{ color: "var(--brand-primary)" }} />
           <span style={{ fontWeight: 600, color: "var(--text-primary)" }}>
             正在查看历史版本 r{state.viewing.revision}
@@ -102,10 +95,10 @@ export default function VersionHistory({
           <span>· {sourceLabel(state.viewing.source)} · {formatTime(state.viewing.created_at)}</span>
           {state.viewing.summary && <span style={{ color: "var(--text-tertiary)" }}>· {state.viewing.summary}</span>}
           <span style={{ marginLeft: "auto", display: "flex", gap: 6, flexShrink: 0 }}>
-            <button onClick={onBackToList} className="btn-ghost" style={{ padding: "4px 10px", fontSize: 12, whiteSpace: "nowrap" }}>
-              <ChevronLeft size={12} style={{ display: "inline", marginRight: 4 }} />版本列表
+            <button onClick={onBackToList} className="btn-secondary" style={{ padding: "4px 10px", fontSize: 12, whiteSpace: "nowrap" }}>
+              <ChevronLeft size={12} />版本列表
             </button>
-            <button onClick={onClose} className="btn-primary" style={{ padding: "4px 12px", fontSize: 12, borderRadius: 20, whiteSpace: "nowrap" }}>
+            <button onClick={onClose} className="btn-primary" style={{ padding: "4px 12px", fontSize: 12, whiteSpace: "nowrap" }}>
               返回当前版本 (r{state.currentRevision})
             </button>
           </span>
@@ -120,15 +113,15 @@ export default function VersionHistory({
 
   return (
     <div data-testid="version-history">
-      <div style={bannerStyle}>
+      <div className="vh-banner">
         <History size={14} style={{ color: "var(--brand-primary)" }} />
         <span style={{ fontWeight: 600, color: "var(--text-primary)" }}>版本历史</span>
         <span>当前 r{state.currentRevision} · 只读</span>
         <span style={{ marginLeft: "auto", display: "flex", gap: 6 }}>
-          <button onClick={onRefresh} className="btn-ghost" style={{ width: 26, height: 26 }} title="刷新版本列表" aria-label="刷新版本列表">
+          <button onClick={onRefresh} className="icon-btn" style={{ width: 26, height: 26 }} title="刷新版本列表" aria-label="刷新版本列表">
             <RefreshCw size={13} />
           </button>
-          <button onClick={onClose} className="btn-ghost" style={{ padding: "4px 10px", fontSize: 12 }}>
+          <button onClick={onClose} className="btn-secondary" style={{ padding: "4px 10px", fontSize: 12 }}>
             关闭
           </button>
         </span>
@@ -160,27 +153,21 @@ export default function VersionHistory({
               <button
                 onClick={() => onSelect(v.revision)}
                 disabled={state.viewingLoading}
-                style={{
-                  width: "100%", textAlign: "left", cursor: state.viewingLoading ? "wait" : "pointer",
-                  padding: "10px 14px", borderRadius: 10,
-                  border: v.revision === state.currentRevision
-                    ? "1px solid var(--brand-primary)"
-                    : "1px solid var(--border-default)",
-                  background: "var(--bg-surface)", display: "flex", flexDirection: "column", gap: 3,
-                }}
+                className={`vh-row${v.revision === state.currentRevision ? " is-current" : ""}`}
+                style={{ cursor: state.viewingLoading ? "wait" : "pointer" }}
                 aria-label={`查看版本 r${v.revision}`}
               >
-                <span style={{ fontSize: 13, color: "var(--text-primary)" }}>
-                  r{v.revision}
+                <span className="vh-row-top">
+                  <span className="vh-rev">r{v.revision}</span>
                   {v.revision === state.currentRevision && (
-                    <span className="badge success" style={{ marginLeft: 8, fontSize: 11 }}>当前</span>
+                    <span className="badge success" style={{ fontSize: 11 }}>当前</span>
                   )}
-                  <span style={{ marginLeft: 8, fontSize: 12, color: "var(--text-tertiary)" }}>
+                  <span className="vh-row-meta">
                     {sourceLabel(v.source)} · {formatTime(v.created_at)}
                   </span>
                 </span>
                 {v.summary && <span style={{ fontSize: 12, color: "var(--text-secondary)" }}>{v.summary}</span>}
-                <span style={{ fontSize: 12, color: "var(--text-tertiary)" }}>{v.title}</span>
+                <span className="vh-row-meta">{v.title}</span>
               </button>
             </li>
           ))}

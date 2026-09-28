@@ -130,51 +130,53 @@ interface FieldDef {
   type: FieldType;
   options?: { value: string; label: string }[];
   placeholder?: string;
+  /** Section heading rendered above the field (empty = no heading). */
+  group?: string;
 }
 
 const FIELD_DEFS: Record<CardKind, FieldDef[]> = {
   characters: [
-    { name: "name", label: "名称", type: "text" },
-    { name: "role", label: "角色类型", type: "select", options: ROLE_OPTIONS },
-    { name: "appearance", label: "外观", type: "textarea" },
-    { name: "personality", label: "性格", type: "textarea" },
-    { name: "costume_description", label: "服装", type: "textarea" },
-    { name: "key_props", label: "关键道具", type: "list" },
-    { name: "backstory", label: "背景故事", type: "textarea" },
-    { name: "motivation", label: "动机", type: "textarea" },
-    { name: "relationship_map", label: "人物关系", type: "pairs" },
-    { name: "image_prompt", label: "图片提示词", type: "textarea" },
+    { name: "name", label: "名称", type: "text", group: "基本设定" },
+    { name: "role", label: "角色类型", type: "select", options: ROLE_OPTIONS, group: "基本设定" },
+    { name: "personality", label: "性格", type: "textarea", group: "基本设定" },
+    { name: "appearance", label: "外观", type: "textarea", group: "外观与服装" },
+    { name: "costume_description", label: "服装", type: "textarea", group: "外观与服装" },
+    { name: "key_props", label: "关键道具", type: "list", group: "外观与服装" },
+    { name: "backstory", label: "背景故事", type: "textarea", group: "叙事" },
+    { name: "motivation", label: "动机", type: "textarea", group: "叙事" },
+    { name: "relationship_map", label: "人物关系", type: "pairs", group: "叙事" },
+    { name: "image_prompt", label: "图片提示词", type: "textarea", group: "生成" },
   ],
   scenes: [
-    { name: "name", label: "名称", type: "text" },
-    { name: "location_type", label: "内景/外景", type: "select", options: ENVIRONMENT_OPTIONS },
-    { name: "environment", label: "环境描述", type: "textarea" },
-    { name: "time_of_day", label: "时间", type: "text" },
-    { name: "weather", label: "天气", type: "text" },
-    { name: "mood", label: "氛围", type: "text" },
-    { name: "lighting_description", label: "灯光", type: "textarea" },
-    { name: "color_palette", label: "色彩", type: "list" },
-    { name: "key_elements", label: "关键元素", type: "list" },
-    { name: "image_prompt", label: "图片提示词", type: "textarea" },
+    { name: "name", label: "名称", type: "text", group: "基本设定" },
+    { name: "location_type", label: "内景/外景", type: "select", options: ENVIRONMENT_OPTIONS, group: "基本设定" },
+    { name: "time_of_day", label: "时间", type: "text", group: "基本设定" },
+    { name: "weather", label: "天气", type: "text", group: "基本设定" },
+    { name: "environment", label: "环境描述", type: "textarea", group: "环境" },
+    { name: "key_elements", label: "关键元素", type: "list", group: "环境" },
+    { name: "mood", label: "氛围", type: "text", group: "氛围" },
+    { name: "lighting_description", label: "灯光", type: "textarea", group: "氛围" },
+    { name: "color_palette", label: "色彩", type: "list", group: "氛围" },
+    { name: "image_prompt", label: "图片提示词", type: "textarea", group: "生成" },
   ],
   shots: [
-    { name: "shot_size", label: "景别", type: "select", options: SHOT_SIZE_OPTIONS },
-    { name: "camera_angle", label: "角度", type: "select", options: CAMERA_ANGLE_OPTIONS },
-    { name: "camera_movement", label: "运镜", type: "select", options: CAMERA_MOVEMENT_OPTIONS },
-    { name: "movement_description", label: "运镜说明", type: "textarea" },
-    { name: "visual_description", label: "画面描述", type: "textarea" },
-    { name: "action_description", label: "动作描述", type: "textarea" },
-    { name: "dialogue", label: "对白", type: "textarea" },
-    { name: "voiceover", label: "旁白", type: "textarea" },
-    { name: "on_screen_text", label: "屏幕文字", type: "text" },
-    { name: "sound_effects", label: "音效", type: "list" },
-    { name: "music_cue", label: "音乐提示", type: "text" },
-    { name: "music_mood", label: "音乐情绪", type: "text" },
-    { name: "duration_seconds", label: "时长（秒）", type: "duration" },
-    { name: "transition_to_next", label: "转场", type: "select", options: TRANSITION_OPTIONS },
-    { name: "image_prompt", label: "首帧图片提示词", type: "textarea" },
-    { name: "video_prompt", label: "视频提示词", type: "textarea" },
-    { name: "negative_prompt", label: "反向提示词", type: "textarea" },
+    { name: "shot_size", label: "景别", type: "select", options: SHOT_SIZE_OPTIONS, group: "镜头参数" },
+    { name: "camera_angle", label: "角度", type: "select", options: CAMERA_ANGLE_OPTIONS, group: "镜头参数" },
+    { name: "camera_movement", label: "运镜", type: "select", options: CAMERA_MOVEMENT_OPTIONS, group: "镜头参数" },
+    { name: "movement_description", label: "运镜说明", type: "textarea", group: "镜头参数" },
+    { name: "duration_seconds", label: "时长（秒）", type: "duration", group: "镜头参数" },
+    { name: "transition_to_next", label: "转场", type: "select", options: TRANSITION_OPTIONS, group: "镜头参数" },
+    { name: "visual_description", label: "画面描述", type: "textarea", group: "内容" },
+    { name: "action_description", label: "动作描述", type: "textarea", group: "内容" },
+    { name: "dialogue", label: "对白", type: "textarea", group: "内容" },
+    { name: "voiceover", label: "旁白", type: "textarea", group: "内容" },
+    { name: "on_screen_text", label: "屏幕文字", type: "text", group: "内容" },
+    { name: "sound_effects", label: "音效", type: "list", group: "声音" },
+    { name: "music_cue", label: "音乐提示", type: "text", group: "声音" },
+    { name: "music_mood", label: "音乐情绪", type: "text", group: "声音" },
+    { name: "image_prompt", label: "首帧图片提示词", type: "textarea", group: "生成" },
+    { name: "video_prompt", label: "视频提示词", type: "textarea", group: "生成" },
+    { name: "negative_prompt", label: "反向提示词", type: "textarea", group: "生成" },
   ],
 };
 
@@ -464,6 +466,60 @@ export default function CardEditDrawer({
   const update = (name: string, value: unknown) =>
     setDraft((prev) => ({ ...prev, [name]: value }));
 
+  const renderField = (f: FieldDef) => {
+    const value = draft[f.name];
+    if (f.type === "select") {
+      return (
+        <FieldShell label={f.label}>
+          <select className="ced-select" data-testid={`field-${f.name}`}
+            value={String(value ?? "")} disabled={disabled}
+            aria-label={f.label}
+            onChange={(e) => update(f.name, e.target.value)}>
+            {(f.options ?? []).map((opt) => (
+              <option key={opt.value} value={opt.value}>{opt.label}</option>
+            ))}
+          </select>
+        </FieldShell>
+      );
+    }
+    if (f.type === "list") {
+      return (
+        <ListEditor label={f.label} name={f.name}
+          items={value as string[]} disabled={disabled}
+          onChange={(items) => update(f.name, items)} />
+      );
+    }
+    if (f.type === "pairs") {
+      return (
+        <PairsEditor label={f.label} name={f.name}
+          rows={value as { key: string; value: string }[]} disabled={disabled}
+          onChange={(rows) => update(f.name, rows)} />
+      );
+    }
+    if (f.type === "textarea") {
+      return (
+        <FieldShell label={f.label}>
+          <textarea className="ced-textarea" data-testid={`field-${f.name}`}
+            rows={3} value={String(value ?? "")} disabled={disabled}
+            aria-label={f.label} placeholder={f.placeholder}
+            onChange={(e) => update(f.name, e.target.value)} />
+        </FieldShell>
+      );
+    }
+    return (
+      <FieldShell label={f.label}>
+        <input
+          className="ced-input" data-testid={`field-${f.name}`}
+          type={f.type === "duration" ? "number" : "text"}
+          step={f.type === "duration" ? "0.1" : undefined}
+          min={f.type === "duration" ? "0.1" : undefined}
+          value={String(value ?? "")} disabled={disabled}
+          aria-label={f.label} placeholder={f.placeholder}
+          onChange={(e) => update(f.name, e.target.value)} />
+      </FieldShell>
+    );
+  };
+
   const handleSave = async () => {
     if (phase === "saving") return; // double-submit guard
     const { changes: pending, errors: pendingErrors } = buildChanges(kind, snapshot, draft);
@@ -510,12 +566,16 @@ export default function CardEditDrawer({
       <div className="ced-shell">
         <header className="ced-header">
           <div style={{ minWidth: 0 }}>
-            <h3 id="card-edit-title" style={{ fontSize: 15, fontWeight: 600 }}>
-              编辑{KIND_LABELS[kind]} · {title}
-            </h3>
-            <span className="badge" data-testid="drawer-basis" style={{ marginTop: 4, display: "inline-block" }}>
-              编辑依据 r{session.revision}
-            </span>
+            <div className="ced-header-title">
+              <h3 id="card-edit-title" style={{ fontSize: 14, fontWeight: 600 }}>
+                编辑{KIND_LABELS[kind]} · {title}
+              </h3>
+            </div>
+            <div className="ced-header-sub">
+              <span className="badge mono" data-testid="drawer-basis">
+                编辑依据 r{session.revision}
+              </span>
+            </div>
           </div>
           <button type="button" className="btn-ghost" data-testid="close-drawer"
             aria-label="关闭编辑面板" onClick={requestClose}>
@@ -569,63 +629,19 @@ export default function CardEditDrawer({
             ))}
           </div>
 
-          {FIELD_DEFS[kind].map((f) => {
-            const value = draft[f.name];
-            if (f.type === "select") {
-              return (
-                <FieldShell key={f.name} label={f.label}>
-                  <select className="ced-select" data-testid={`field-${f.name}`}
-                    value={String(value ?? "")} disabled={disabled}
-                    aria-label={f.label}
-                    onChange={(e) => update(f.name, e.target.value)}>
-                    {(f.options ?? []).map((opt) => (
-                      <option key={opt.value} value={opt.value}>{opt.label}</option>
-                    ))}
-                  </select>
-                </FieldShell>
-              );
-            }
-            if (f.type === "list") {
-              return (
-                <ListEditor key={f.name} label={f.label} name={f.name}
-                  items={value as string[]} disabled={disabled}
-                  onChange={(items) => update(f.name, items)} />
-              );
-            }
-            if (f.type === "pairs") {
-              return (
-                <PairsEditor key={f.name} label={f.label} name={f.name}
-                  rows={value as { key: string; value: string }[]} disabled={disabled}
-                  onChange={(rows) => update(f.name, rows)} />
-              );
-            }
-            if (f.type === "textarea") {
-              return (
-                <FieldShell key={f.name} label={f.label}>
-                  <textarea className="ced-textarea" data-testid={`field-${f.name}`}
-                    rows={3} value={String(value ?? "")} disabled={disabled}
-                    aria-label={f.label} placeholder={f.placeholder}
-                    onChange={(e) => update(f.name, e.target.value)} />
-                </FieldShell>
-              );
-            }
-            return (
-              <FieldShell key={f.name} label={f.label}>
-                <input
-                  className="ced-input" data-testid={`field-${f.name}`}
-                  type={f.type === "duration" ? "number" : "text"}
-                  step={f.type === "duration" ? "0.1" : undefined}
-                  min={f.type === "duration" ? "0.1" : undefined}
-                  value={String(value ?? "")} disabled={disabled}
-                  aria-label={f.label} placeholder={f.placeholder}
-                  onChange={(e) => update(f.name, e.target.value)} />
-              </FieldShell>
-            );
-          })}
+          {FIELD_DEFS[kind].map((f, fi) => (
+            <React.Fragment key={f.name}>
+              {f.group && (fi === 0 || FIELD_DEFS[kind][fi - 1].group !== f.group) && (
+                <div className="ced-group-label">{f.group}</div>
+              )}
+              {renderField(f)}
+            </React.Fragment>
+          ))}
         </div>
 
         <footer className="ced-footer">
-          <span style={{ fontSize: 12, color: "var(--text-tertiary)" }}>
+          <span className={`ced-dirty-note${dirty ? " is-dirty" : ""}`}>
+            <span className="ced-dirty-dot" />
             {dirty ? "有未保存的修改" : "暂无修改"}
           </span>
           <span style={{ display: "flex", gap: 8 }}>
@@ -635,7 +651,7 @@ export default function CardEditDrawer({
             </button>
             <button type="button" className="btn-primary" data-testid="save-card"
               disabled={disabled} onClick={handleSave}>
-              {disabled && <Loader2 size={13} className="spin" style={{ marginRight: 4 }} />}
+              {disabled && <Loader2 size={13} className="spin" />}
               保存修改
             </button>
           </span>
