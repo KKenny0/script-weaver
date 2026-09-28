@@ -1,389 +1,421 @@
 # Script-Weaver
 
-**Agent-native 剧本 + 分镜生成系统** — 随用户成长的 AI 创作管线
+> **Agent-Native Screenplay & Storyboard Generation Engine** — An autonomous AI creative pipeline that transforms raw premises into production-grade screenplays and shot-by-shot video generation prompts, growing alongside creators.
 
-> 从一个故事想法出发，自动生成完整剧本和专业分镜脚本，可直接用于下游视频生成工具（Seiko/Runway/Kling 等）。
+<p align="center">
+  <a href="README.md"><b>English</b></a> | <a href="README_zh.md"><b>简体中文</b></a>
+</p>
 
-## 核心特性
+<p align="center">
+  <img src="https://img.shields.io/badge/Python-3.10%20%7C%203.11%20%7C%203.12-blue?logo=python" alt="Python Version" />&nbsp;<img src="https://img.shields.io/badge/FastAPI-0.100%2B-009688?logo=fastapi" alt="FastAPI" />&nbsp;<img src="https://img.shields.io/badge/Next.js-15-black?logo=next.js" alt="Next.js" />&nbsp;<img src="https://img.shields.io/badge/License-MIT-green.svg" alt="License" />&nbsp;<img src="https://img.shields.io/badge/PRs-welcome-brightgreen.svg" alt="PRs Welcome" />
+</p>
 
-- **Agent-Native 架构**: 9 个专业 Agent（创意细化、大纲构建、角色设计、场景设计、美术指导、剧本写作、分镜拆解、质量审查、编排调度），每个 Agent 拥有自主 tool-use 循环
-- **多 LLM 支持**: 统一接口支持 Anthropic Claude / OpenAI GPT / DeepSeek / GLM / Qwen / Ollama 等任意 OpenAI 兼容服务
-- **Skill 插件系统**: 支持用户自定义 Skills（YAML / JSON / Claude Code .md 格式），可在每个 Pipeline 阶段注入，支持动态激活/禁用/排序
-- **Grows With User**: 三层成长机制 — 项目级经验记忆 + 跨项目用户画像 + Skill 自进化
-- **下游就绪**: 分镜输出包含逐镜头的 image/video prompt，可直接喂给 AI 视频生成工具
-- **多格式导出**: JSON / Fountain (Final Draft 兼容) / VideoGen CSV
+---
 
-## 快速开始
+## Highlights
 
-### 安装
+- 🎬 **Idea to Production-Ready Assets**: Takes a rough logline or premise and systematically builds beat outlines, character sheets, scene designs, standardized screenplays (Fountain / ScreenJSON), and granular visual storyboards.
+- 🤖 **9 Specialized Autonomous Agents**: Features a multi-agent cooperative architecture (Idea Refiner, Structurer, Character Designer, Scene Designer, Art Director, Script Writer, Storyboard Artist, Visual Highlights, and Orchestrator) — each running an autonomous tool-use reasoning loop.
+- 🎥 **Downstream AI Video Ready**: Direct prompt generation for modern video models (**Kling, Runway Gen-3, Luma Dream Machine, Hailuo / Minimax, Pika, Sora**). Generates both first-frame image prompts and temporal video motion prompts.
+- 🧩 **Extensible Skill Registry**: Plug-and-play creative methodologies (*Save the Cat 15-Beat Sheet*, *Dan Harmon's Story Circle*, *Jungian Character Prototypes*, *Wong Kar-wai Visual Style*, *Cinematography Lexicon*). Seamlessly adapts Native YAML, JSON, and Claude Code `.md` skills.
+- 🧠 **Grows With User (3-Tier Evolution)**:
+  - **Project Memory**: Captures revisions and extracts editing patterns.
+  - **User Profile**: Learns your narrative pacing, tone preferences, and dialogue density across projects.
+  - **Skill Self-Evolution**: Automatically proposes new skills and optimizes existing ones based on approval metrics.
+- ⚡ **Production-Grade Engineering Rigor**: Built-in SQLite persistence, CAS (Compare-And-Swap) revision control, detached background run execution with SSE streaming (survives tab close/reconnect), and atomic stage checkpoints (`--resume`).
+- 💻 **Dual Interfaces**: High-productivity dual-panel **Web Workbench** (Next.js 15 + Tailwind + Lucide) and scriptable **CLI**.
 
-```bash
-cd script-weaver
-pip install -e ".[dev]"
-```
+---
 
-### 配置
+## Web Workbench Layout
 
-```bash
-cp .env.example .env
-# 编辑 .env，填入你的 LLM API Key
-```
-
-支持的 Provider:
-
-| 环境变量 | 说明 |
-|----------|------|
-| `SCRIPTWEAVER_LLM_PROVIDER` | `anthropic` / `openai` / `deepseek` / `glm` / `qwen` / `openai_compatible` |
-| `SCRIPTWEAVER_LLM_MODEL` | 模型名称 (默认: `claude-sonnet-4-20250514`) |
-| `SCRIPTWEAVER_ANTHROPIC_API_KEY` | Anthropic API Key |
-| `SCRIPTWEAVER_OPENAI_API_KEY` | OpenAI / DeepSeek / 兼容服务 Key |
-| `SCRIPTWEAVER_GLM_API_KEY` | 智谱 GLM API Key |
-| `SCRIPTWEAVER_QWEN_API_KEY` | 通义千问 API Key |
-| `SCRIPTWEAVER_OPENAI_BASE_URL` | OpenAI 兼容端点 (Ollama/vLLM 等) |
-
-### 运行
-
-```bash
-# 从一个想法生成完整剧本+分镜
-python -m script_weaver generate "一个穿越时空的古装爱情故事，女主角能看见别人的命运线"
-
-# 指定标题和输出目录
-python -m script_weaver generate "你的想法" --title "我的剧本" --output-dir ./output
-
-# 管理 Skills
-python -m script_weaver skills list                    # 列出所有可用 Skills
-python -m script_weaver skills list --stage structuring   # 按阶段筛选
-python -m script_weaver skills install ./my-skill.yaml    # 安装新 Skill
-python -m script_weaver skills activate save-the-cat --stage structuring  # 激活 Skill
-
-# 查看用户画像（学习到的偏好）
-python -m script_weaver profile show
-```
-
-## 系统架构
+Script-Weaver provides a responsive dual-panel Web Workbench tailored for narrative and storyboard production:
 
 ```
-用户输入 (idea/大纲/任何格式)
+┌───────────────────────────────────────┬─────────────────────────────────────────────────────────┐
+│ Left Panel: Chat & Co-Pilot Console   │ Right Panel: Structured Production Artifacts            │
+├───────────────────────────────────────┼─────────────────────────────────────────────────────────┤
+│ • Natural-language story idea input   │ • [Overview]    Project metadata & concept breakdown    │
+│ • Live SSE pipeline execution stream  │ • [Outline]     Beat sheets (Save the Cat / Harmon etc.)│
+│ • Targeted card refinement & prompts  │ • [Characters]  Character dossiers & visual prompts     │
+│ • Semantic diff review (Adopt/Discard)│ • [Scenes]      Atmosphere, color palette, lighting     │
+│ • One-click stop & checkpoint resume  │ • [Script]      ScreenJSON / Fountain screenplay        │
+│ • Multi-format export (JSON/Ftn/ZIP)  │ • [Storyboard]  Shots, camera moves, image/video prompts│
+└───────────────────────────────────────┴─────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Pipeline Architecture
+
+```
+User Input (Logline, Premise, Outline, or Notes)
        │
        ▼
-┌─────────────┐
-│ Orchestrator │ ← 编排器：路由请求到正确的 Agent
-└──────┬──────┘
+┌──────────────┐
+│ Orchestrator │ ── Routes requests and manages stage transitions
+└──────┬───────┘
        │
        ├──────────────┐
        ▼              │
-┌─────────────┐      │
-│ IdeaRefiner  │──[Gate]──▶ Structurer ──[Gate]──▶ Designers (并行)
-│ (创意细化)   │              │              │  ├── CharacterDesigner
-└─────────────┘              │              │  ├── SceneDesigner
-                              │              │  └── ArtDirector
-                              ▼              │
-                        ┌──────────┐        │
-                        │ScriptWriter│──[Gate]──▶ StoryboardArtist
-                        └──────────┘                │
-                                                   ▼
-                                           VisualHighlights
-                                                   │
-                                                   ▼
-                                          ┌──────────────┐
-                                          │  Exporters    │
-                                          │ JSON/Fountain │
-                                          │ /VideoGen     │
-                                          └──────────────┘
-                                                   │
-                                                   ▼
-                                          ┌──────────────┐
-                                          │ Growth Loop   │ ◄── 记录决策 → 提取模式 → 更新画像
-                                          │ (Grows With U)│     → 评估 Skill → 提议新 Skill
-                                          └──────────────┘
+┌──────────────┐      │
+│  IdeaRefiner │──[Human Gate]──▶ Structurer ──[Human Gate]──▶ Designers (Parallel)
+│(Concept Dev) │                     │                           ├── CharacterDesigner
+└──────────────┘                     │                           ├── SceneDesigner
+                                     ▼                           └── ArtDirector
+                               ┌─────────────┐                          │
+                               │ScriptWriter │──[Human Gate]──▶ StoryboardArtist
+                               └─────────────┘                         │
+                                                                       ▼
+                                                                VisualHighlights
+                                                                       │
+                                                                       ▼
+                                                              ┌─────────────────┐
+                                                              │    Exporters    │
+                                                              │  JSON / Fountain│
+                                                              │  / VideoGen ZIP │
+                                                              └────────┬────────┘
+                                                                       │
+                                                                       ▼
+                                                              ┌─────────────────┐
+                                                              │   Growth Loop   │
+                                                              │ Record Decisons │
+                                                              │ Update Profile  │
+                                                              │  Evolve Skills  │
+                                                              └─────────────────┘
 ```
 
-## 数据模型
-
-所有核心数据模型定义在 `src/script_weaver/core/types.py`：
-
-| 模型 | 说明 |
-|------|------|
-| `ProjectState` | 项目状态容器（所有 artifact 的集合） |
-| `Outline` | 结构化大纲（基本信息 + 角色概要 + 情节节拍） |
-| `Character` | 角色设计（外貌/性格/形象描述/image_prompt） |
-| `SceneDesign` | 场景设计（环境/氛围/色调） |
-| `ArtStyle` | 美术风格指南 |
-| `Script` | 剧本（ScreenJSON 风格：场景标题/动作/对白/转场） |
-| `Shot` | 单个分镜镜头（景别/机位运动/画面描述/时长/video_prompt） |
-| `Storyboard` | 完整分镜脚本（Shot 列表） |
-| `Skill` | 统一 Skill 表示（格式无关） |
-| `SkillBinding` | 项目级 Skill 激活配置 |
-| `UserProfile` | 跨项目用户创作画像 |
-| `ProjectMemory` | 项目级决策记录和模式提取 |
-
-## 内置 Skills
-
-| Skill ID | 名称 | 适用阶段 | 说明 |
-|----------|------|----------|------|
-| `save-the-cat` | 救猫咪节拍表 | structuring | Blake Snyder 15 节拍结构 |
-| `story-circle` | Dan Harmon 故事圈 | structuring | 8 段式循环叙事 |
-| `three-act` | 经典三幕式 | structuring | 通用戏剧结构 |
-| `character-prototype` | 人物原型系统 | character_design | 荣格原型 + 角色弧光 |
-| `wong-kar-wai-style` | 王家卫视觉风格 | art_direction | 抽帧慢动作/高饱和色彩/都市孤独感 |
-| `cinematography-basics` | 基础运镜语言库 | storyboarding | 专业影视分镜术语参考 |
-
-## Skill 自定义
-
-### 格式 1: Native YAML（推荐）
-
-```yaml
-# my-skill.yaml
-id: my-custom-skill
-name: "我的自定义方法"
-stage: scriptwriting
-description: "我的特殊编剧技巧"
-version: "1.0"
-
-prompt_injection: |
-  在写剧本时，请遵循以下规则：
-  1. 每场戏必须有一个"情感转折点"
-  2. ...
-
-constraints:
-  - "规则1"
-  - "规则2"
-```
-
-### 格式 2: Claude Code Markdown (.md)
-
-直接使用 Claude Code 原生 `.md` skill 文件，系统会自动适配：
-
-```markdown
----
-name: screenwriting-master
-description: 山音超级编剧大师
-TRIGGER when: 用户提到写剧本、写短片...
 ---
 
-# 技能说明
-这是一套完整的编剧方法论...
+## Quick Start
 
-## 输出要求
-1. 必须包含人物小传
-2. ...
-```
+### 1. Prerequisites & Installation
 
-### 安装和使用
+- **Python**: `>= 3.10` (tested with 3.11 and 3.12)
+- **Node.js**: `>= 18.0` (required for Web UI)
 
 ```bash
+# Clone the repository
+git clone https://github.com/KKenny0/script-weaver.git
+cd script-weaver
+
+# Install Python backend dependencies (including dev and web optional dependencies)
+pip install -e ".[dev,web]"
+
+# Install Web frontend dependencies
+cd web && npm install && cd ..
+```
+
+### 2. Multi-Provider LLM Configuration
+
+Copy the example environment file and configure your preferred model provider:
+
+```bash
+cp .env.example .env
+```
+
+Script-Weaver supports leading cloud providers and local open-source models out of the box:
+
+| Environment Variable | Description | Supported Values |
+|----------------------|-------------|------------------|
+| `SCRIPTWEAVER_LLM_PROVIDER` | Active LLM provider | `anthropic` / `openai` / `deepseek` / `glm` / `qwen` / `openai_compatible` |
+| `SCRIPTWEAVER_LLM_MODEL` | Target model name | e.g. `claude-3-7-sonnet-latest`, `gpt-4o`, `deepseek-chat`, `glm-4-plus`, `qwen-plus` |
+| `SCRIPTWEAVER_ANTHROPIC_API_KEY` | Anthropic API Key | `sk-ant-...` |
+| `SCRIPTWEAVER_OPENAI_API_KEY` | OpenAI / DeepSeek API Key | `sk-...` |
+| `SCRIPTWEAVER_GLM_API_KEY` | Zhipu GLM API Key | API Key from Zhipu Open Platform |
+| `SCRIPTWEAVER_QWEN_API_KEY` | Alibaba Qwen API Key | DashScope API Key |
+| `SCRIPTWEAVER_OPENAI_BASE_URL` | Custom OpenAI-compatible endpoint | e.g. `http://localhost:11434/v1` for Ollama / vLLM |
+
+---
+
+### 3. Launching the Web Workbench
+
+Run the backend and frontend in separate terminals:
+
+```bash
+# Terminal 1: Start the FastAPI backend (runs on port 8000)
+python web/api/main.py
+
+# Terminal 2: Start the Next.js frontend (runs on port 3000)
+cd web
+npm run dev
+```
+
+Open [http://localhost:3000](http://localhost:3000) in your browser. The frontend automatically proxies `/api/*` requests to the FastAPI backend at `http://localhost:8000`.
+
+---
+
+### 4. Running via CLI
+
+Generate a complete screenplay, character dossiers, scene designs, and video storyboard in one command:
+
+```bash
+# Generate from a creative premise with auto-approved gates
+python -m script_weaver generate "A neon-noir cyberpunk thriller where a memory detective discovers his own childhood was manufactured." --auto-approve --output-dir ./output
+
+# Specify title and custom output directory
+python -m script_weaver generate "A time-travel drama set in Song dynasty" --title "Threads of Destiny" --output-dir ./dist
+
+# Resume a failed or interrupted generation run from its last checkpoint
+python -m script_weaver generate --resume --output-dir ./output
+```
+
+#### Skill & Profile CLI Utilities
+
+```bash
+# List all available skills
+python -m script_weaver skills list
+
+# Filter skills by pipeline stage
+python -m script_weaver skills list --stage structuring
+
+# Install a custom skill
 python -m script_weaver skills install ./my-skill.yaml
-python -m script_weaver skills activate my-skill --stage scriptwriting
-```
 
-## Grows With User — 成长系统
+# Activate a skill for a specific stage
+python -m script_weaver skills activate save-the-cat --stage structuring
 
-Script-Weaver 不是一次性工具——它会随着使用越来越懂你：
-
-### Layer 1: 项目记忆 (ProjectMemory)
-- 记录你在项目中做的每一个决定（接受/修改/拒绝）
-- 自动提取重复的修改模式为可复用 Pattern
-
-### Layer 2: 用户画像 (UserProfile)
-- 跨项目累积的创作偏好（存储在 `~/.scriptweaver/user_profile.json`）
-- 学习你喜欢的叙事结构、对话密度、视觉风格
-- 推荐你可能喜欢的 Skills
-
-### Layer 3: Skill 自进化
-- 分析你的修改模式，自动提议创建新 Skill
-- 根据 Skill 使用效果（接受率/修改频率）自动优化
-- 基于历史成功率对 Skills 排序推荐
-
-```bash
-# 查看系统学到了什么
+# Inspect current learned User Profile (creative preferences)
 python -m script_weaver profile show
 ```
 
-## Web 项目持久化
+---
 
-Web UI 创建的项目保存在 SQLite 数据库中，刷新页面或重启后端后仍可打开、继续修改和导出：
+## Downstream AI Video Generation (VideoGen)
 
-- 数据位置：`<data_dir>/main-web/projects.sqlite3`（默认 `~/.scriptweaver/main-web/`），可用 `SCRIPTWEAVER_DATA_DIR` 重定向；不新增其他环境变量。
-- 打开哪个项目由页面 URL 的 `?project=<id>` 决定；项目 ID 与导出 JSON 中的 `meta.id` 一致。
-- 每次保存都会追加一条不可变历史版本（`GET /api/projects/{id}/versions`），重命名同样推进项目 revision；携带过期 revision 的写入会返回 409，不会产生部分写入。
-- 单卡 AI 修改：在卡片编辑面板提出要求，生成持久候选，比较后采用或放弃；生成成功不代表采用。生成期间仍可手工保存；项目任何保存都会使旧候选过期，需载入最新内容重新发起。候选及失败运行可在卡片面板重开后查看。
-- 数据库升级到 v3 前请停止 API 并备份整个 `main-web` 数据目录（含 SQLite 相关文件）。升级保留项目和版本历史；旧程序会拒绝 v3 数据库，回退需恢复升级前备份，升级后的新数据不会自动降级。
-- 单实例运行：API 启动时对数据目录持有独占文件锁，同一数据目录上的第二个 API 实例会拒绝启动；正常退出后可立即重启。CLI 不会写该数据库。
+Script-Weaver's core differentiator is the **VideoGen Exporter**, which bridges conceptual writing and downstream visual rendering.
 
-### 生成运行独立于页面（可停止）
+### Output Structure
 
-生成由服务端拥有（`generation_runs` 表随 schema v2 落库），刷新、关闭页面或断开进度订阅都不会取消运行；只有显式停止、阶段保存冲突或服务重启会终止它：
-
-- **提交/订阅分离**：`POST /api/projects/{id}/generate`（body 可带 `request_key` 幂等键与 `user_input` 覆盖）提交运行；`GET /api/projects/{id}/runs/{run_id}/events` 先回放当前快照再直播进度，`GET .../runs/latest` 查询最近一次运行，`POST .../runs/{run_id}/stop` 显式停止（幂等，只取消本地等待，不声称远端请求必定取消或不计费）。旧 `GET .../generate` 改为只读订阅别名：订阅最近一次运行，无运行时返回 404 `no_run` 提示先提交——**不再启动生成，也不再因断连取消运行**（PR #12 的旧契约已按 #14 有意变更）。
-- **幂等与互斥**：`request_key` 按 `(项目, key)` 覆盖**所有状态**查原运行（查询与新建在同一 SQLite 写事务内）——同 key 同输入返回原运行且不创建模型执行实例（失败/取消/中断后重发亦然，不受后续运行遮蔽），同 key 不同输入返回 409 `request_conflict`，同一项目已有活跃模型操作返回 409 `run_active`（refine 修改同样遵守该互斥，占用覆盖模型调用与 CAS 保存全程）。**引擎初始化在服务端运行任务内进行**：运行获准（入库）与任务注册在同一项目锁下完成，stop 的状态转换也经同一把锁协调——已成功停止的运行绝不会再启动流水线，初始化失败/被取消都会落到终态并清理注册；提交响应读取注册后的当前状态，不返回受理时的缓存快照。
-- **阶段保存与冲突**：每个成功 Agent 阶段（概念→大纲→角色→场景→美术→剧本→分镜→收尾）通过验证后在**同一 SQLite 事务**内完成 revision 校验、产物保存、历史版本与 run checkpoint（任一步失败整笔回滚）；分镜按场次生成，部分场次失败不会把该阶段记为完成。用户在生成期间手工保存会让下一阶段提交冲突：运行标记 failed，未应用结果保留在运行记录（`unapplied`）中，不覆盖用户内容、不继续后续阶段。
-- **状态机**：`running / stopping / succeeded / failed / cancelled / interrupted`。停止与完成的竞争以数据库原子转换的先后为准（成功先落库则保留成功；停止先被接受则成功不能落库，运行记为 cancelled；终态不可回退、重复停止安全）；服务重启把遗留活跃运行标记为 `interrupted` 并如实展示，不自动调用模型续跑；进程退出会取消并等待全部运行协程，不留未取回异常。
-- **前端**：刷新或重新打开项目会自动找回运行中的生成并重连进度（含停止按钮）；连接中断与生成失败分开展现——断线提示"生成仍在后台进行"，终态（成功/停止/失败/中断）各有明确反馈。断连期间完成的运行在重新点击当前项目时按**同一条结果处理路径**恢复（状态、文案、产物刷新与刷新失败重试一致），进度查询区分"无运行记录"与查询失败（失败可重点击重试）；所有异步回写都以会话代次、项目归属与订阅归属校验，旧会话/旧订阅/被 newer 请求取代的迟到响应一律丢弃（含 A→B→A 往返）。
-
-### 升级与回滚
-
-- 旧版本（纯内存 Web 项目）的内容不会迁移：升级前请先用旧版本导出需要的项目 JSON。
-- 回滚到旧代码不会删除或改动 `main-web` 数据库与历史版本，但旧版本无法展示其中的项目；重新部署新版本后仍可读取。
-- 数据库通过 `PRAGMA user_version` 管理格式版本；当数据库版本超出当前程序支持时会拒绝写入，不会自动降级。
-
-## 全局修改（refine）的真实结果契约
-
-`POST /api/projects/{id}/refine` 只在验证通过且 CAS 保存成功时返回 200；返回体在原有字段之上追加由前后快照实际计算出的差异摘要（不引用模型自报的完成声明）：
-
-- `changed_artifacts`：发生实质变化的产物列表（如 `["script"]`）。
-- `changes`：字段路径 + `before`/`after` 预览，最多展示 10 条，每侧最多 300 字符；`total_changes` 给出总数，完整内容在项目历史中。摘要只读，不是可应用的 patch。
-- 修改了剧本但未重跑分镜时返回 `notice` 提示"已有分镜和视频提示词未自动同步"。
-
-未应用返回 422，`detail.code` 区分四种原因：`refine_no_meaningful_change`（无实质变化，仅备注/自动 ID——含角色与场景设计的 `id`——或元数据变化不算）、`refine_constraint_failed`（受限修改越界，整体拒绝；普通修改新破坏引用完整性同样归入此码——`storyboard.shots[*].scene_id → script.scenes[*].scene_id`、`script.scenes[*].scene_design_id → scenes[*].id`、`visual_highlights[*].related_shot_ids → storyboard.shots[*].shot_id` 中新引入的悬空或歧义引用会被拒绝并指出字段。缺陷按稳定身份比较（引用关系、所属对象稳定 ID、引用目标原值、缺陷类型，数组下标仅用于报错信息），且历史豁免要求所属对象 ID 可靠匹配：本次新增或加重所属 ID 重复、或历史重复组内容已变化时不可借用旧缺陷；修改前快照已有的历史缺陷随对象重排或引用列表重排不阻断无关编辑，但同一对象换成新断链值、在旧缺陷下标处换一个对象破坏都会被视为新缺陷）、`refine_not_executable`（路由决定不执行或目标不可修改，含 action/constraint 非字符串等非法类型）、`refine_target_not_found`（约束目标不存在，执行 Agent 不会被调用）。模型协议或请求失败返回脱敏的 502（`refine_model_failed`），不会伪装成未应用或成功。所有非 200 路径都不写库：revision、历史、memory 与产物保持原样。
-
-约束修改 `shorten_last_dialogue`（用户明确要求"只缩短剧本最后一句对白，其他内容保持"时由编排器选择）：目标定位自修改前快照（`script.scenes` 与 blocks 顺序最后一个非空对白 block 的 `content.dialogue`），返回结果中该字符串去首尾空白后必须非空、不同且字符数严格减少，剧本其余全部字段（含 notes、ID、场次顺序）与其他产物保持逐字一致；任何越界改动都会被整体拒绝，不会从越界整稿中挑出部分变化冒充成功。
-
-## 导出格式
-
-### Web 导出 API（`GET /api/projects/{id}/export/{format}`）
-
-三种格式都返回真实文件字节（`Content-Disposition: attachment`，文件名 = 项目 ID + 格式扩展名，与项目标题无关），供对应工具直接打开；全部内容来自该项目当前持久化快照的一次读取，导出本身不写库、不新增版本、不触发任何模型调用：
-
-| format | Content-Type | 内容 |
-| --- | --- | --- |
-| `json` | `application/json` | 原始 `ProjectState` 对象（顶层即 `meta`、`script` 等，UTF-8） |
-| `fountain` | `text/plain; charset=utf-8` | 实际 Fountain 文本 |
-| `video_gen` | `application/zip` | `ZIP_DEFLATED` 包：根目录 `video_gen_shots.json`、`video_gen_shots.csv`，以及 `shots/` 下逐镜头 `.txt` |
-
-注意：这是旧版导出响应形状的**有意变更** —— 外部调用方不应再读取旧的 `{"content": ...}` JSON 包装；CLI 的文件输出契约保持不变。错误语义：项目不存在返回 404，格式不支持或必需产物缺失返回 400，危险（含路径分隔符/父路径）或重复的 `shot_id` 返回 422，服务失败保持非 2xx。
-
-### VideoGen 导出（核心差异化功能）
-
-每个 Shot 都会被导出为视频生成工具可用的格式：
+When exporting with `video_gen` format (CLI `--format video_gen` or Web export), the following bundle is generated:
 
 ```
 output/video_gen/
-├── video_gen_shots.json      # 全部 shot 的结构化数据
-├── video_gen_shots.csv       # 表格格式（可用 Excel 打开）
+├── video_gen_shots.json      # Structured data for all shots
+├── video_gen_shots.csv       # Tabular summary (Excel / spreadsheet compatible)
 └── shots/
-    ├── shot_xxx_1.txt        # Shot 1: image_prompt + video_prompt
-    ├── shot_xxx_2.txt        # Shot 2
+    ├── shot_001.txt          # Shot 1: Image & Video prompts, metadata
+    ├── shot_002.txt          # Shot 2: Image & Video prompts, metadata
     └── ...
 ```
 
-每个 shot 包含：
-- **image_prompt**: 首帧图像生成提示词（构图/光线/色彩/主体姿态）
-- **video_prompt**: 视频生成提示词（动作/运镜/物理真实感）
-- **duration_seconds**: 时长
-- **transition_in/out**: 转场方式
-- **dialogue_text / voiceover_text**: 音频轨道信息
+### Concrete Shot Breakdown Sample
 
-> CSV 是表格工作流用的**摘要格式**：超过 200 字符的字段会截断加 `...`。完整提示词以 `video_gen_shots.json` 和 `shots/*.txt` 为准。
+Each shot file provides synchronized prompts ready for video models:
 
-## 开发
+```yaml
+Shot ID: shot_scene1_01
+Scene: INT. RAIN-SLICKED LAB - NIGHT
+Duration: 4.5s
+Camera: Low-angle tracking shot, 35mm anamorphic lens, shallow depth of field
 
-```bash
-# 安装开发依赖
-pip install -e ".[dev]"
+Image Prompt (First-frame key visual):
+  Cinematic 35mm film still, low angle, medium close-up of Kaelen in a dim, rain-streaked cybernetics lab. Harsh neon-amber backlight catching cigarette smoke, volumetric shadows, intricate cybernetic eye with subtle blue aperture ring, photorealistic textures, muted teal and tungsten palette, 8k resolution.
 
-# 运行测试
-pytest
+Video Prompt (Motion & Temporal dynamics):
+  Camera slowly tracks forward from low angle as Kaelen exhales smoke, his mechanical iris clicking and recalibrating. Neon rain reflections ripple across the window pane behind him. Atmospheric dust motes floating through volumetric amber beam. Smooth organic motion, cinematic pacing, 24fps.
 
-# 代码检查
-ruff check src/ tests/
-
-# 手动测试完整流程
-python -m script_weaver generate "测试故事" --auto-approve --output-dir ./test-output
+Audio & Dialogue:
+  KAELEN (V.O.): "Memories are just code. And code can be forged."
+Transition Out: Hard cut on eye reflex
 ```
 
-### Web 前端回归（Playwright）
+> **Compatible Tools**: Directly copy and paste prompts into **Kling AI**, **Runway Gen-3 Alpha**, **Luma Dream Machine**, **Hailuo AI (Minimax)**, or batch-upload via API.
 
-针对 Web 端异步隔离行为（迟到响应、面板折叠、历史查看、生成连接生命周期）的端到端回归，使用页面内请求门闩与生成 SSE 替身（EventSource stand-in）复现竞争，不依赖固定等待：
+---
+
+## Skill Registry & Methodologies
+
+Script-Weaver decouples storytelling methodology from core LLM logic. Techniques are encapsulated as reusable, composable **Skills**.
+
+### Built-in Skills
+
+| Skill ID | Name | Target Stage | Methodology / Style |
+|----------|------|--------------|---------------------|
+| `save-the-cat` | Save the Cat! Beat Sheet | `structuring` | Blake Snyder’s 15-beat narrative structure |
+| `story-circle` | Dan Harmon Story Circle | `structuring` | 8-step cyclical character journey |
+| `three-act` | Classical Three-Act Structure | `structuring` | Universal dramatic setup, confrontation, resolution |
+| `character-prototype` | Archetype & Character Arc | `character_design` | Jungian archetypes, internal flaws, transformation arcs |
+| `wong-kar-wai-style` | Wong Kar-wai Visual Aesthetics | `art_direction` | Step-printed slow motion, saturated neon, urban melancholy |
+| `cinematography-basics` | Cinematography Lexicon | `storyboarding` | Standard framing, camera axes, and cinematic grammar |
+
+### Authoring Custom Skills
+
+#### Format 1: Native YAML (Recommended)
+
+```yaml
+# my-film-noir.yaml
+id: modern-neo-noir
+name: "Modern Neo-Noir Style"
+stage: art_direction
+description: "High-contrast shadows, practical lighting, and cynicism"
+version: "1.0"
+
+prompt_injection: |
+  Apply neo-noir cinematic conventions:
+  1. Contrast ratio must exceed 8:1 with prominent venetian blind or neon slash shadows.
+  2. Frame subjects through architectural silhouettes, glass reflections, or rainy windshields.
+
+constraints:
+  - "Avoid bright high-key lighting"
+  - "Color palette must prioritize deep shadows, amber, and cold cyan"
+```
+
+#### Format 2: Claude Code Markdown (`.md`)
+
+Script-Weaver natively parses `.md` skill files:
+
+```markdown
+---
+name: dialogue-punch-up
+description: Sharp, Subtext-Driven Dialogue
+---
+
+# Guidelines
+1. Characters must never state their true intention directly.
+2. Every dialogue turn must advance status or uncover leverage.
+```
+
+Install and activate with:
+
+```bash
+python -m script_weaver skills install ./my-film-noir.yaml
+python -m script_weaver skills activate modern-neo-noir --stage art_direction
+```
+
+---
+
+## Grows With User (3-Tier Evolution)
+
+Script-Weaver is designed as an evolving creative companion rather than a stateless prompt:
+
+1. **Layer 1: Project Memory (`ProjectMemory`)**
+   - Logs accepted, revised, and rejected suggestions throughout a project.
+   - Extracts reusable refinement patterns (e.g., "User consistently trims dialogue blocks by 30%").
+2. **Layer 2: User Profile (`UserProfile`)**
+   - Stored globally in `~/.scriptweaver/user_profile.json`.
+   - Accumulates cross-project tastes: favored narrative pacing, character archetypes, visual styles, and color temperatures.
+   - Dynamically tailors agent system prompts to your creative voice.
+3. **Layer 3: Skill Self-Evolution**
+   - Automatically detects recurring prompt modifications and drafts new custom skills.
+   - Ranks and optimizes active skills based on real user acceptance rates.
+
+---
+
+## Architecture & Engineering Rigor
+
+Script-Weaver is built with production reliability at its core:
+
+### 1. SQLite Persistence & CAS Revisions
+- All Web projects are stored in an ACID SQLite database (`<data_dir>/main-web/projects.sqlite3`).
+- Updates use Compare-And-Swap (CAS) revision checks (`revision` counter). Concurrent or stale writes return `409 Conflict`, strictly preventing partial writes or state corruption.
+- Every save automatically creates an immutable version snapshot (`GET /api/projects/{id}/versions`).
+
+### 2. Detached Background Execution & SSE Streaming
+- Generation runs are owned by the server process, not tied to the HTTP socket.
+- Closing the browser tab, refreshing, or network disconnections will **never** cancel an active generation.
+- The Web client uses SSE (`/runs/{run_id}/events`) with snapshot replay upon reconnection.
+- Runs can be idempotently stopped via `POST /runs/{run_id}/stop` or resumed from the latest checkpoint.
+
+### 3. Atomic Checkpoints & Fault-Tolerant Resumption
+- Successful agent stages commit atomically within a single transaction.
+- If a run fails or is interrupted (e.g. process termination), `--resume` (CLI) or `/resume` (Web API) verifies fingerprint compatibility and resumes execution from the exact failed stage without repeating costly upstream LLM calls.
+
+### 4. Granular Refinement Contracts
+- Global and card-level AI refinements (`POST /api/projects/{id}/refine`) enforce strict structural and referential integrity (e.g. `shot.scene_id` must match `script.scene_id`).
+- When a refinement succeeds, the API returns a real semantic diff summary (`changed_artifacts`, `before`/`after` snippets). If a refinement produces no meaningful change or violates constraints, it fails fast with descriptive `422` error codes without mutating state.
+
+---
+
+## Testing & Verification
+
+### Unit & Integration Tests
+
+```bash
+# Run backend pytest suite
+pytest
+
+# Code style and linting
+ruff check src/ tests/
+```
+
+### Web E2E Tests (Playwright with Port Isolation)
+
+Script-Weaver features comprehensive E2E tests for Web state management, SSE reconnects, and CAS conflict handling using port isolation (ensuring no accidental calls to live models):
 
 ```bash
 cd web
 npm install
-npx playwright install chromium   # 首次运行前执行一次
-npm run test:e2e                  # 自动启动隔离后端(8310)与前端(3100)
-```
+npx playwright install chromium    # Run once
+npm run test:e2e                   # Runs isolated backend (8310) and frontend (3100)
 
-测试使用独立的临时数据目录（`/tmp/script-weaver-e2e-data`），不会触碰默认数据目录。生成一律通过页内 EventSource 替身驱动（支持等待、进度、完成、错误与关闭），且配置会用空密钥覆盖所有 `SCRIPTWEAVER_*_API_KEY`（真实环境变量优先于 `.env`），因此即使开发机配置了真实密钥，E2E 也不会、也不能发起任何真实模型调用；每个用例结束时都会断言没有任何请求真正到达 `/generate` 或 `/refine`。
-
-测试要求端口 8310（后端）与 3100（前端）空闲：套件从不复用已在监听的服务（避免复用到未经隔离配置、可能带真实密钥的后端），也不会自动终止它们——端口被占用时运行会在任何用例执行前直接报错退出。可用以下最小回归随时复验该行为（纯本地替身占用端口，断言零测试流量到达占用者）：
-
-```bash
+# Verify port isolation
 npm run check:e2e-ports
 ```
 
-## 真实模型验收
+### Real-Model Acceptance Testing
 
-DeepSeek 适配器显式使用非思考模式，匹配当前工具消息协议。分镜按剧本场次分别生成，
-全部成功后汇总；任一场次达到输出 token 上限会明确失败，不接受截断或缺场结果。
-
-按前面的环境变量说明配置模型和 API Key 后，可使用诊断脚本运行同一条流水线：
+Verify the end-to-end pipeline against live LLM providers using the diagnostic verification script:
 
 ```bash
-python scripts/verify_real_model.py --output-dir /tmp/script-weaver-verification \
-  --idea "60秒悬疑短片，两人一景。门牌为007，屏幕显示2026，结尾反转。"
+python scripts/verify_real_model.py \
+  --output-dir /tmp/script-weaver-verification \
+  --idea "A 60-second sci-fi suspense short where two astronauts realize their ship's clock runs backwards."
 
-# 失败后复用已完成的阶段；不要删除该目录中的 checkpoint.json
-python scripts/verify_real_model.py --output-dir /tmp/script-weaver-verification --resume
+# Resume from previous checkpoint if interrupted
+python scripts/verify_real_model.py \
+  --output-dir /tmp/script-weaver-verification \
+  --resume
 ```
 
-每次新的验收使用新目录。`checkpoint.json` 保存已完成阶段的创作内容；`calls.jsonl`
-记录模型、阶段、停止原因、token 用量和工具名称；请求失败时记录异常类型与耗时，
-不记录 API Key 或消息正文。
-成功时同时生成 `project.json`、`script.fountain` 和 `video_gen/`。
-`PASS` 表示生成与导出完成，不代表时长、镜头数量等创作质量要求已全部满足；
-严格时长预算与跨场分镜节奏控制留待后续完善。
-已经完成的验收不能续跑，避免重复执行成长统计。恢复运行跳过的是已完成阶段，
-当前失败阶段会重新执行，不支持从半个场次的截断输出继续。
-第一阶段失败时尚无 checkpoint，需使用新目录重新执行，不能 `--resume`。
+---
 
-包含 SSE 回归的完整测试需要 Web 依赖：
-
-```bash
-pip install -e ".[dev,web]"
-pytest
-```
-
-## 项目结构
+## Project Structure
 
 ```
 script-weaver/
 ├── src/script_weaver/
-│   ├── __init__.py
-│   ├── cli.py                      # CLI 入口
+│   ├── cli.py                      # Click CLI entry point
 │   ├── core/
-│   │   ├── types.py                # 全部 Pydantic 数据模型 ★
-│   │   ├── config.py               # 配置管理
-│   │   └── pipeline.py             # Pipeline 编排引擎
+│   │   ├── types.py                # Core Pydantic domain models
+│   │   ├── config.py               # Settings and environment management
+│   │   ├── pipeline.py             # Pipeline orchestration engine
+│   │   ├── project_store.py        # SQLite persistence, CAS locking, run state machine
+│   │   ├── refinement.py           # Global & card refinement validation
+│   │   └── resume.py               # Checkpoint fingerprinting and resume logic
 │   ├── agents/
-│   │   ├── base.py                 # BaseAgent (tool-use 循环) ★
-│   │   └── impl.py                 # 全部 9 个 Agent 实现
+│   │   ├── base.py                 # BaseAgent (autonomous tool-use loop)
+│   │   └── impl.py                 # Implementations of all 9 specialized agents
 │   ├── tools/
-│   │   └── definitions.py          # 工具定义与注册
-│   ├── prompts/
-│   │   └── system_prompts.py       # 中文 System Prompt 模板
+│   │   └── definitions.py          # Agent tool definitions and dispatchers
 │   ├── llm/
-│   │   ├── client.py               # LLM Client 封装
-│   │   └── providers.py            # 6 个 LLM Provider 实现
+│   │   ├── client.py               # Unified LLM client interface
+│   │   └── providers.py            # Provider adapters (Anthropic, OpenAI, DeepSeek, etc.)
 │   ├── skills/
-│   │   ├── adapters.py             # 多格式 Skill 适配器
-│   │   ├── registry.py             # Skill 注册管理中心
-│   │   └── builtin/                # 6 个内置 Skills (YAML)
+│   │   ├── adapters.py             # Adapters for YAML, JSON, Claude Code Markdown
+│   │   ├── registry.py             # Discovery, loading, activation, and prompt merging
+│   │   └── builtin/                # 6 Built-in production skills
 │   ├── memory/
-│   │   ├── profile.py              # UserProfile 持久化
-│   │   └── evolution.py            # Skill 自进化引擎
-│   ├── validators/
+│   │   ├── profile.py              # UserProfile persistence & learning
+│   │   └── evolution.py            # Skill self-evolution engine
 │   └── exporters/
-│       ├── json_exporter.py
-│       ├── fountain_exporter.py
-│       └── video_gen_exporter.py    # VideoGen 导出 ★
-├── tests/
-│   └── unit/
-│       └── test_models.py
-├── snapshot/                       # 参考截图
-├── pyproject.toml
-├── .env.example
-└── README.md
+│       ├── json_exporter.py        # ProjectState JSON export
+│       ├── fountain_exporter.py    # Industry-standard Fountain export
+│       └── video_gen_exporter.py   # VideoGen multi-file & CSV export
+├── web/
+│   ├── api/
+│   │   └── main.py                 # FastAPI backend (REST + SSE streaming)
+│   ├── src/app/
+│   │   └── page.tsx                # Next.js interactive dual-pane workbench
+│   └── tests/e2e/                  # Playwright E2E isolation test suites
+├── scripts/
+│   └── verify_real_model.py        # Real-model pipeline diagnostic harness
+├── pyproject.toml                  # Python package metadata and dependencies
+└── README.md                       # Project documentation
 ```
+
+---
 
 ## License
 
-MIT
+This project is licensed under the **MIT License**. See [LICENSE](LICENSE) for details.
