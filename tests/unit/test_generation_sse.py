@@ -9,6 +9,7 @@ below runs offline against the real store via a scripted engine.
 """
 
 import asyncio
+import uuid
 import json
 import threading
 from types import SimpleNamespace
@@ -478,10 +479,10 @@ async def test_refine_blocked_while_generation_active_and_vice_versa(client):
     await c.post(f"/api/projects/{p['project_id']}/generate", json={"request_key": "k"})
 
     refine_blocked = await c.post(
-        f"/api/projects/{p['project_id']}/refine", json={"message": "改一下"}
+        f"/api/projects/{p['project_id']}/refine", json={"message": "改一下", "expected_revision": api._runtime.store.get_required(p["project_id"]).revision, "request_key": uuid.uuid4().hex}
     )
     assert refine_blocked.status_code == 409
-    assert refine_blocked.json()["detail"]["code"] == "run_active"
+    assert refine_blocked.json()["detail"]["code"] == "candidate_run_conflict"
     gen_release.set()
     latest = await c.get(f"/api/projects/{p['project_id']}/runs/latest")
     await await_terminal(api, latest.json()["run_id"])
@@ -489,7 +490,7 @@ async def test_refine_blocked_while_generation_active_and_vice_versa(client):
     # Reverse direction: a refine in flight refuses a generation submit.
     refine_release = asyncio.Event()
 
-    async def fake_refine(state, message):
+    async def fake_refine(state, message, **kwargs):
         await refine_release.wait()
         raise api.RefinementError("unapplied")  # nothing saved; just unblock
 
@@ -510,7 +511,7 @@ async def test_refine_blocked_while_generation_active_and_vice_versa(client):
 
     api._get_engine = refine_engine
     refine_task = asyncio.create_task(
-        c.post(f"/api/projects/{p['project_id']}/refine", json={"message": "慢修改"})
+        c.post(f"/api/projects/{p['project_id']}/refine", json={"message": "慢修改", "expected_revision": api._runtime.store.get_required(p["project_id"]).revision, "request_key": uuid.uuid4().hex})
     )
     await asyncio.sleep(0.05)  # let the refine slot be taken
     gen_blocked = await c.post(
@@ -726,7 +727,7 @@ async def test_two_concurrent_refines_admit_one_and_survive_failure(client):
     release = asyncio.Event()
     refine_calls = {"n": 0}
 
-    async def fake_refine(state, message):
+    async def fake_refine(state, message, **kwargs):
         refine_calls["n"] += 1
         if refine_calls["n"] == 1:
             model_entered.set()
@@ -751,35 +752,37 @@ async def test_two_concurrent_refines_admit_one_and_survive_failure(client):
 
     api._get_engine = refine_engine
     first_refine = asyncio.create_task(
-        c.post(f"/api/projects/{p['project_id']}/refine", json={"message": "慢修改"})
+        c.post(f"/api/projects/{p['project_id']}/refine", json={"message": "慢修改", "expected_revision": api._runtime.store.get_required(p["project_id"]).revision, "request_key": uuid.uuid4().hex})
     )
     await asyncio.wait_for(model_entered.wait(), timeout=5)
 
     # The second refine is rejected while the first holds the slot.
     second = await c.post(
-        f"/api/projects/{p['project_id']}/refine", json={"message": "并发修改"}
+        f"/api/projects/{p['project_id']}/refine", json={"message": "并发修改", "expected_revision": api._runtime.store.get_required(p["project_id"]).revision, "request_key": uuid.uuid4().hex}
     )
     assert second.status_code == 409
-    assert second.json()["detail"]["code"] == "run_active"
+    assert second.json()["detail"]["code"] == "candidate_run_conflict"
 
     release.set()
     first = await first_refine
-    assert first.status_code == 422  # failure released the slot
+    assert first.status_code == 200
+    assert (await await_terminal(api, first.json()["run"]["run_id"]))["status"] == "failed"
 
     # The slot survives an exception: a new refine reaches the model again.
     release = asyncio.Event()
     third = asyncio.create_task(
-        c.post(f"/api/projects/{p['project_id']}/refine", json={"message": "再次修改"})
+        c.post(f"/api/projects/{p['project_id']}/refine", json={"message": "再次修改", "expected_revision": api._runtime.store.get_required(p["project_id"]).revision, "request_key": uuid.uuid4().hex})
     )
     await asyncio.wait_for(model_entered.wait(), timeout=5)
     release.set()
-    await third
+    third_result = await third
+    await await_terminal(api, third_result.json()["run"]["run_id"])
     assert refine_calls["n"] == 2
 
     # Another project is fully independent.
     other = await create_project(c, "独立项目")
     blocked = await c.post(f"/api/projects/{other['project_id']}/refine",
-                           json={"message": "修改"})
+                           json={"message": "修改", "expected_revision": api._runtime.store.get_required(p["project_id"]).revision, "request_key": uuid.uuid4().hex})
     assert blocked.status_code in (200, 422)  # admission succeeded either way
 
 
@@ -790,7 +793,7 @@ async def test_generation_rejected_while_refine_is_saving(client, monkeypatch):
     save_entered = threading.Event()
     save_release = threading.Event()
 
-    async def fake_refine(state, message):
+    async def fake_refine(state, message, **kwargs):
         model_done.set()
         updated = state.model_copy(deep=True)
         updated.refined_idea = "refined"
@@ -810,14 +813,14 @@ async def test_generation_rejected_while_refine_is_saving(client, monkeypatch):
         )
         return engine, ctx
 
-    original_save = api._runtime.store.save_state
+    original_save = api._runtime.store.complete_card_candidate
 
     def blocked_save(*args, **kwargs):
         save_entered.set()
         save_release.wait(5)
         return original_save(*args, **kwargs)
 
-    monkeypatch.setattr(api._runtime.store, "save_state", blocked_save)
+    monkeypatch.setattr(api._runtime.store, "complete_card_candidate", blocked_save)
     api._get_engine = refine_engine
 
     calls = []
@@ -828,7 +831,7 @@ async def test_generation_rejected_while_refine_is_saving(client, monkeypatch):
         return state_with("保存期互斥故事", "大纲")
 
     refine_task = asyncio.create_task(
-        c.post(f"/api/projects/{p['project_id']}/refine", json={"message": "修改"})
+        c.post(f"/api/projects/{p['project_id']}/refine", json={"message": "修改", "expected_revision": api._runtime.store.get_required(p["project_id"]).revision, "request_key": uuid.uuid4().hex})
     )
     await asyncio.wait_for(model_done.wait(), timeout=5)
     await asyncio.to_thread(save_entered.wait, 5)
@@ -1655,7 +1658,7 @@ async def test_resume_blocked_while_refine_in_flight_and_vice_versa(client, monk
         record = api._runtime.store.get_required(pid)
         from types import SimpleNamespace
 
-        async def slow_refine(state, message):
+        async def slow_refine(state, message, **kwargs):
             await hold.wait()
             raise RefineExecutionError("受控失败")
 
@@ -1670,7 +1673,7 @@ async def test_resume_blocked_while_refine_in_flight_and_vice_versa(client, monk
 
     api._get_engine = fake_get_engine
     refine_task = asyncio.create_task(
-        c.post(f"/api/projects/{p['project_id']}/refine", json={"message": "改短"})
+        c.post(f"/api/projects/{p['project_id']}/refine", json={"message": "改短", "expected_revision": api._runtime.store.get_required(p["project_id"]).revision, "request_key": uuid.uuid4().hex})
     )
     await asyncio.sleep(0.05)  # let the refine slot acquire
     async def pipeline(**kwargs):  # pragma: no cover - must not run
@@ -1684,7 +1687,8 @@ async def test_resume_blocked_while_refine_in_flight_and_vice_versa(client, monk
     assert refused.json()["detail"]["code"] == "run_active"
     hold.set()
     done = await refine_task
-    assert done.status_code == 502  # released; controlled failure surfaces
+    assert done.status_code == 200
+    assert (await await_terminal(api, done.json()["run"]["run_id"]))["status"] == "failed"
 
 
 async def test_zero_step_resume_reruns_everything(client):

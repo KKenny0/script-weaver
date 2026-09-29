@@ -321,8 +321,11 @@ Script-Weaver 在底层融入了工业级系统设计的鲁棒性考量：
 - 遇到模型网络抖动或服务重启中断时，使用 CLI `--resume` 或 Web 续跑 API 可精准识别阶段指纹，跳过耗时且已成功的上游环节，仅针对失败阶段重试。
 
 ### 4. 严密的局部修改（Refine）安全契约
-- 全局与卡片级修改接口（`POST /api/projects/{id}/refine`）在执行后会核验实体引用完整性（例如 `shot.scene_id` 与 `script.scene_id` 的匹配性）。
-- 修改成功后返回由前后快照严格计算得出的真实 Diff 摘要（`changed_artifacts` 与 `before/after`）；未发生实质变化或越界违背约束时，以 `422` 状态码迅速拒绝，绝不向数据库写入无效状态。
+- **API 兼容变化**：`POST /api/projects/{id}/refine` 现在必须提交 `{message, expected_revision, request_key}`，立即返回 `{run, created}`。提交成功或 `global_candidate` 运行成功只代表生成候选，不自动保存项目。通过运行接口或 `GET /api/projects/{id}/candidates` 查询，明确调用 `POST /api/projects/{id}/candidates/{candidate_id}/accept` 或 `/reject` 采用或放弃。
+- 聊天保留自然语言修改入口；常驻的“全局修改候选”入口在刷新、切换项目后仍可找回运行和候选。采用前显示完整字段差异、整件替换范围、原始要求与保守下游影响。采用前当前内容、历史和三种导出均不改变。
+- 阶段 1 仅支持单个已有的整组角色、场景、剧本或分镜；命中大纲、美术风格路由时在执行前明确拒绝。保留 ID、归属、引用、集合顺序与手工编辑只读字段，不支持增删重排。CLI 仍保留既有六路由范围。
+- 采用复用卡片候选的 revision 校验、内容/历史/复核原子事务、过期规则与幂等行为。期间任何保存都会使待采用候选过期；重复采用返回最初采用版本。角色/场景影响已有剧本、分镜、亮点；剧本影响已有分镜/亮点；分镜影响已有亮点，只标记待复核，不自动重生成。
+- 全局与卡片候选共用既有 SQLite 候选表，无 schema 变更，旧卡片候选仍可读取。候选运行独立于完整生成，latest-generation 与 resume 不把它当作生成断点。中断、停止和失败仍可发现，使用新的 request key 重新发起。
 
 ---
 

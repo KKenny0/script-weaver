@@ -604,3 +604,23 @@ print(json.dumps(info, ensure_ascii=False))
     firstShotTxt: raw.first_shot_txt ?? "",
   };
 }
+
+// Real durable run and candidate storage; no model endpoint is invoked.
+export async function seedGlobal(pid: string) {
+  const { execFile } = await import("node:child_process");
+  const script = `
+import json, sys, uuid
+from pathlib import Path
+from script_weaver.core.project_store import ProjectStore, hash_run_request
+s = ProjectStore(Path('/tmp/script-weaver-e2e-data/main-web/projects.sqlite3'))
+r = s.get_required(sys.argv[1])
+req = dict(kind='global', target_id='', instruction='让角色更坚定', expected_revision=r.revision)
+run, _ = s.admit_generation_run(r.project_id, kind='global_candidate', request_key=str(uuid.uuid4()), request=req, request_hash=hash_run_request(req), base_revision=r.revision, base_state_json=r.state_json, checkpoint_json=None)
+out = r.state.model_copy(deep=True)
+out.characters[0].personality = '坚定的候选性格'
+c = s.complete_card_candidate(run.run_id, out)
+print(json.dumps(dict(run_id=run.run_id, candidate=c)))
+s.close()
+`;
+  return new Promise<any>((resolve, reject) => execFile("../.venv/bin/python", ["-c", script, pid], (err, stdout) => err ? reject(err) : resolve(JSON.parse(stdout))));
+}

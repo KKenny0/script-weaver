@@ -2,6 +2,7 @@
 
 import React, { useState, useCallback, useRef, useEffect } from "react";
 import { PanelLeftOpen } from "lucide-react";
+import CardCandidates from "./components/CardCandidates";
 import ChatPanel from "./components/ChatPanel";
 import ArtifactPanel from "./components/ArtifactPanel";
 import ProjectList, { ProjectSummary } from "./components/ProjectList";
@@ -145,6 +146,7 @@ export default function HomePage() {
   // The open review panel's session (ticket #17): one seq per open/reload,
   // keyed remount resets the checkbox selection; the revision inside is the
   // confirm request's CAS basis.
+  const [globalOpen, setGlobalOpen] = useState(false);
   const [reviewPanel, setReviewPanel] = useState<ReviewPanelSession | null>(null);
 
   // Late-response guard: async handlers compare against the project that is
@@ -807,6 +809,8 @@ export default function HomePage() {
           projectId={projectId}
           isGenerating={isGenerating}
           setIsGenerating={setIsGenerating}
+          projectRevision={projectRevision}
+          onGlobalRequested={() => setGlobalOpen(true)}
           projectStatus={projectStatus}
           setProjectStatus={setProjectStatus}
           onArtifactUpdate={handleArtifactUpdate}
@@ -851,6 +855,18 @@ export default function HomePage() {
           <PanelLeftOpen size={18} />
         </button>
       )}
+
+      {projectId && <aside key={`${projectId}-${projectOpenEpoch}`} style={{ position: "fixed", right: 16, bottom: 16, zIndex: 110, maxWidth: "min(620px, 90vw)", maxHeight: "80vh", overflow: "auto", background: "var(--bg-sidebar)", border: "1px solid var(--border-default)", padding: 12, borderRadius: 8 }}>
+        <button className="btn-secondary" aria-expanded={globalOpen} onClick={() => setGlobalOpen(v => !v)}>全局修改候选</button>
+        {globalOpen && <CardCandidates session={{ projectId, seq: projectOpenEpoch, kind: "global", id: "", revision: projectRevision, snapshot: {} }}
+          dirty={false} fieldLabels={{ characters: "角色", scenes: "场景", script: "剧本", storyboard: "分镜", visual_highlights: "视觉亮点" }}
+          onReload={(snapshot) => { if (snapshot) adoptSnapshot(snapshot); }} onAccepted={(payload) => {
+            contentReqRef.current++;
+            if (adoptSnapshot(payload)) appendNotice(`✅ 已采用全局候选，保存为 r${payload.revision}。`);
+            refreshProjects();
+            if (historyPanel.open) refreshHistory(projectId);
+          }} />}
+      </aside>}
 
       {/* Right Panel: Structured Output */}
       <ArtifactPanel

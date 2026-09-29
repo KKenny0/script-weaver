@@ -54,6 +54,8 @@ async function apiGet(path: string) {
 
 interface ChatPanelProps {
   projectId: string;
+  projectRevision: number;
+  onGlobalRequested: () => void;
   isGenerating: boolean;
   setIsGenerating: (v: boolean) => void;
   projectStatus: "idle" | "running" | "complete" | "error";
@@ -75,7 +77,7 @@ interface ChatPanelProps {
 }
 
 export default function ChatPanel({
-  projectId,
+  projectId, projectRevision, onGlobalRequested,
   isGenerating, setIsGenerating,
   projectStatus, setProjectStatus,
   onArtifactUpdate, onTabSwitch,
@@ -675,77 +677,39 @@ export default function ChatPanel({
     }
   }, [inputValue, isGenerating, sessionEpoch, isSessionActive, isProjectActive, subscribeRun, onProjectCreated, onProjectMutated, setProjectStatus, setIsGenerating, onArtifactUpdate]);
 
+  const refineRequest = useRef(0);
+  const refineWorking = useRef(false);
+  useEffect(() => { refineWorking.current = false; refineRequest.current++; }, [projectId, projectOpenEpoch]);
   const handleRefine = useCallback(async () => {
-    if (!projectId || !inputValue.trim() || isGenerating) return;
-
-    const refineText = inputValue.trim();
-    const originalInput = inputValue;
-    const seqAtStart = openSeqRef.current;
-    setMessages((prev) => [
-      ...prev,
-      { role: "user", content: `[修改] ${refineText}`, timestamp: Date.now() },
-      { role: "assistant", content: "正在应用修改...", timestamp: Date.now() },
-    ]);
-
+    if (!projectId || !inputValue.trim() || isGenerating || refineWorking.current) return;
+    const text = inputValue;
+    const seq = openSeqRef.current;
+    const request = ++refineRequest.current;
+    const current = () => mountedRef.current && openSeqRef.current === seq && refineRequest.current === request && isProjectActive(projectId);
+    refineWorking.current = true;
+    setMessages(prev => [...prev, { role: "user", content: `[修改] ${text.trim()}`, timestamp: Date.now() }]);
     try {
-      const body = await apiPost(`/projects/${projectId}/refine`, { message: refineText });
-      if (!mountedRef.current || openSeqRef.current !== seqAtStart || !isProjectActive(projectId)) return;
-      // The change is saved server-side from here on. Consume the submitted
-      // instruction only if the composer still holds it; a draft typed while
-      // the model was processing must survive.
-      setInputValue((prev) => (prev === originalInput ? "" : prev));
-
-      let reloaded = false;
-      try {
-        const fullState = await refreshProjectContent(projectId);
-        if (fullState === null) return;
-        if (!mountedRef.current || openSeqRef.current !== seqAtStart || !isProjectActive(projectId)) return;
-        applyFullState(fullState);
-        onProjectMutated();
-        reloaded = true;
-      } catch (fetchErr) {
-        // Saved, but the reload failed — the catch must NOT write anything
-        // itself; the shared exit guard below decides whether this instance
-        // still owns the chat.
-        console.error("Failed to reload project:", fetchErr);
-      }
-      // Common exit after the refresh settled, success or failure: the
-      // outcome message may only be written while this instance is still
-      // mounted AND the session/project are still current — otherwise a
-      // late refresh failure would splice A's summary into B's chat and
-      // delete B's latest message (an A→B→A round trip included).
-      if (!mountedRef.current || openSeqRef.current !== seqAtStart || !isProjectActive(projectId)) return;
-
-      const summary = formatChangeSummary(body);
-      const outcome = summary
-        ? `✅ 修改已保存。\n\n${summary}`
-        : "修改请求已返回，但未检测到内容差异；未产生新版本。";
-      const content = reloaded
-        ? outcome
-        : `✅ 修改已保存，但刷新项目显示失败；请手动刷新页面查看最新内容，无需重新提交。\n\n${summary}`;
-      setMessages((prev) => [...prev.slice(0, -1), { role: "assistant", content, timestamp: Date.now() }]);
+      await apiPost(`/projects/${projectId}/refine`, { message: text.trim(), expected_revision: projectRevision, request_key: crypto.randomUUID() });
+      if (!current()) return;
+      setInputValue(prev => prev === text ? "" : prev);
+      setMessages(prev => [...prev, { role: "assistant", content: "全局候选已提交，原内容未变。请在全局修改候选中比较后采用或放弃。", timestamp: Date.now() }]);
+      onGlobalRequested();
     } catch (err: any) {
-      if (!mountedRef.current || openSeqRef.current !== seqAtStart || !isProjectActive(projectId)) return; // late failure
-      // Keep inputValue so the user's text is not lost on failure.
+      if (!current()) return;
       if (err?.code === "revision_conflict") {
-        setMessages((prev) => [...prev.slice(0, -1), { role: "assistant", content: "⚠️ 项目已在其他窗口被修改，已为你重新加载最新内容。请基于最新内容重试修改。", timestamp: Date.now() }]);
         try {
-          const fullState = await refreshProjectContent(projectId);
-          if (fullState === null) return;
-          if (mountedRef.current && openSeqRef.current === seqAtStart && isProjectActive(projectId)) applyFullState(fullState);
-        } catch (fetchErr) {
-          console.error("Failed to reload project:", fetchErr);
+          const latest = await refreshProjectContent(projectId);
+          if (!current() || !latest) return;
+          applyFullState(latest);
+          setMessages(prev => [...prev, { role: "assistant", content: "项目已变化，已载入最新内容。修改要求已保留，请重新发起候选。", timestamp: Date.now() }]);
+        } catch {
+          if (current()) setMessages(prev => [...prev, { role: "assistant", content: "项目已变化，载入最新内容失败；请刷新页面后重试。", timestamp: Date.now() }]);
         }
-      } else if (REFINE_UNAPPLIED_CODES.has(err?.code)) {
-        // The backend refused the modification (no substantive change,
-        // constraint violation, unusable routing, missing target): nothing
-        // was saved, so show the reason and keep the draft retryable.
-        setMessages((prev) => [...prev.slice(0, -1), { role: "assistant", content: `⚠️ 未应用修改：${err.message}\n原文未变动，可调整指令后重试。`, timestamp: Date.now() }]);
-      } else {
-        setMessages((prev) => [...prev.slice(0, -1), { role: "assistant", content: `❌ 修改失败: ${err.message}`, timestamp: Date.now() }]);
-      }
+      } else setMessages(prev => [...prev, { role: "assistant", content: `候选提交失败：${err.message}。原内容未变，可重试。`, timestamp: Date.now() }]);
+    } finally {
+      if (current()) refineWorking.current = false;
     }
-  }, [projectId, inputValue, isGenerating, isProjectActive, refreshProjectContent, applyFullState, onProjectMutated]);
+  }, [projectId, projectRevision, inputValue, isGenerating, isProjectActive, onGlobalRequested, refreshProjectContent, applyFullState]);
 
   const toggleSkill = (skillId: string) => {
     setActiveSkillIds((prev) => {
@@ -948,15 +912,6 @@ export default function ChatPanel({
 
 // ── Helpers ─────────────────────────────────────
 
-/** detail.code values for a refused refine: nothing was saved, the draft
- * stays retryable, and the UI must not claim success. */
-const REFINE_UNAPPLIED_CODES = new Set([
-  "refine_no_meaningful_change",
-  "refine_constraint_failed",
-  "refine_not_executable",
-  "refine_target_not_found",
-]);
-
 /** Ticket #15: a terminal unfinished-content run is resumable — the POST
  * /resume does the authoritative check; this only gates the entry point. */
 function isResumableOutcome(outcome: {
@@ -989,22 +944,6 @@ function formatResumeProgress(outcome: {
     ? `\n恢复将从「${outcome.next_step_label}」继续。`
     : "";
   return `\n已完成阶段：${labels.join("、")}。${next}`;
-}
-
-/** Render the backend's real diff (computed from the before/after
- * snapshots) as chat text: field path plus before/after preview, with the
- * out-of-cap hint and the storyboard-not-synced notice when present. */
-function formatChangeSummary(body: any): string {
-  const changes: Array<{ path: string; before: string; after: string }> = body?.changes ?? [];
-  if (!changes.length) return "";
-  const total = typeof body?.total_changes === "number" ? body.total_changes : changes.length;
-  const lines = changes.map((c) => `- ${c.path}\n  修改前: ${c.before}\n  修改后: ${c.after}`);
-  let text = `本次实际变化（${total} 处）:\n${lines.join("\n")}`;
-  if (total > changes.length) {
-    text += `\n…共 ${total} 处变化，仅显示前 ${changes.length} 处；完整内容见项目历史。`;
-  }
-  if (body?.notice) text += `\n\nℹ️ ${body.notice}`;
-  return text;
 }
 
 function formatResultSummary(state: any): string {
