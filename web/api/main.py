@@ -199,7 +199,10 @@ class CardEditRequest(BaseModel):
 
 
 class RefineRequest(BaseModel):
-    message: str
+    model_config = {"extra": "forbid"}
+    message: str = Field(min_length=1, max_length=10000)
+    expected_revision: int = Field(strict=True, ge=1)
+    request_key: str = Field(min_length=1, max_length=200)
 
 
 class ReviewFlagSelection(BaseModel):
@@ -455,7 +458,6 @@ class _RunManager:
         self._subscribers: dict[str, set[asyncio.Queue]] = {}
         self._stop_events: dict[str, asyncio.Event] = {}
         self._project_locks: dict[str, asyncio.Lock] = {}
-        self._refine_projects: set[str] = set()
 
     # ── Admission ──────────────────────────────────────
 
@@ -509,10 +511,6 @@ class _RunManager:
         )
 
         async with self._project_lock(project_id):
-            if project_id in self._refine_projects:
-                raise RunSubmitConflict(
-                    "run_active", "该项目正在处理修改请求，请稍后再提交生成。"
-                )
             try:
                 run, created = await asyncio.to_thread(
                     self.store.admit_generation_run,
@@ -550,20 +548,20 @@ class _RunManager:
         return run, True
 
     async def submit_candidate(self, project_id, kind, target_id, req):
+        run_kind = "global_candidate" if kind == "global" else "card_candidate"
         from script_weaver.core.card_edit import card_snapshot
         request = {"kind": kind, "target_id": target_id, "instruction": req.instruction,
                    "expected_revision": req.expected_revision}
         if not req.instruction.strip():
             raise InvalidCardChangeError("修改要求不能为空。")
         async with self._project_lock(project_id):
-            if project_id in self._refine_projects:
-                raise RunSubmitConflict("run_active", "项目正在生成，请稍后重试。")
             record = await asyncio.to_thread(self.store.get_required, project_id)
-            card_snapshot(record.state, kind, target_id)
+            if kind != "global":
+                card_snapshot(record.state, kind, target_id)
             run, created = await asyncio.to_thread(
-                self.store.admit_generation_run, project_id, kind="card_candidate",
+                self.store.admit_generation_run, project_id, kind=run_kind,
                 request_key=req.request_key, request=request,
-                request_hash=hash_run_request({"run_kind": "card_candidate", **request}),
+                request_hash=hash_run_request({"run_kind": run_kind, **request}),
                 base_revision=req.expected_revision, base_state_json=record.state_json,
                 checkpoint_json=None,
             )
@@ -601,17 +599,13 @@ class _RunManager:
                         run=existing,
                     )
                 return existing, False
-            if project_id in self._refine_projects:
-                raise RunSubmitConflict(
-                    "run_active", "该项目正在处理修改请求，请稍后再恢复生成。"
-                )
             original = await asyncio.to_thread(
                 self.store.get_generation_run, run_id
             )
             if original is None or original.project_id != project_id:
                 raise ProjectNotFoundError(f"Run '{run_id}' not found")
             if original.kind != "generate":
-                raise RunSubmitConflict("not_resumable", "卡片候选不能恢复，请重新发起定向修改。", run=original)
+                raise RunSubmitConflict("not_resumable", "候选运行不能恢复，请重新发起修改。", run=original)
             if original.status in RUN_ACTIVE_STATUSES:
                 raise RunSubmitConflict(
                     "run_active",
@@ -735,35 +729,6 @@ class _RunManager:
         )
         return run, True
 
-    @asynccontextmanager
-    async def refine_slot(self, project_id: str):
-        """Admission for the synchronous refine endpoint.
-
-        Refine is a model run too: inside the project lock both an active
-        generation and an in-flight refine are rejected, so two concurrent
-        refines can never both reach the model. The slot is held by its
-        owner across the whole operation — base snapshot, model call,
-        validation and CAS save — and released only on success or failure.
-        """
-        async with self._project_lock(project_id):
-            if project_id in self._refine_projects:
-                raise RunSubmitConflict(
-                    "run_active", "该项目正在处理另一条修改请求，请稍后再试。"
-                )
-            active = await asyncio.to_thread(
-                self.store.active_generation_run, project_id
-            )
-            if active is not None:
-                raise RunSubmitConflict(
-                    "run_active", "项目正在生成中，请先停止或等待完成后再修改。",
-                    run=active,
-                )
-            self._refine_projects.add(project_id)
-        try:
-            yield
-        finally:
-            self._refine_projects.discard(project_id)
-
     # ── Execution ──────────────────────────────────────
 
     def _spawn(self, run_id: str) -> None:
@@ -818,6 +783,21 @@ class _RunManager:
                 # The run ended before this task got its turn: converge
                 # without ever touching the model.
                 await self._converge_revoked_run(run)
+                return
+            if run.kind == "global_candidate":
+                engine, _ = await _get_engine(run.project_id, progress_callback=relay)
+                progress = {"stage": "candidate", "message": "正在生成全局候选；原内容保持不变。"}
+                await asyncio.to_thread(self.store.update_generation_run, run_id, last_progress=progress)
+                self.broadcast(run_id, "progress", progress)
+                result = await asyncio.wait_for(engine.refine(
+                    ProjectState.model_validate_json(run.base_state_json), run.request["instruction"],
+                    global_candidate=True), timeout=get_settings().agent_timeout_seconds)
+                try:
+                    await asyncio.to_thread(self.store.complete_card_candidate, run_id, result)
+                except RunStageRejectedError:
+                    raise PipelineStopped() from None
+                run = await asyncio.to_thread(self.store.get_generation_run_required, run_id)
+                self.broadcast(run_id, "done", _run_done_payload(run))
                 return
             if run.kind == "card_candidate":
                 from script_weaver.agents.card_revision import CardRevisionAgent
@@ -1060,7 +1040,8 @@ class _RunManager:
         except Exception as exc:
             logger.exception("Generation run %s failed", run_id)
             run = await self._settle_terminal(
-                run_id, status="failed", error=f"生成失败：{str(exc) or type(exc).__name__}"
+                run_id, status="failed", error=f"生成失败：{str(exc) or type(exc).__name__}",
+                result_summary={"code": getattr(exc, "code", "candidate_failed")}
             )
             self.broadcast(run_id, "done", _run_done_payload(run))
 
@@ -1241,7 +1222,8 @@ def _serialize_run(run: GenerationRun) -> dict:
         "run_id": run.run_id,
         "project_id": run.project_id,
         "kind": run.kind,
-        "target": {"kind": run.request.get("kind"), "id": run.request.get("target_id")} if run.kind == "card_candidate" else None,
+        "instruction": run.request.get("instruction"),
+        "target": {"kind": run.request.get("kind"), "id": run.request.get("target_id")} if run.kind in ("card_candidate", "global_candidate") else None,
         "request_key": run.request_key,
         "status": run.status,
         "base_revision": run.base_revision,
@@ -1730,64 +1712,9 @@ async def resume_run(project_id: str, run_id: str, req: ResumeRequest) -> dict:
 
 @app.post("/api/projects/{project_id}/refine")
 async def refine(project_id: str, req: RefineRequest) -> dict:
-    """Send an iterative refinement request.
-
-    A 200 means a validated substantive change was CAS-saved and the body
-    reports the diff computed from the before/after snapshots — never the
-    model's own claim of completion. Refusals answer 422 with a stable
-    detail.code; model/protocol failures answer a sanitized 502; nothing is
-    written in any non-200 path.
-    """
-    engine, ctx = await _get_engine(project_id)
-
-    # PipelineEngine.refine runs on an internal copy and raises before any
-    # write when the result lacks a substantive, constraint-respecting change.
-    # The refine slot keeps the one-active-model-run rule intact across the
-    # WHOLE operation — base snapshot, model call, validation and CAS save —
-    # so a generation can never slip in between the model's answer and its
-    # save, and it is released by the holder on success or failure alike.
-    try:
-        async with _runs().refine_slot(project_id):
-            try:
-                updated = await engine.refine(ctx.state, req.message)
-            except RefinementError as exc:
-                raise HTTPException(422, detail={"code": exc.code, "message": str(exc)}) from exc
-            except RefineExecutionError as exc:
-                logger.error("refine model failure for %s: %s", project_id, exc)
-                raise HTTPException(
-                    502,
-                    detail={"code": "refine_model_failed", "message": "模型调用失败，修改未应用"},
-                ) from exc
-
-            updated.meta.id = project_id
-            summary = refinement.build_change_summary(ctx.state, updated)
-            try:
-                record = await asyncio.to_thread(
-                    ctx.save, updated, "manual", f"修改: {req.message[:60]}"
-                )
-            except ProjectStoreError as exc:
-                raise _store_error(exc) from exc
-    except RunSubmitConflict as exc:
-        raise HTTPException(
-            409, detail={"code": exc.code, "message": exc.message}
-        ) from exc
-
-    body = {
-        "project_id": project_id,
-        "revision": record.revision,
-        "stage": updated.current_stage_status().value,
-        "message": "Refinement applied",
-        "changed_artifacts": summary["changed_artifacts"],
-        "changes": summary["changes"],
-        "total_changes": summary["total_changes"],
-    }
-    # Editing the script never re-runs the storyboard: say so instead of
-    # letting stale shots/video prompts masquerade as up to date.
-    if "script" in summary["changed_artifacts"] and (
-        updated.storyboard or updated.visual_highlights
-    ):
-        body["notice"] = "本次仅更新剧本，已有分镜和视频提示词未自动同步。"
-    return body
+    """Submit a whole-artifact candidate; only explicit acceptance writes content."""
+    return await submit_card_candidate(project_id, "global", "", CandidateRequest(
+        instruction=req.message, expected_revision=req.expected_revision, request_key=req.request_key))
 
 
 # ── Skills Management ─────────────────────────────────

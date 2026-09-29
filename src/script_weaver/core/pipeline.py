@@ -528,6 +528,8 @@ class PipelineEngine:
         self,
         state: ProjectState,
         user_message: str,
+        *,
+        global_candidate: bool = False,
     ) -> ProjectState:
         """Handle an iterative refinement request.
 
@@ -549,6 +551,13 @@ class PipelineEngine:
             logger.exception("[refine] orchestrator failed")
             raise RefineExecutionError("编排器调用失败，修改未应用") from e
         decision = refinement.parse_routing(routing_result)
+        if global_candidate:
+            from script_weaver.core.global_revision import SUPPORTED, has_content
+            artifact = refinement.REFINABLE_AGENTS[decision.next_agent]
+            if artifact not in SUPPORTED:
+                raise refinement.RefineNotExecutable("阶段 1 暂不支持大纲或美术风格的全局候选。")
+            if not has_content(state, artifact):
+                raise refinement.RefineTargetNotFound("目标产物不存在，请先完成生成。")
 
         # Locate the constrained target from the pre-modification snapshot;
         # without it the execution agent must not even be called.
@@ -564,6 +573,8 @@ class PipelineEngine:
         instruction = refinement.build_agent_instruction(
             state, decision, user_message, target
         )
+        if global_candidate:
+            instruction += "\nWeb 阶段 1：仅修订一个已有整件产物的内容。无论用户要求如何，必须保留所有 ID、归属、引用、对象顺序和只读字段；不得增删或重排。结构性要求请明确拒绝。"
         try:
             await self._run_agent(decision.next_agent, working, instruction)
         except Exception as e:

@@ -7,6 +7,8 @@ import {
   openApp,
   release,
   seedOutline,
+  seedCardsProject,
+  seedGlobal,
   seedProject,
   seedRun,
   sseClosed,
@@ -692,12 +694,12 @@ test("P2-3: late initial project GET cannot replace newer terminal recovery", as
 });
 
 
-test("P2-3: refine supersedes terminal recovery content without losing the run outcome", async ({ page, request }) => {
+test("P2-3: candidate adoption supersedes terminal recovery content without losing the run outcome", async ({ page, request }) => {
   const a = await seedProject(request, "恢复与修改竞争");
-  await seedOutline(a.project_id, "修改前大纲");
+  await seedCardsProject(a.project_id);
   const old = await (await request.get(`http://127.0.0.1:8310/api/projects/${a.project_id}`)).json();
   await openApp(page, `/?project=${a.project_id}`);
-  await expect(page.getByText("修改前大纲", { exact: true })).toBeVisible();
+  await page.locator(".segment-tab", { hasText: "主角列表" }).click();
   await seedRun(a.project_id, "failed");
 
   let heldRoute: any;
@@ -711,20 +713,18 @@ test("P2-3: refine supersedes terminal recovery content without losing the run o
   await Promise.race([held, new Promise((_, reject) => setTimeout(() => reject(new Error("recovery GET was not intercepted")), 5_000))]);
   await expect(page.getByText("出错了", { exact: true })).toBeVisible();
 
-  await seedOutline(a.project_id, "修改后的新大纲");
-  await gateRespond(page, "POST /refine", 200, {
-    changes: [{ path: "outline", before: "修改前大纲", after: "修改后的新大纲" }], total_changes: 1,
-  });
-  await page.getByPlaceholder("输入修改指令，按 Enter 发送...").fill("调整大纲");
-  await page.locator("textarea ~ button").click();
-  await release(page, "POST /refine");
-  await expect(page.getByText("修改后的新大纲", { exact: true })).toBeVisible();
+  await seedGlobal(a.project_id);
+  await page.getByRole("button", { name: "全局修改候选", exact: true }).click();
+  await page.getByTestId("global-candidates").getByRole("button", { name: "采用候选" }).click();
+  await expect(page.getByText("已采用全局候选", { exact: false })).toBeVisible();
+  await page.locator(".segment-tab", { hasText: "主角列表" }).click();
+  await expect(page.locator(".character-card").getByText("坚定的候选性格", { exact: false })).toBeVisible();
 
   const response = page.waitForResponse((r) => r.url().endsWith(`/api/projects/${a.project_id}`));
   await heldRoute.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(old) });
   await (await response).finished();
   await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => setTimeout(() => requestAnimationFrame(() => resolve()), 0))));
-  await expect(page.getByText("修改后的新大纲", { exact: true })).toBeVisible();
+  await expect(page.locator(".character-card").getByText("坚定的候选性格", { exact: false })).toBeVisible();
   await expect(page.getByText("出错了", { exact: true })).toBeVisible();
   await expect(page.getByRole("button", { name: "刷新内容" })).toHaveCount(0);
 });

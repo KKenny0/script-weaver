@@ -5,6 +5,7 @@ controlled fakes so no network or model calls happen.
 """
 
 import asyncio
+import uuid
 import copy
 import io
 import json
@@ -103,6 +104,34 @@ async def consume_sse(c: httpx.AsyncClient, path: str) -> list[tuple[str, str]]:
             elif line.startswith("data:") and current_event:
                 events.append((current_event, line.split(":", 1)[1].strip()))
     return events
+
+
+async def submit_refine(c, api, project_id, *, json):
+    before = (await c.get(f"/api/projects/{project_id}")).json()
+    submitted = await c.post(f"/api/projects/{project_id}/refine", json={
+        **json, "expected_revision": before["revision"], "request_key": uuid.uuid4().hex})
+    assert submitted.status_code == 200, submitted.text
+    run_id = submitted.json()["run"]["run_id"]
+    for _ in range(200):
+        response = await c.get(f"/api/projects/{project_id}/runs/{run_id}")
+        assert response.status_code == 200
+        if response.json()["status"] not in ("running", "stopping"):
+            return response
+        await asyncio.sleep(.01)
+    raise AssertionError("candidate did not settle")
+
+
+async def accept_refine(c, project_id, run_response):
+    run = run_response.json()
+    assert run["status"] == "succeeded", run
+    candidates = (await c.get(f"/api/projects/{project_id}/candidates")).json()["candidates"]
+    candidate = next(x for x in candidates if x["run_id"] == run["run_id"])
+    before = (await c.get(f"/api/projects/{project_id}")).json()
+    assert before["revision"] == candidate["base_revision"]
+    assert before[candidate["target_id"]] == candidate["original"][candidate["target_id"]]
+    response = await c.post(f"/api/projects/{project_id}/candidates/{candidate['id']}/accept")
+    assert response.status_code == 200, response.text
+    return response
 
 
 # ── CRUD, isolation, listing ───────────────────────────────
@@ -347,27 +376,18 @@ async def test_generate_missing_model_returns_clear_error(client, monkeypatch):
 # ── Refine persists ────────────────────────────────────────
 
 
-async def test_refine_persists_via_store(client):
+async def test_refine_requires_new_contract_and_refuses_unsupported_artifact(client):
     api, c = client
-    p = await create_project(c, "要修改的故事", "标题")
-
-    async def fake_refine(state, message):
-        state = outlined_state("要修改的故事", f"按指令修改: {message}")
-        state.meta.id = "must-be-repinned"
+    p = await create_project(c, "故事", "标题")
+    old = await c.post(f"/api/projects/{p['project_id']}/refine", json={"message": "修改"})
+    assert old.status_code == 422
+    async def fake_refine(state, message, **kwargs):
+        state.outline = Outline(basic_info=BasicInfo(logline="修改"))
         return state
-
     stub_engine(api, refine=fake_refine)
-
-    r = await c.post(f"/api/projects/{p['project_id']}/refine",
-                     json={"message": "让大纲更悬疑"})
-    assert r.status_code == 200, r.text
-    body = r.json()
-    assert body["revision"] == 2
-
-    after = (await c.get(f"/api/projects/{p['project_id']}")).json()
-    assert after["outline"]["basic_info"]["logline"] == "按指令修改: 让大纲更悬疑"
-    # The service project ID always wins over any state-carried meta.id.
-    assert after["meta"]["id"] == p["project_id"]
+    r = await submit_refine(c, api, p["project_id"], json={"message": "修改大纲"})
+    assert r.json()["status"] == "failed"
+    assert (await c.get(f"/api/projects/{p['project_id']}")).json()["revision"] == 1
 
 
 # ── Export serves real, tool-readable files ────────────────
@@ -789,7 +809,7 @@ def real_engine(api, llm):
     from script_weaver.memory import profile as profile_m
     from script_weaver.skills.registry import SkillRegistry
 
-    async def fake_get_engine(project_id):
+    async def fake_get_engine(project_id, **kwargs):
         record = api._runtime.store.get_required(project_id)
         profile_m._profile_manager = None  # keep profile IO inside this tmp dir
         engine = PipelineEngine(
@@ -863,8 +883,8 @@ async def assert_project_untouched(c: httpx.AsyncClient, api, p: dict) -> None:
 async def test_refine_notes_only_claim_rejected_no_write(client):
     """Defect regression (#22): the model only claims completion in
     script.notes while the dialogue stays identical. Old behaviour saved a
-    new revision and answered 200; the fix must answer 422 and write
-    nothing."""
+    new revision and answered 200; the candidate run must fail and write
+    no project content."""
     api, c = client
     p = await seed_scripted_project(c, api, "修改目标A")
     base = scripted_script_dict(scripted_state())
@@ -872,11 +892,11 @@ async def test_refine_notes_only_claim_rejected_no_write(client):
     llm = ScriptedLLM(ROUTE_SHORTEN, with_notes_claim(base))
     real_engine(api, llm)
 
-    r = await c.post(f"/api/projects/{p['project_id']}/refine", json={
+    r = await submit_refine(c, api, p["project_id"], json={
         "message": "只把结尾最后一句对白改得更简短，保持人物、地点和主要情节不变",
     })
-    assert r.status_code == 422, r.text
-    detail = r.json()["detail"]
+    assert r.json()["status"] == "failed", r.text
+    detail = {**r.json()["result_summary"], "message": r.json()["error"]}
     assert detail["code"] == "refine_constraint_failed"
     assert detail["message"]
     await assert_project_untouched(c, api, p)
@@ -890,10 +910,10 @@ async def test_refine_general_notes_only_change_is_no_meaningful_change(client):
     llm = ScriptedLLM(ROUTE_GENERAL_SCRIPT, with_notes_claim(base))
     real_engine(api, llm)
 
-    r = await c.post(f"/api/projects/{p['project_id']}/refine",
+    r = await submit_refine(c, api, p["project_id"],
                      json={"message": "把剧本对白整体调整得更简洁"})
-    assert r.status_code == 422
-    assert r.json()["detail"]["code"] == "refine_no_meaningful_change"
+    assert r.json()["status"] == "failed"
+    assert r.json()["result_summary"]["code"] == "refine_no_meaningful_change"
     await assert_project_untouched(c, api, p)
 
 
@@ -906,25 +926,24 @@ async def test_refine_shorten_last_dialogue_success(client):
     llm = ScriptedLLM(ROUTE_SHORTEN, with_shortened_last(base))
     real_engine(api, llm)
 
-    r = await c.post(f"/api/projects/{p['project_id']}/refine", json={
+    r = await submit_refine(c, api, p["project_id"], json={
         "message": "只把结尾最后一句对白改得更简短，其他内容保持不变",
     })
+    r = await accept_refine(c, p["project_id"], r)
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["revision"] == 3
-    assert body["changed_artifacts"] == ["script"]
-    assert body["total_changes"] == 1
-    [change] = body["changes"]
-    assert change["path"] == "script.scenes[1].blocks[1].content.dialogue"
-    assert change["before"] == LAST_DIALOGUE
-    assert change["after"] == SHORTENED_DIALOGUE
-    assert "分镜" in body["notice"] and "未自动同步" in body["notice"]
+    assert body["candidate"]["target_id"] == "script"
+    candidate = body["candidate"]
+    assert candidate["original"]["script"]["scenes"][1]["blocks"][1]["content"]["dialogue"] == LAST_DIALOGUE
+    assert candidate["proposed"]["script"]["scenes"][1]["blocks"][1]["content"]["dialogue"] == SHORTENED_DIALOGUE
+    assert "storyboard" in candidate["affected_artifacts"]
 
     current = (await c.get(f"/api/projects/{p['project_id']}")).json()
     assert current["revision"] == 3
     assert current["script"]["scenes"][1]["blocks"][1]["content"]["dialogue"] == SHORTENED_DIALOGUE
     assert current["script"]["notes"] == "初稿备注"  # untouched by the constrained edit
-    assert len(current["memory_decisions"]) == 1
+    assert current["memory_decisions"] == []  # candidate adoption only changes its artifact
 
     versions = (await c.get(f"/api/projects/{p['project_id']}/versions")).json()["versions"]
     assert [v["revision"] for v in versions] == [3, 2, 1]  # newest first
@@ -965,13 +984,14 @@ async def test_refine_shorten_counterexamples(client, mutate, reason):
     llm = ScriptedLLM(ROUTE_SHORTEN, mutate(copy.deepcopy(base)))
     real_engine(api, llm)
 
-    r = await c.post(f"/api/projects/{p['project_id']}/refine",
+    r = await submit_refine(c, api, p["project_id"],
                      json={"message": "只缩短最后一句对白"})
     if reason == "正常缩短（阳性对照）":
+        r = await accept_refine(c, p["project_id"], r)
         assert r.status_code == 200, r.text
     else:
-        assert r.status_code == 422, f"{reason}: {r.text}"
-        assert r.json()["detail"]["code"] == "refine_constraint_failed"
+        assert r.json()["status"] == "failed", f"{reason}: {r.text}"
+        assert r.json()["result_summary"]["code"] == "refine_constraint_failed"
         await assert_project_untouched(c, api, p)
 
 
@@ -1026,10 +1046,10 @@ async def test_refine_unusable_routing_is_not_executable(client, routing, reason
     llm = ScriptedLLM(routing, with_shortened_last(base))
     real_engine(api, llm)
 
-    r = await c.post(f"/api/projects/{p['project_id']}/refine",
+    r = await submit_refine(c, api, p["project_id"],
                      json={"message": "随便改点什么"})
-    assert r.status_code == 422, f"{reason}: {r.text}"
-    assert r.json()["detail"]["code"] == "refine_not_executable"
+    assert r.json()["status"] == "failed", f"{reason}: {r.text}"
+    assert r.json()["result_summary"]["code"] == "refine_not_executable"
     assert llm.tool_submissions == 0, f"{reason}: 不可执行路由不应调用目标 Agent"
     await assert_project_untouched(c, api, p)
 
@@ -1049,10 +1069,10 @@ async def test_refine_routing_text_response_is_not_executable(client):
     real_engine(api, TextLLM(ROUTE_GENERAL_SCRIPT, with_shortened_last(
         scripted_script_dict(scripted_state()))))
 
-    r = await c.post(f"/api/projects/{p['project_id']}/refine",
+    r = await submit_refine(c, api, p["project_id"],
                      json={"message": "改一下"})
-    assert r.status_code == 422
-    assert r.json()["detail"]["code"] == "refine_not_executable"
+    assert r.json()["status"] == "failed"
+    assert r.json()["result_summary"]["code"] == "refine_not_executable"
     await assert_project_untouched(c, api, p)
 
 
@@ -1075,10 +1095,10 @@ async def test_refine_shorten_without_target_is_target_not_found(client, strip_s
     llm = ScriptedLLM(ROUTE_SHORTEN, {"scenes": []})
     real_engine(api, llm)
 
-    r = await c.post(f"/api/projects/{p['project_id']}/refine",
+    r = await submit_refine(c, api, p["project_id"],
                      json={"message": "只缩短最后一句对白"})
-    assert r.status_code == 422
-    assert r.json()["detail"]["code"] == "refine_target_not_found"
+    assert r.json()["status"] == "failed"
+    assert r.json()["result_summary"]["code"] == "refine_target_not_found"
     assert llm.tool_submissions == 0, "目标不存在时不应调用执行 Agent"
     current = (await c.get(f"/api/projects/{p['project_id']}")).json()
     assert current["revision"] == 2
@@ -1087,7 +1107,7 @@ async def test_refine_shorten_without_target_is_target_not_found(client, strip_s
     assert current["memory_decisions"] == []
 
 
-async def test_refine_model_failure_is_sanitized_502(client):
+async def test_refine_model_failure_is_sanitized_failed_run(client):
     api, c = client
     p = await seed_scripted_project(c, api, "模型失败")
 
@@ -1097,10 +1117,10 @@ async def test_refine_model_failure_is_sanitized_502(client):
     )
     real_engine(api, llm)
 
-    r = await c.post(f"/api/projects/{p['project_id']}/refine",
+    r = await submit_refine(c, api, p["project_id"],
                      json={"message": "改一下"})
-    assert r.status_code == 502, r.text
-    detail = r.json()["detail"]
+    assert r.json()["status"] == "failed", r.text
+    detail = {**r.json()["result_summary"], "message": r.json()["error"]}
     assert detail["code"] == "refine_model_failed"
     assert "sk-secret" not in json.dumps(detail)  # sanitized
     assert "deepseek" not in json.dumps(detail).lower()
@@ -1113,10 +1133,10 @@ async def test_refine_invalid_artifact_is_model_failure_no_write(client):
     llm = ScriptedLLM(ROUTE_GENERAL_SCRIPT, {"scenes": []})  # empty script
     real_engine(api, llm)
 
-    r = await c.post(f"/api/projects/{p['project_id']}/refine",
+    r = await submit_refine(c, api, p["project_id"],
                      json={"message": "改一下"})
-    assert r.status_code == 502, r.text
-    assert r.json()["detail"]["code"] == "refine_model_failed"
+    assert r.json()["status"] == "failed", r.text
+    assert r.json()["result_summary"]["code"] == "refine_model_failed"
     await assert_project_untouched(c, api, p)
 
 
@@ -1133,14 +1153,14 @@ async def test_refine_general_real_change_succeeds_with_true_diff(client):
     llm = ScriptedLLM(ROUTE_GENERAL_SCRIPT, rewrite_first_dialogue(base))
     real_engine(api, llm)
 
-    r = await c.post(f"/api/projects/{p['project_id']}/refine",
+    r = await submit_refine(c, api, p["project_id"],
                      json={"message": "第一句对白加个顿号"})
+    r = await accept_refine(c, p["project_id"], r)
     assert r.status_code == 200, r.text
     body = r.json()
-    assert body["changed_artifacts"] == ["script"]
-    assert body["total_changes"] == 1
-    assert body["changes"][0]["before"] == "灯不能灭。"
-    assert body["changes"][0]["after"] == "灯，不能灭。"
+    assert body["candidate"]["target_id"] == "script"
+    assert body["candidate"]["original"]["script"]["scenes"][0]["blocks"][1]["content"]["dialogue"] == "灯不能灭。"
+    assert body["script"]["scenes"][0]["blocks"][1]["content"]["dialogue"] == "灯，不能灭。"
 
 
 async def test_refine_auto_id_shuffle_is_no_meaningful_change(client):
@@ -1158,10 +1178,10 @@ async def test_refine_auto_id_shuffle_is_no_meaningful_change(client):
     llm = ScriptedLLM(ROUTE_GENERAL_SCRIPT, scene_ids_only(base))
     real_engine(api, llm)
 
-    r = await c.post(f"/api/projects/{p['project_id']}/refine",
+    r = await submit_refine(c, api, p["project_id"],
                      json={"message": "重写剧本"})
-    assert r.status_code == 422
-    assert r.json()["detail"]["code"] == "refine_no_meaningful_change"
+    assert r.json()["status"] == "failed"
+    assert r.json()["result_summary"]["code"] == "refine_no_meaningful_change"
     await assert_project_untouched(c, api, p)
 
 
@@ -1180,19 +1200,21 @@ async def test_refine_conflict_when_project_changes_during_model_call(client):
 
     real_engine(api, ConcurrentWriterLLM(ROUTE_SHORTEN, with_shortened_last(base)))
 
-    r = await c.post(f"/api/projects/{p['project_id']}/refine",
+    r = await submit_refine(c, api, p["project_id"],
                      json={"message": "只缩短最后一句对白"})
-    assert r.status_code == 409, r.text
-    detail = r.json()["detail"]
-    assert detail["code"] == "revision_conflict"
-    assert detail["current_revision"] == 3
+    assert r.json()["status"] == "succeeded"
+    candidate = (await c.get(f"/api/projects/{p['project_id']}/candidates")).json()["candidates"][0]
+    assert candidate["status"] == "stale"
+    rejected = await c.post(f"/api/projects/{p['project_id']}/candidates/{candidate['id']}/accept")
+    assert rejected.status_code == 409
+    assert rejected.json()["detail"]["current_revision"] == 3
     # The concurrent rename survives; the refine result was not applied.
     current = (await c.get(f"/api/projects/{p['project_id']}")).json()
     assert current["meta"]["title"] == "并发期间改名"
     assert current["script"]["scenes"][1]["blocks"][1]["content"]["dialogue"] == LAST_DIALOGUE
 
 
-async def test_refine_store_failure_is_500_without_partial_write(client, monkeypatch):
+async def test_refine_store_failure_is_failed_run_without_partial_write(client, monkeypatch):
     import sqlite3
 
     api, c = client
@@ -1200,20 +1222,20 @@ async def test_refine_store_failure_is_500_without_partial_write(client, monkeyp
     base = scripted_script_dict(scripted_state())
     real_engine(api, ScriptedLLM(ROUTE_SHORTEN, with_shortened_last(base)))
 
-    original_save = api._runtime.store.save_state
+    original_save = api._runtime.store.complete_card_candidate
 
     def broken_save(*args, **kwargs):
         raise sqlite3.OperationalError("disk I/O error")
 
-    monkeypatch.setattr(api._runtime.store, "save_state", broken_save)
-    r = await c.post(f"/api/projects/{p['project_id']}/refine",
+    monkeypatch.setattr(api._runtime.store, "complete_card_candidate", broken_save)
+    r = await submit_refine(c, api, p["project_id"],
                      json={"message": "只缩短最后一句对白"})
-    assert r.status_code == 500, r.text
-    monkeypatch.setattr(api._runtime.store, "save_state", original_save)
+    assert r.json()["status"] == "failed", r.text
+    monkeypatch.setattr(api._runtime.store, "complete_card_candidate", original_save)
     await assert_project_untouched(c, api, p)
 
 
-async def test_refine_summary_truncates_to_ten_previews_300(client):
+async def test_refine_full_candidate_keeps_all_changes_and_untruncated_values(client):
     api, c = client
     p = await create_project(c, "修改目标故事", "摘要截断")
     state = outlined_state("修改目标故事", "摘要截断的故事梗概")
@@ -1250,15 +1272,17 @@ async def test_refine_summary_truncates_to_ten_previews_300(client):
     llm = ScriptedLLM(ROUTE_GENERAL_SCRIPT, rewrite_all(state.script.model_dump(mode="json")))
     real_engine(api, llm)
 
-    r = await c.post(f"/api/projects/{p['project_id']}/refine",
+    r = await submit_refine(c, api, p["project_id"],
                      json={"message": "整体改写"})
+    r = await accept_refine(c, p["project_id"], r)
     assert r.status_code == 200, r.text
     body = r.json()
-    assert body["total_changes"] == 12
-    assert len(body["changes"]) == 10  # capped for display; full diff lives in history
-    for change in body["changes"]:
-        assert len(change["before"]) <= 303  # 300 + "..."
-        assert len(change["after"]) <= 303
+    candidate = body["candidate"]
+    before = candidate["original"]["script"]["scenes"][0]["blocks"][1:]
+    after = candidate["proposed"]["script"]["scenes"][0]["blocks"][1:]
+    assert len(before) == len(after) == 12
+    assert before[0]["content"]["dialogue"] == long_text
+    assert all(b["content"]["dialogue"] == a["content"]["dialogue"] + "改" for a, b in zip(before, after))
 
 
 # ── Review round 2: raw strict compare + reference integrity ────────
@@ -1279,11 +1303,11 @@ async def test_refine_shorten_whitespace_padded_other_id_rejected(client):
     llm = ScriptedLLM(ROUTE_SHORTEN, pad_other_scene_id(base))
     real_engine(api, llm)
 
-    r = await c.post(f"/api/projects/{p['project_id']}/refine",
+    r = await submit_refine(c, api, p["project_id"],
                      json={"message": "只缩短最后一句对白"})
-    assert r.status_code == 422, r.text
-    assert r.json()["detail"]["code"] == "refine_constraint_failed"
-    assert "scene_id" in r.json()["detail"]["message"]
+    assert r.json()["status"] == "failed", r.text
+    assert r.json()["result_summary"]["code"] == "refine_constraint_failed"
+    assert "scene_id" in r.json()["error"]
     await assert_project_untouched(c, api, p)
 
 
@@ -1304,11 +1328,11 @@ async def test_refine_general_rebuilt_referenced_id_rejected_no_write(client):
     llm = ScriptedLLM(ROUTE_GENERAL_SCRIPT, shorten_first_and_rebuild_id(base))
     real_engine(api, llm)
 
-    r = await c.post(f"/api/projects/{p['project_id']}/refine",
+    r = await submit_refine(c, api, p["project_id"],
                      json={"message": "第一句对白加顿号"})
-    assert r.status_code == 422, r.text
-    assert r.json()["detail"]["code"] == "refine_constraint_failed"
-    assert "storyboard.shots[0].scene_id" in r.json()["detail"]["message"]
+    assert r.json()["status"] == "failed", r.text
+    assert r.json()["result_summary"]["code"] == "refine_constraint_failed"
+    assert "storyboard.shots[0].scene_id" in r.json()["error"]
     await assert_project_untouched(c, api, p)
 
 
@@ -1325,10 +1349,11 @@ async def test_refine_general_intact_references_succeed(client):
     llm = ScriptedLLM(ROUTE_GENERAL_SCRIPT, keep_ids_change_dialogue(base))
     real_engine(api, llm)
 
-    r = await c.post(f"/api/projects/{p['project_id']}/refine",
+    r = await submit_refine(c, api, p["project_id"],
                      json={"message": "第一句对白加顿号"})
+    r = await accept_refine(c, p["project_id"], r)
     assert r.status_code == 200, r.text
-    assert r.json()["changed_artifacts"] == ["script"]
+    assert r.json()["candidate"]["target_id"] == "script"
 
 
 # ── Review round 3: stable defect identity + auto-ID exclusions ────
@@ -1390,11 +1415,11 @@ async def test_refine_repair_one_break_other_same_index_rejected_no_write(client
     llm = ScriptedLLM(ROUTE_GENERAL_SCRIPT, swap_repair_and_break(base))
     real_engine(api, llm)
 
-    r = await c.post(f"/api/projects/{p['project_id']}/refine",
+    r = await submit_refine(c, api, p["project_id"],
                      json={"message": "交换两场并修好第一场的场景引用"})
-    assert r.status_code == 422, r.text
-    assert r.json()["detail"]["code"] == "refine_constraint_failed"
-    assert "scene_design_id" in r.json()["detail"]["message"]
+    assert r.json()["status"] == "failed", r.text
+    assert r.json()["result_summary"]["code"] == "refine_constraint_failed"
+    assert "scene_design_id" in r.json()["error"]
     await assert_project_untouched(c, api, p)
     current = (await c.get(f"/api/projects/{p['project_id']}")).json()
     assert current["script"]["scenes"][0]["scene_design_id"] == "old_missing"
@@ -1420,10 +1445,10 @@ async def test_refine_character_id_rebuild_only_is_no_meaningful_change(client):
                       artifact_type="characters")
     real_engine(api, llm)
 
-    r = await c.post(f"/api/projects/{p['project_id']}/refine",
+    r = await submit_refine(c, api, p["project_id"],
                      json={"message": "把主角性格写得更鲜明"})
-    assert r.status_code == 422, r.text
-    assert r.json()["detail"]["code"] == "refine_no_meaningful_change"
+    assert r.json()["status"] == "failed", r.text
+    assert r.json()["result_summary"]["code"] == "refine_no_meaningful_change"
     await assert_project_untouched(c, api, p)
     current = (await c.get(f"/api/projects/{p['project_id']}")).json()
     assert current["characters"][0]["id"] == "char_ayun"
@@ -1446,10 +1471,10 @@ async def test_refine_scene_design_id_rebuild_only_is_no_meaningful_change(clien
                       artifact_type="scenes")
     real_engine(api, llm)
 
-    r = await c.post(f"/api/projects/{p['project_id']}/refine",
+    r = await submit_refine(c, api, p["project_id"],
                      json={"message": "把天台环境写得更具体"})
-    assert r.status_code == 422, r.text
-    assert r.json()["detail"]["code"] == "refine_no_meaningful_change"
+    assert r.json()["status"] == "failed", r.text
+    assert r.json()["result_summary"]["code"] == "refine_no_meaningful_change"
     await assert_project_untouched(c, api, p)
     current = (await c.get(f"/api/projects/{p['project_id']}")).json()
     assert current["scenes"][0]["id"] == "sd_roof"
@@ -1501,12 +1526,12 @@ async def test_refine_owner_id_duplication_defect_transfer_rejected_no_write(cli
     assert before_detail["script"]["scenes"][0]["scene_id"] == "sc_first"
     assert before_detail["script"]["scenes"][1]["scene_id"] == "sc_last"
 
-    r = await c.post(f"/api/projects/{p['project_id']}/refine",
+    r = await submit_refine(c, api, p["project_id"],
                      json={"message": "修好第一场引用，第二场换个编号并改对白"})
-    assert r.status_code == 422, r.text
-    assert r.json()["detail"]["code"] == "refine_constraint_failed"
-    assert "scene_design_id" in r.json()["detail"]["message"]
-    assert "sc_first" in r.json()["detail"]["message"]
+    assert r.json()["status"] == "failed", r.text
+    assert r.json()["result_summary"]["code"] == "refine_constraint_failed"
+    assert "scene_design_id" in r.json()["error"]
+    assert "sc_first" in r.json()["error"]
 
     # Full before/after snapshot comparison — not just the status code.
     after_detail, after_versions = await _project_snapshot(c, p["project_id"])

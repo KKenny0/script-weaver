@@ -895,14 +895,15 @@ class ProjectStore:
                         "同一 request_key 已绑定其他输入，提交被拒绝。", run=run
                     )
                 return run, False
-            if kind == "card_candidate":
+            if kind in ("card_candidate", "global_candidate"):
                 from script_weaver.core.card_edit import card_snapshot
                 project = conn.execute("SELECT revision, state_json FROM projects WHERE id = ?", (project_id,)).fetchone()
                 if project is None:
                     raise ProjectNotFoundError(f"Project '{project_id}' not found")
                 if project["revision"] != base_revision or project["state_json"] != base_state_json:
                     raise RevisionConflictError("项目已变化，请载入最新内容后重新发起。", project["revision"])
-                card_snapshot(ProjectState.model_validate_json(project["state_json"]), request["kind"], request["target_id"])
+                if kind == "card_candidate":
+                    card_snapshot(ProjectState.model_validate_json(project["state_json"]), request["kind"], request["target_id"])
             if request.get("resume_of") is not None:
                 project = conn.execute(
                     "SELECT revision, state_json FROM projects WHERE id = ?", (project_id,)
@@ -1252,30 +1253,51 @@ class ProjectStore:
             rows = self._conn.execute("SELECT * FROM card_candidates WHERE project_id = ? ORDER BY created_at DESC, rowid DESC", (project_id,)).fetchall()
         return [self._candidate_dict(row) for row in rows]
 
-    @staticmethod
-    def _candidate_dict(row) -> dict:
+    def _candidate_dict(self, row) -> dict:
         result = dict(row)
         for field in ("original", "proposed", "changes"):
             result[field] = json.loads(result.pop(field + "_json"))
+        if result["kind"] == "global":
+            from script_weaver.core.global_revision import impacts
+            run = self.get_generation_run_required(result["run_id"])
+            base = ProjectState.model_validate_json(run.base_state_json)
+            result["affected_artifacts"] = impacts(base, result["target_id"])
+            from script_weaver.core.refinement import diff_field_changes, _MISSING
+            raw = base.model_dump(mode="json")
+            raw.update(result["proposed"])
+            result["diff"] = [{"path": change.path,
+                "before": None if change.before is _MISSING else change.before,
+                "after": None if change.after is _MISSING else change.after,
+                "before_exists": change.before is not _MISSING,
+                "after_exists": change.after is not _MISSING,
+            } for change in diff_field_changes(base, ProjectState.model_validate(raw), strict=True)]
         return result
 
     def candidate_runs(self, project_id: str) -> list[GenerationRun]:
         with self._lock:
-            rows = self._conn.execute(f"SELECT {self._RUN_COLUMNS} FROM generation_runs WHERE project_id = ? AND kind = 'card_candidate' ORDER BY created_at DESC, rowid DESC", (project_id,)).fetchall()
+            rows = self._conn.execute(f"SELECT {self._RUN_COLUMNS} FROM generation_runs WHERE project_id = ? AND kind IN ('card_candidate', 'global_candidate') ORDER BY created_at DESC, rowid DESC", (project_id,)).fetchall()
         return [self._row_to_run(row) for row in rows]
 
     def complete_card_candidate(self, run_id: str, output: dict) -> dict:
         from script_weaver.core.card_edit import card_snapshot, validate_candidate_output
         with self._write_tx() as conn:
             row = conn.execute(f"SELECT {self._RUN_COLUMNS} FROM generation_runs WHERE id = ?", (run_id,)).fetchone()
-            if row is None or row["kind"] != "card_candidate" or row["status"] != "running":
+            if row is None or row["kind"] not in ("card_candidate", "global_candidate") or row["status"] != "running":
                 raise RunStageRejectedError("候选运行已停止，结果未保存。")
             run = self._row_to_run(row)
             state = ProjectState.model_validate_json(run.base_state_json)
-            kind, target_id = run.request["kind"], run.request["target_id"]
-            original = card_snapshot(state, kind, target_id)
-            validate_candidate_output(state, kind, target_id, output)
-            proposed = card_snapshot(state, kind, target_id)
+            if run.kind == "global_candidate":
+                from script_weaver.core.global_revision import validate_global_result
+                target_id, updated = validate_global_result(state, output)
+                kind = "global"
+                original = {target_id: state.model_dump(mode="json")[target_id]}
+                proposed = {target_id: updated.model_dump(mode="json")[target_id]}
+                output = {"changes": proposed}
+            else:
+                kind, target_id = run.request["kind"], run.request["target_id"]
+                original = card_snapshot(state, kind, target_id)
+                validate_candidate_output(state, kind, target_id, output)
+                proposed = card_snapshot(state, kind, target_id)
             revision = conn.execute("SELECT revision FROM projects WHERE id = ?", (run.project_id,)).fetchone()[0]
             candidate_id = str(uuid.uuid4())
             conn.execute("INSERT INTO card_candidates VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)", (
@@ -1308,6 +1330,29 @@ class ProjectStore:
             if candidate["status"] != "ready" or project["revision"] != candidate["base_revision"]:
                 raise RevisionConflictError("候选已过期或已放弃；项目发生变化，请重新发起。", project["revision"])
             state = ProjectState.model_validate_json(project["state_json"])
+            if candidate["kind"] == "global":
+                from script_weaver.core.global_revision import validate_global_result, impacts
+                from script_weaver.core.card_edit import build_review_flags, merge_review_flags
+                artifact = candidate["target_id"]
+                if {artifact: state.model_dump(mode="json")[artifact]} != candidate["original"]:
+                    raise ProjectStoreError("候选依据与当前产物不一致。")
+                if set(candidate["proposed"]) != {artifact} or candidate["changes"] != candidate["proposed"]:
+                    raise ProjectStoreError("候选整件产物范围不一致。")
+                raw = state.model_dump(mode="json")
+                raw.update(candidate["proposed"])
+                target, updated = validate_global_result(state, ProjectState.model_validate(raw))
+                if target != artifact or {artifact: updated.model_dump(mode="json")[artifact]} != candidate["proposed"]:
+                    raise ProjectStoreError("候选范围不一致。")
+                full = conn.execute("SELECT * FROM projects WHERE id = ?", (project_id,)).fetchone()
+                review = merge_review_flags(json.loads(full["review_json"] or "{}"), build_review_flags(
+                    "global", artifact, artifact, project["revision"] + 1, impacts(state, artifact)))
+                revision, state_json, now = self._write_new_state(conn, project_id, updated,
+                    project["revision"], full["title"], json.dumps(review, ensure_ascii=False),
+                    "manual", f"采用全局候选：{artifact}")
+                record = self._record_from_row(full, updated, revision, state_json, review, now)
+                conn.execute("UPDATE card_candidates SET status = 'accepted', accepted_revision = ? WHERE id = ?", (revision, candidate_id))
+                candidate.update(status="accepted", accepted_revision=revision)
+                return candidate, record
             if card_snapshot(state, candidate["kind"], candidate["target_id"]) != candidate["original"]:
                 raise RevisionConflictError("候选依据与当前卡片不一致，请重新发起。", project["revision"])
             record, changed = self._save_card_edit(conn, project_id, candidate["kind"], candidate["target_id"], candidate["changes"], candidate["base_revision"])
