@@ -1,5 +1,9 @@
 # Script-Weaver
 
+<p align="center">
+  <img src="assets/banner.png" alt="Script-Weaver" width="720">
+</p>
+
 > **Agent-Native Screenplay & Storyboard Generation Engine** — An autonomous AI creative pipeline that transforms raw premises into production-grade screenplays and shot-by-shot video generation prompts, growing alongside creators.
 
 <p align="center">

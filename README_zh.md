@@ -1,5 +1,9 @@
 # Script-Weaver
 
+<p align="center">
+  <img src="assets/banner.png" alt="Script-Weaver" width="720">
+</p>
+
 > **Agent-Native 剧本与分镜生成引擎** — 随创作者共同进化的 AI 创作管线，将原始创意一站式转化为影视级标准剧本与逐镜头 AI 视频生成提示词。
 
 <p align="center">
